@@ -31,7 +31,13 @@ ALIGN = 4096
 class CB3Store:
     def __init__(self, path: str, device, punched_path: str = ""):
         meta = json.load(open(path + ".json"))
-        assert meta["format"] == "cb3_v2", meta["format"]
+        # every format that shares the CB3 slot geometry reads the same way; which codebook
+        # decodes it is the engine's EXPERT_FORMAT, not the store's business
+        assert meta["format"] in ("cb3_v2", "vq12_in_cb3_slots", "vq12_from_fp4"), meta["format"]
+        self.format = meta["format"]
+        # set by maybe_open when the run's EXPERT_FORMAT does not match this file's: the record is
+        # read as it is and rewritten in the slot (see a100-vq/vq12_fallback.py)
+        self.convert = None
         self.stride = int(meta["stride"])
         assert self.stride % ALIGN == 0, f"record stride {self.stride} is not {ALIGN}-aligned"
         self.offsets = {k: (int(o), int(n), tuple(s)) for k, (o, n, s) in meta["offsets"].items()}
@@ -78,6 +84,8 @@ class CB3Store:
             stream.wait_stream(compute)
             for name, (o, n, shape) in self.offsets.items():
                 getattr(arena, name)[slot].view(-1).copy_(buf[o:o + n], non_blocking=True)
+            if self.convert is not None:
+                self.convert(arena, slot)
         stream.synchronize()
         self.n_hits += 1
         return slot
@@ -94,9 +102,23 @@ def maybe_open(device):
         return None
     punched = os.environ.get("DSV41_FP4_PUNCHED", os.path.join(os.path.dirname(stores[0]),
                                                                "fp4_punched.json"))
-    if len(stores) == 1:
-        return CB3Store(stores[0], device, punched)
-    return MultiStore([CB3Store(s, device) for s in stores], punched)
+    st = (CB3Store(stores[0], device, punched) if len(stores) == 1
+          else MultiStore([CB3Store(s, device) for s in stores], punched))
+    # a VQ12 run reading a CB3 record: re-encode it in the slot rather than raise. The A100-packed
+    # VQ12 store does not cover every expert -- the disk does not hold two full stores -- and the
+    # FP4 bytes behind the uncovered ones are punched.
+    if os.environ.get("EXPERT_FORMAT", "") == "vq12":
+        import vq12_fallback
+        conv = vq12_fallback.Converter(device)
+        for f in getattr(st, "stores", [st]):
+            if f.format == "cb3_v2":
+                f.convert = conv
+        st.converter = conv
+        n_cb3 = sum(1 for f in st.records.values() if f.format == "cb3_v2") \
+            if isinstance(st, MultiStore) else (len(st.records) if st.format == "cb3_v2" else 0)
+        print(f"[vq12] {len(st.records) - n_cb3} experts come from a VQ12 store, {n_cb3} would be "
+              f"re-encoded from CB3 on the miss path", flush=True)
+    return st
 
 
 class MultiStore:
@@ -107,7 +129,12 @@ class MultiStore:
         self.records = {}
         for st in stores:
             for k in st.records:
-                self.records[k] = st
+                # a later file overrides an earlier one, so a store can be extended without being
+                # rewritten -- except that a record already in the run's own format wins over one
+                # that would have to be converted on the miss path
+                cur = self.records.get(k)
+                if cur is None or cur.format == st.format or st.format != "cb3_v2":
+                    self.records[k] = st
         self.punched = set()
         if punched_path and os.path.exists(punched_path):
             self.punched = {tuple(x) for x in json.load(open(punched_path))["punched"]}
