@@ -239,8 +239,11 @@ def _cbf8_down_kernel(
     tl.store(y_ptr + row[:, None] * stride_y + offs_n[None, :], acc, mask=mask_m[:, None])
 
 
-CBF8_UP_CFG = {16: (32, 4, 3), 32: (32, 4, 3), 64: (32, 4, 3)}
-CBF8_DOWN_CFG = {16: (32, 4, 3), 32: (32, 4, 3), 64: (32, 4, 3)}
+# Decode-sized calls (BM 16/32) and prefill-sized ones (BM 64) want opposite shapes: one warp on a
+# 16-wide output tile for a handful of tokens, four warps on 32 for hundreds. Leaving the decode
+# config in place for BM=64 measured 457 ms on a 512-token prefill against 64 with this one.
+CBF8_UP_CFG = {16: (16, 1, 1), 32: (16, 1, 1), 64: (32, 4, 2)}
+CBF8_DOWN_CFG = {16: (64, 4, 1), 32: (64, 4, 1), 64: (32, 4, 2)}
 
 
 class CBF8Arena(CB3Arena):
