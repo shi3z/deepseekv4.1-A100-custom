@@ -33,7 +33,8 @@ class CB3Store:
         meta = json.load(open(path + ".json"))
         # every format that shares the CB3 slot geometry reads the same way; which codebook
         # decodes it is the engine's EXPERT_FORMAT, not the store's business
-        assert meta["format"] in ("cb3_v2", "vq12_in_cb3_slots", "vq12_from_fp4"), meta["format"]
+        assert meta["format"] in ("cb3_v2", "vq12_in_cb3_slots", "vq12_from_fp4",
+                                  "cbf8_from_fp4"), meta["format"]
         self.format = meta["format"]
         # set by maybe_open when the run's EXPERT_FORMAT does not match this file's: the record is
         # read as it is and rewritten in the slot (see a100-vq/vq12_fallback.py)
