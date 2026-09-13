@@ -1,0 +1,8 @@
+{
+ "k1": 64,
+ "k2": 64,
+ "bits": 3.0,
+ "rel_rmse_residual": 0.21023763489243297,
+ "rel_rmse_flat4096_float": 0.14845159913733375,
+ "rel_rmse_flat4096_snapped": 0.16006079429021405
+}

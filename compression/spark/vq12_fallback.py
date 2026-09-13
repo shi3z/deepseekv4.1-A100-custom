@@ -81,3 +81,40 @@ class Converter:
         if self.n % 50 == 0:
             print(f"[vq12] {self.n} CB3->VQ12 fallback conversions, "
                   f"{self.ms / self.n:.1f} ms each, {self.ms / 1e3:.1f} s total", flush=True)
+
+
+class ToVQ6:
+    """Re-encodes a VQ12 record into VQ6 planes in the slot, for measuring the VQ6 decode without
+    a second 222 GB store on a disk that does not have room for one.
+
+    The values come out doubly quantised (dim-4 VQ, then dim-2), so this is a SPEED path: the row
+    to read off it is the warm one, where the arena hits every expert and no conversion runs during
+    the measured tokens at all.
+    """
+
+    def __init__(self, device):
+        from vq12 import VQ12
+        from vq6 import VQ6
+        import os
+        self.v12 = VQ12(os.environ.get("DSV41_VQ12_CODEBOOK",
+                                       os.path.expanduser("~/dsv41-spark/a100-vq/vq_3.0.npz")), device)
+        self.v6 = VQ6(os.environ.get("DSV41_VQ6_CODEBOOK",
+                                     os.path.expanduser("~/dsv41-spark/a100-vq/vq2_3.npz")), device)
+        self.n = 0
+        self.ms = 0.0
+
+    def __call__(self, arena, slot: int) -> None:
+        t0 = time.perf_counter()
+        for lo_n, hi_n, cb_n, s_n in MATS:
+            lo_t, hi_t, cb_t, s_t = (getattr(arena, x) for x in (lo_n, hi_n, cb_n, s_n))
+            packed = self.v12.unpack(lo_t[slot], hi_t[slot])
+            lo, hi, cb = self.v6.pack(packed, s_t[slot].view(torch.uint8))
+            lo_t[slot].copy_(lo)
+            hi_t[slot].copy_(hi)
+            cb_t[slot].copy_(cb)
+        torch.cuda.current_stream().synchronize()
+        self.n += 1
+        self.ms += (time.perf_counter() - t0) * 1e3
+        if self.n % 500 == 0:
+            print(f"[vq6] {self.n} VQ12->VQ6 slot re-encodes, {self.ms / self.n:.1f} ms each",
+                  flush=True)

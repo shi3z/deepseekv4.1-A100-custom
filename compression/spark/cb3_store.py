@@ -107,6 +107,15 @@ def maybe_open(device):
     # a VQ12 run reading a CB3 record: re-encode it in the slot rather than raise. The A100-packed
     # VQ12 store does not cover every expert -- the disk does not hold two full stores -- and the
     # FP4 bytes behind the uncovered ones are punched.
+    if os.environ.get("EXPERT_FORMAT", "") == "vq6":
+        # VQ6 reads the same record shape but a different code; re-encode each slot as it lands
+        import vq12_fallback
+        conv = vq12_fallback.ToVQ6(device)
+        for f in getattr(st, "stores", [st]):
+            f.convert = conv
+        st.converter = conv
+        print(f"[vq6] {len(st.records)} records will be re-encoded VQ12 -> VQ6 on load", flush=True)
+        return st
     if os.environ.get("EXPERT_FORMAT", "") == "vq12":
         import vq12_fallback
         conv = vq12_fallback.Converter(device)

@@ -1,0 +1,8 @@
+{
+ "dim": 2,
+ "bits": 3.0,
+ "K": 64,
+ "rel_rmse_float": 0.18753344699190672,
+ "rel_rmse_snapped": 0.2093518922374171,
+ "identity_fraction": 0.0625
+}
