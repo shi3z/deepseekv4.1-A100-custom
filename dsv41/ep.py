@@ -31,7 +31,9 @@ EP_TRACE = os.environ.get("DSV41_EP_TRACE", "0") == "1"  # per-layer device time
 # owner's partner over NVLink and to ONE GPU of the other pair over PCIe, which forwards it to its partner over
 # NVLink; the partials come back the same way in reverse (the far pair's leaf adds into its partner, one PCIe
 # transfer instead of two). Partials travel as bf16 (the fp32 sum over the shard's experts rounded once).
-EP_RELAY = os.environ.get("DSV41_EP_RELAY", "1") == "1"
+# Default off: pure PCIe (A6000 / PCIe A100) gains nothing from the NVLink-pair relay topology.
+# Set DSV41_EP_RELAY=1 on boxes where GPU pairs are NVLinked (the original 4-GPU NV12 recipe).
+EP_RELAY = os.environ.get("DSV41_EP_RELAY", "0") == "1"
 # Column-chunked partials (DSV41_EP_CHUNKS=2..4): the w2 GEMM runs chunk by chunk and each finished chunk is sent
 # on a second stream while the next one computes. Measured slower (S=32 K=3: 638 -> 617 tok/s, wait partials
 # 169 -> 283 us/layer): the half-width GEMM launches and the extra stream hand-offs cost more than the transfer

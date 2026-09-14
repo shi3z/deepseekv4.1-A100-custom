@@ -19,7 +19,10 @@ def lib():
         tag = hashlib.sha1(open(src, "rb").read()).hexdigest()[:12]
         so = os.path.join(HERE, "cpu", f".moe_cpu.{tag}.so")
         if not os.path.exists(so):
-            subprocess.run(["g++", "-O3", "-march=sapphirerapids", "-fopenmp", "-shared", "-fPIC", "-o", so, src], check=True)
+            # Default icelake-server: AVX-512 + VNNI + BF16 without requiring AMX (Sapphire Rapids).
+            # Override with DSV41_CPU_MARCH=sapphirerapids|cooperlake|native|...
+            march = os.environ.get("DSV41_CPU_MARCH", "icelake-server")
+            subprocess.run(["g++", "-O3", f"-march={march}", "-fopenmp", "-shared", "-fPIC", "-o", so, src], check=True)
         _lib = ctypes.CDLL(so)
         _lib.cpumoe_alloc.restype = ctypes.c_void_p
         _lib.cpumoe_alloc.argtypes = [ctypes.c_size_t]

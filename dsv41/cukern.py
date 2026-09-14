@@ -21,18 +21,32 @@ def _check(err, what):
         raise RuntimeError(f"{what} failed with CUDA error {err}")
 
 
-def _cubin(src_name: str) -> bytes:
+# nvcc -arch for cubin builds. Default sm_80 (A100); set via set_cuda_arch() / serve --cuda-arch.
+CUDA_ARCH = "sm_80"
+
+
+def set_cuda_arch(arch: str) -> None:
+    """Set nvcc -arch (e.g. sm_86 for A6000). Call before the first kernel load."""
+    global CUDA_ARCH
+    arch = arch.strip()
+    if not arch.startswith("sm_"):
+        arch = f"sm_{arch.replace('.', '')}"
+    CUDA_ARCH = arch
+
+
+def _cubin(src_name: str, arch: str | None = None) -> bytes:
+    arch = arch or CUDA_ARCH
     src = os.path.join(HERE, "cuda", src_name)
     code = open(src, "rb").read()
     tag = hashlib.sha1(code).hexdigest()[:12]
-    out = os.path.join(HERE, "cuda", f".{src_name}.{tag}.sm80.cubin")
+    out = os.path.join(HERE, "cuda", f".{src_name}.{tag}.{arch}.cubin")
     if not os.path.exists(out):
-        subprocess.run([NVCC, "-cubin", "-arch=sm_80", "-O3", "-o", out, src], check=True)
+        subprocess.run([NVCC, "-cubin", f"-arch={arch}", "-O3", "-o", out, src], check=True)
     return open(out, "rb").read()
 
 
 def get_function(src_name: str, func: str, device: torch.device) -> ctypes.c_void_p:
-    key = (src_name, device.index)
+    key = (src_name, device.index, CUDA_ARCH)
     if key not in _modules:
         with torch.cuda.device(device):
             torch.cuda.current_stream()  # make sure the context exists
@@ -40,7 +54,7 @@ def get_function(src_name: str, func: str, device: torch.device) -> ctypes.c_voi
             mod = ctypes.c_void_p()
             _check(_cuda.cuModuleLoadData(ctypes.byref(mod), image), "cuModuleLoadData")
             _modules[key] = mod
-    fkey = (src_name + ":" + func, device.index)
+    fkey = (src_name + ":" + func, device.index, CUDA_ARCH)
     if fkey not in _funcs:
         f = ctypes.c_void_p()
         _check(_cuda.cuModuleGetFunction(ctypes.byref(f), _modules[key], func.encode()), "cuModuleGetFunction")
