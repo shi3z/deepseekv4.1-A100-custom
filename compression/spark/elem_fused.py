@@ -134,10 +134,12 @@ def _hc_post_kernel(X, RES, POST, COMB, Y, D, HC: tl.constexpr, BLOCK: tl.conste
     md = d < D
     xv = tl.load(X + s * D + d, mask=md, other=0.0).to(tl.float32)
     for j in tl.static_range(HC):
-        acc = tl.load(POST + s * HC + j).to(tl.float32) * xv
+        # torch's order: the mixing sum on its own, then the post*x term added to it
+        mixed = tl.zeros([BLOCK], dtype=tl.float32)
         for i in tl.static_range(HC):
             r = tl.load(RES + (s * HC + i) * D + d, mask=md, other=0.0).to(tl.float32)
-            acc += tl.load(COMB + (s * HC + i) * HC + j).to(tl.float32) * r
+            mixed += tl.load(COMB + (s * HC + i) * HC + j).to(tl.float32) * r
+        acc = tl.load(POST + s * HC + j).to(tl.float32) * xv + mixed
         tl.store(Y + (s * HC + j) * D + d, acc.to(tl.bfloat16), mask=md)
 
 

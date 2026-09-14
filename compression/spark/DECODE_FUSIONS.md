@@ -19,10 +19,25 @@ DSV41_FUSED_ATTN=0 DSV41_BLOCK=1`, arena 94 GB (6,503 of 15,360 routed experts r
 | routed + shared merge in one kernel | -0.26 % | `DSV41_FUSE_MERGE` | bit-identical, T = 1..8 |
 | RMSNorm in one kernel | -2.33 % | `DSV41_FUSE_RMSNORM` | 0 top-6 changes in 21,360 decisions |
 | RoPE in one kernel | -1.04 % | `DSV41_FUSE_ROPE` | 4 of 8,584 calls differ by one bf16 ulp |
-| `hc_post` in one kernel | -0.90 % | `DSV41_FUSE_HC` | 1 bf16 ulp |
+| `hc_post` in one kernel | -0.90 % | `DSV41_FUSE_HC` | wikitext PPL +0.291 %, code +0.081 % |
 
 The last three together: 87.964 -> 84.422 ms (-4.03 %), and 19.44 -> 20.15 tok/s with each arm
 warmed to its own hit = 1.0.
+
+Seven of the eight leave the teacher-forced NLL bit-identical to the pre-optimisation run --
+wikitext 1.1685283184051514, code 0.5347256064414978, the same float64 in both. `hc_post` is the
+only one that moves it, by +0.291 % / +0.081 % of PPL, with 97.60 % top-1 agreement and a relative
+logit L2 of 0.0685: a third of the perturbation `attn` FP4 causes, and that was adopted at
++0.06 %. Its accumulation follows torch's order -- the mixing sum first, then the `post*x` term --
+which is worth five times the code-corpus damage of the other way round.
+
+### The routing metric that had to be thrown away
+
+Comparing routing by rewinding `c.len` and replaying a step measures the cache the first arm just
+wrote, not the change: an A-vs-A control scored 2.19 % with nothing changed. Rebuilding the cache
+per arm fixes that (A-vs-A: 0), but then it charges 3.56 % to the bf16-storage router gate, which
+provably moves 0 of 71,044 same-input decisions. It is measuring chaos amplified through a 50-token
+prefill, not damage, and nothing here was decided on it.
 
 ## What was rejected, and why
 
