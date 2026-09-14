@@ -77,6 +77,8 @@ class _Reading:
 
 
 PROBE = _Probe() if os.environ.get("DSV41_STORE_PROBE") == "1" else None
+#: set by ExpertStore.resolve's split path to an event recorded before the resident pass
+GATE = None
 
 
 class CB3Store:
@@ -137,7 +139,14 @@ class CB3Store:
         assert got == self.stride, (got, self.stride)
         compute = torch.cuda.current_stream()
         with torch.cuda.stream(stream):
-            stream.wait_stream(compute)
+            # GATE, when the engine's split path set one, is an event recorded before the resident
+            # MoE was launched: ordering the copy after THAT instead of after the whole compute
+            # stream is what lets the read queue stay full while the resident pass runs.
+            gate = GATE
+            if gate is None:
+                stream.wait_stream(compute)
+            else:
+                stream.wait_event(gate)
             for name, (o, n, shape) in self.offsets.items():
                 getattr(arena, name)[slot].view(-1).copy_(buf[o:o + n], non_blocking=True)
             if self.convert is not None:

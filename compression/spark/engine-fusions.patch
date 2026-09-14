@@ -1,0 +1,629 @@
+diff --git a/engine/fastdecode.py b/engine/fastdecode.py
+index 9444411..5845e71 100644
+--- a/engine/fastdecode.py
++++ b/engine/fastdecode.py
+@@ -62,6 +62,25 @@ GRAPH_SEGMENTS = os.environ.get("DSV41_GRAPH_SEGMENTS", "1") == "1"
+ # math is identical either way (the buffers get the same values).
+ LEAN_STEP = os.environ.get("DSV41_LEAN_STEP", "1") == "1"
+ 
++# wq_a and wkv read the same x and the same K; with a `wqkv` attached to the block they
++# run as one launch and the K loop is paid once. Bit-exact -- concatenating along N
++# changes no row's arithmetic. 0 restores the two-kernel path.
++FUSE_QKV = os.environ.get("DSV41_FUSE_QKV", "1") == "1"
++
++# The gate weight is BF16 in the checkpoint and f32() promotes it on load, so the
++# fp32 GEMM reads twice the bytes for the same values. 0 restores the fp32 path.
++GATE_BF16 = os.environ.get("DSV41_GATE_BF16", "0") == "1"
++# Set to a list to record (layer, fp32 top-k, bf16 top-k) from the same y.
++GATE_KERNEL = os.environ.get("DSV41_GATE_KERNEL", "1") == "1"
++try:
++    import elem_fused as _EF
++except Exception:
++    _EF = None
++GATE_CMP = None
++RMS_CMP = None
++GATE_KW = {'block_n': 32, 'target': 96, 'num_warps': 2}
++from gate_gemm import gate_linear as GATE_GEMM  # noqa: E402
++
+ 
+ def _fp32_lin(x, w):
+     """fp32 y = x @ w^T with an fp32 weight. `x` may be bf16: the Triton kernel upcasts the loaded
+@@ -181,6 +200,9 @@ class FastDecoder:
+ 
+     def _rope(self, x, fq, inverse=False):
+         rd = self.a.rope_head_dim
++        if (_EF is not None and _EF.ROPE and x.dtype == torch.bfloat16 and x.stride(-1) == 1
++                and fq.dtype == torch.complex64 and x.shape[-1] > rd):
++            return _EF.fused_rope(x, fq, rd, inverse)   # one kernel, no complex tensor, no cat
+         return torch.cat([x[..., :-rd], R.apply_rotary(x[..., -rd:], fq, inverse=inverse)], dim=-1)
+ 
+     def _hc_mixes(self, x, hc_fn, hc_scale, hc_base):
+@@ -194,9 +216,15 @@ class FastDecoder:
+         a = self.a
+         T = x.size(0)
+         fq = freqs[pos]
+-        qr = R.rmsnorm(_lin(x, w.wq_a), w.q_norm, a.norm_eps)
++        wqkv = getattr(w, "wqkv", None) if FUSE_QKV else None
++        if wqkv is None:
++            _qa, _kvin = _lin(x, w.wq_a), _lin(x, w.wkv)
++        else:
++            _qkv = _lin(x, wqkv)
++            _qa, _kvin = _qkv[:, :w.wqkv_split], _qkv[:, w.wqkv_split:]
++        qr = R.rmsnorm(_qa, w.q_norm, a.norm_eps)
+         q = self._rope(_lin(qr, w.wq_b).view(T, a.n_heads, a.head_dim), fq)
+-        kv = self._rope(R.rmsnorm(_lin(x, w.wkv), w.kv_norm, a.norm_eps), fq)
++        kv = self._rope(R.rmsnorm(_kvin, w.kv_norm, a.norm_eps), fq)
+         # The key set is two pieces: the window rows and (verify) the CSA2 rows / (draft) the draft
+         # keys. The fused kernel takes both as base pointers, so they are never cat'ed; only the
+         # torch fallback materialises kv_all. The draft's window is a stride-0 broadcast view.
+@@ -316,18 +344,47 @@ class FastDecoder:
+         self.h.copy_(h)
+         ffn_pre, ffn_post, ffn_comb = self._hc_mixes(h, w.hc_ffn_fn, w.hc_ffn_scale, w.hc_ffn_base)
+         self.ffn_pre.copy_(ffn_pre); self.ffn_post.copy_(ffn_post); self.ffn_comb.copy_(ffn_comb)
+-        y = R.rmsnorm(R.hc_pre(h, attn_pre), w.ffn_norm, a.norm_eps)
++        _pre = R.hc_pre(h, attn_pre)
++        y = R.rmsnorm(_pre, w.ffn_norm, a.norm_eps)
++        if RMS_CMP is not None:
++            _sv = _EF.RMSNORM
++            _EF.RMSNORM = not _sv
++            _alt = R.rmsnorm(_pre, w.ffn_norm, a.norm_eps)
++            _EF.RMSNORM = _sv
++            _g = lambda t: (F.softplus(GATE_GEMM(t.to(torch.bfloat16), self.gate_bf16[L],
++                                                 **GATE_KW)).sqrt() + w.gate_bias
++                            ).topk(a.n_activated_experts, dim=-1)[1]
++            RMS_CMP.append((L, _g(y).detach().clone(), _g(_alt).detach().clone(),
++                            torch.equal(y, _alt)))
+         self.y.copy_(y)
+         # fp32, exactly as Model.moe does it. The gate picks 6 of 384 experts and its scores are
+         # full of near-ties, so a bf16 GEMM here (which this path used until 2026-09-11) changes
+         # 11 % of the picks at layer 0 -- where the inputs are bit-identical -- and up to 31 %
+         # deeper in, which is what made the graphed path disagree with the reference at all.
+-        scores = F.softplus(R.mm(y.float(), self.W.layers[L].gate_w)).sqrt()
++        if GATE_KERNEL:
++            scores = F.softplus(GATE_GEMM(y.to(torch.bfloat16), self.gate_bf16[L],
++                                          **GATE_KW)).sqrt()
++        elif GATE_BF16:
++            scores = F.softplus(R.mm(y.to(torch.bfloat16), self.gate_bf16[L]).float()).sqrt()
++        else:
++            scores = F.softplus(R.mm(y.float(), self.W.layers[L].gate_w)).sqrt()
+         logits = scores + w.gate_bias
+         pm = getattr(self.m, "prune_mask", None)
+         if pm is not None and L in pm:
+             logits = logits.masked_fill(~pm[L], float("-inf"))
+         idx = logits.topk(a.n_activated_experts, dim=-1)[1]
++        if GATE_CMP is not None:
++            from gate_gemm import gate_linear as _gl
++            _raw = _gl(y.to(torch.bfloat16), self.gate_bf16[L], **GATE_KW)
++            _alt = F.softplus(_raw).sqrt()
++            _al = _alt + w.gate_bias
++            _ai = _al.topk(a.n_activated_experts, dim=-1)[1]
++            # margin at the top-k boundary: how far the 6th score is above the 7th
++            _s = torch.topk(logits, a.n_activated_experts + 1, dim=-1)[0]
++            GATE_CMP.append((L, idx.detach().clone(), _ai.detach().clone(),
++                             (_s[:, a.n_activated_experts - 1] - _s[:, a.n_activated_experts]
++                              ).detach().clone(),
++                             (logits - _al).abs().max().detach().clone()))
+         wts = scores.gather(1, idx)
+         wts = wts / (wts.sum(dim=-1, keepdim=True) + 1e-20) * a.route_scale
+         self.route_idx.copy_(idx); self.route_w.copy_(wts)
+@@ -342,9 +399,16 @@ class FastDecoder:
+     def _layer_b(self, L):
+         a = self.a
+         w = self.W.layers[L]
+-        out = self.m.moe_fn(self.y, self.slots, self.route_w, self.m.store.arena, a.swiglu_limit).float()
+-        out += R.expert_ffn(self.y, w.sh_w1, w.sh_w2, w.sh_w3, a.swiglu_limit).float()
+-        h = R.hc_post(out.to(torch.bfloat16), self.h, self.ffn_post, self.ffn_comb)
++        rt = self.m.moe_fn(self.y, self.slots, self.route_w, self.m.store.arena, a.swiglu_limit)
++        sh = R.expert_ffn(self.y, w.sh_w1, w.sh_w2, w.sh_w3, a.swiglu_limit)
++        if (_EF is not None and _EF.MERGE and rt.dtype == torch.bfloat16
++                and sh.dtype == torch.bfloat16):
++            merged = _EF.fused_merge(rt, sh)          # bf16(fp32(rt) + fp32(sh)), one kernel
++        else:
++            out = rt.float()
++            out += sh.float()
++            merged = out.to(torch.bfloat16)
++        h = R.hc_post(merged, self.h, self.ffn_post, self.ffn_comb)
+         self.h.copy_(h); self.pre_mix.copy_(self.ffn_pre)
+ 
+     def _final(self):
+@@ -377,7 +441,25 @@ class FastDecoder:
+             residual = h
+             ffn_pre, ffn_post, ffn_comb = self._hc_mixes(h, w.hc_ffn_fn, w.hc_ffn_scale, w.hc_ffn_base)
+             y = R.rmsnorm(R.hc_pre(h, attn_pre), w.ffn_norm, a.norm_eps)
+-            scores = F.softplus(R.mm(y.float(), self.W.mtp[k].gate_w)).sqrt()  # fp32, as Model.moe
++            if GATE_CMP is not None:
++                _r32 = F.softplus(R.mm(y.float(), self.W.mtp[k].gate_w)).sqrt()
++                _rn = F.softplus(GATE_GEMM(y.to(torch.bfloat16), self.mtp_gate_bf16[k],
++                                           **GATE_KW)).sqrt()
++                _bk = self.W.mtp[k].gate_bias
++                _n_act = self.a.n_activated_experts
++                _i32 = (_r32 + _bk).topk(_n_act, dim=-1)[1]
++                _inw = (_rn + _bk).topk(_n_act, dim=-1)[1]
++                _t = torch.topk(_r32 + _bk, _n_act + 1, dim=-1)[0]
++                GATE_CMP.append((100 + k, _i32.detach().clone(), _inw.detach().clone(),
++                                 (_t[:, _n_act - 1] - _t[:, _n_act]).detach().clone(),
++                                 (_r32 - _rn).abs().max().detach().clone()))
++            if GATE_KERNEL:
++                scores = F.softplus(GATE_GEMM(y.to(torch.bfloat16), self.mtp_gate_bf16[k],
++                                              **GATE_KW)).sqrt()
++            elif GATE_BF16:
++                scores = F.softplus(R.mm(y.to(torch.bfloat16), self.mtp_gate_bf16[k]).float()).sqrt()
++            else:
++                scores = F.softplus(R.mm(y.float(), self.W.mtp[k].gate_w)).sqrt()  # fp32, as Model.moe
+             idx = (scores + w.gate_bias).topk(3, dim=-1)[1]
+             wts = scores.gather(1, idx); wts = wts / (wts.sum(dim=-1, keepdim=True) + 1e-20) * a.route_scale
+             slots = (idx.to(torch.int32) + k * 128)
+diff --git a/engine/model.py b/engine/model.py
+index 2006073..15eb167 100644
+--- a/engine/model.py
++++ b/engine/model.py
+@@ -37,6 +37,11 @@ RING = int(os.environ.get("DSV41_RING", 4096))
+ # experts and quadrupling the chunk quarters it. The ceiling is activation memory: at T=2048 the
+ # gathered window+compressed KV of one layer is ~2.7 GB.
+ MAX_CHUNK = int(os.environ.get("DSV41_PREFILL_CHUNK", 2048))
++# a100-vq/patch_engine_split.py: run the residents (and the shared expert) while the misses load
++SPLIT_MOE = os.environ.get("DSV41_SPLIT_MOE") == "1"
++#: layers of lookahead for the oracle prefetch experiment (a100-vq/oracle_probe.py)
++ORACLE_DEPTH = int(os.environ.get("DSV41_ORACLE_DEPTH", "1"))
++LAYER_TIMING = os.environ.get("DSV41_LAYER_TIMING") == "1"
+ 
+ # Chunk invariance requires every GEMM to give the same row whatever the batch length M. cuBLAS
+ # picks split-K kernels for small M and, with this flag on, reduces the K-splits in bf16, so
+@@ -119,6 +124,15 @@ class Weights:
+         self.mtp = []
+         for k in range(3 if load_mtp else 0):
+             self.mtp.append(MTPWeights(get, k, args, device))
++        # One projection for wq_a + wkv at decode (a100-vq/ab_all.py: -2.23 % of step time,
++        # generated tokens identical). Built once here; decode never concatenates.
++        _nf = R.attach_fused_qkv(self.layers + self.mtp)
++        if _nf:
++            log(f"fused qkv projection on {_nf} blocks")
++        # The LM head is read twice a step and BLOCK_N=16 with one warp measured 27 % faster on it
++        # than the generic decode tile; no rule over N fits, so the shape carries its own.
++        if R.FP4Weight is not None and isinstance(self.head, R.FP4Weight):
++            self.head.tile = (16, 1, 3)
+         self.dspark_experts = None  # filled by the engine (arena of 3 x 128 experts)
+         log(f"weights: all non-expert weights on GPU in {time.time() - t0:.0f}s")
+ 
+@@ -252,6 +266,10 @@ class Model:
+         self.stats = {"attn_s": 0.0, "moe_s": 0.0, "engram_s": 0.0, "tokens": 0}
+         self.begin_prompt()
+ 
++    #: {layer: top-k expert ids} from a recorded pass; set to prefetch one layer ahead
++    oracle = None
++    _pf_done = {}
++
+     def _tap(self, name, L, t):
+         if self.tap is not None:
+             self.tap(name, L, t)
+@@ -494,9 +512,25 @@ class Model:
+         weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20) * a.route_scale
+         self._tap("route_idx", L, indices); self._tap("route_w", L, weights)
+         t0 = time.perf_counter()
+-        slots = store.resolve(L, indices, prefill)
+-        routed = self.moe_fn(y, slots, weights, arena, a.swiglu_limit).float()
+-        shared = R.expert_ffn(y, w.sh_w1, w.sh_w2, w.sh_w3, a.swiglu_limit).float()
++        w8 = self._pf_done.pop(L, None)
++        if w8 is not None:
++            w8()                   # the prefetch for this layer: let it land before we route
++        res = store.resolve(L, indices, prefill, split=SPLIT_MOE and prefill)
++        if isinstance(res, tuple):
++            slots, pend, wait_for_misses = res
++            # the shared expert is dense bf16 and needs nothing from the expert store, and the
++            # resident routed experts are already in the arena: both can run while the misses are
++            # still coming off NVMe.
++            shared = R.expert_ffn(y, w.sh_w1, w.sh_w2, w.sh_w3, a.swiglu_limit).float()
++            routed = self.moe_fn(y, slots, weights, arena, a.swiglu_limit).float()
++            wait_for_misses()
++            routed = routed + self.moe_fn(y, pend, weights, arena, a.swiglu_limit).float()
++            # the unsplit path rounds the routed sum once, on the way out of moe_fn
++            routed = routed.to(torch.bfloat16).float()
++        else:
++            slots = res
++            routed = self.moe_fn(y, slots, weights, arena, a.swiglu_limit).float()
++            shared = R.expert_ffn(y, w.sh_w1, w.sh_w2, w.sh_w3, a.swiglu_limit).float()
+         self._tap("moe_routed", L, routed); self._tap("moe_shared", L, shared)
+         out = routed + shared
+         self.stats["moe_s"] += time.perf_counter() - t0
+@@ -637,9 +671,27 @@ class Model:
+                 self.stats["engram_s"] += time.perf_counter() - t0
+             if L in a.dspark_target_layer_ids:
+                 main_hiddens.append(h.float().mean(dim=1))
++            if self.oracle is not None and prefill:
++                # start the coming layers' experts now, while this layer's attention and dense
++                # parts run. A predictor would have to produce these ids; the oracle knows them.
++                for d in range(1, ORACLE_DEPTH + 1):
++                    nxt = L + d
++                    if nxt in self.oracle and nxt not in self._pf_done:
++                        r = self.store.resolve(nxt, self.oracle[nxt], True, split=True, spec=True)
++                        self._pf_done[nxt] = r[2] if isinstance(r, tuple) else None
+             freqs = self.freqs_c if w.ratio else self.freqs_w
++            _tl = time.perf_counter()
++            _tm = self.stats.get("moe_s", 0.0)
+             h, pre_mix = self.block(h, pre_mix, w, L, S, sh, self.c.win[L], freqs, prefill, self.store,
+                                     self.store.arena, a.n_routed_experts)
++            if self.oracle is not None or LAYER_TIMING:
++                d = self.stats.setdefault("layer_ms", {})
++                tot = (time.perf_counter() - _tl) * 1e3
++                moe = (self.stats.get("moe_s", 0.0) - _tm) * 1e3
++                e = d.setdefault(L, [0.0, 0.0, 0])
++                e[0] += tot - moe      # attention + engram + dense
++                e[1] += moe            # routing, waiting for experts, and the MoE itself
++                e[2] += 1
+             self._tap("h", L, h); self._tap("pre_mix", L, pre_mix)
+         self.c.len = S + T
+         self.stats["tokens"] += T
+diff --git a/engine/v41_engine.py b/engine/v41_engine.py
+index 5f65145..654a88c 100644
+--- a/engine/v41_engine.py
++++ b/engine/v41_engine.py
+@@ -255,7 +255,7 @@ class V41Engine:
+         self.act_quant = act_quant
+         self.trace_stats = trace_stats
+         self.expert_format = (expert_format or "fp4").lower()
+-        assert self.expert_format in ("fp4", "cb3"), self.expert_format
++        assert self.expert_format in ("fp4", "cb3", "vq12", "vq6", "cbf8", "tiered"), self.expert_format
+         self.sim_cb2_frac = float(sim_cb2_frac or 0.0)
+         assert 0.0 <= self.sim_cb2_frac <= 1.0, self.sim_cb2_frac
+         try:
+@@ -269,6 +269,86 @@ class V41Engine:
+             self.kernel = "dequant-fallback"
+             log(f"Triton kernel unavailable ({e!r}); using the slow dequant fallback")
+         cb3_cls = None
++        tiered_cls = None
++        if self.expert_format == "tiered":
++            # Every expert stays REACHABLE: the hottest are resident in the checkpoint's own FP4,
++            # the next band is resident at 2 bits, and whatever is left still streams off NVMe at
++            # FP4 exactly as the unpruned recipe does. Nothing is dropped, so the failure mode that
++            # pruning has (the router's top-6 silently replaced by the top-6 of a smaller set, and
++            # free generation collapsing into a repeated phrase) cannot occur; the 2-bit band only
++            # makes an expert coarse, and a coarse expert is still the right expert.
++            import tiered_moe as TM
++            from engine.codebook_sim import CodebookSim
++            assert not sim_bits, "--sim-bits is meaningless with --expert-format tiered"
++            tiered_cls = TM.TieredArena
++            self._tier_mode = os.environ.get("DSV41_TIER_MODE", "allres")   # allres | stream
++            self._tier_fp4_frac = float(os.environ.get("DSV41_TIER_FP4_FRAC", "0.30"))
++            self._tier_cold_fmt = os.environ.get("DSV41_TIER_COLD", "cb2")
++            self._tier_inter_h = int(os.environ.get("DSV41_TIER_INTER_H", "1280"))
++            # The tail format. `cb2h` is 2 bits over `inter_h` channels; `fp4h` keeps the
++            # checkpoint's own e2m1 codes and UE8M0 scales over those channels and re-quantises
++            # nothing. Measured on real prompts, 2-bit tails lose to upstream's pruning outright
++            # (see docs/tiered-arena.md), so `fp4h` is the default.
++            self._tier_tail_fmt = os.environ.get("DSV41_TIER_TAIL", "fp4h")
++            self._tier_fp4_share = float(os.environ.get("DSV41_TIER_FP4_SHARE", "0.40"))
++            self._tier_sims = {self._tier_cold_fmt: CodebookSim(int(self._tier_cold_fmt[-1]), device)}
++            tiered_moe_fn = TM.moe_forward_tiered
++            self.kernel = f"triton-tiered({self._tier_mode})"
++            if self._tier_mode == "allres":
++                tail = ("the checkpoint's own FP4 over" if self._tier_tail_fmt == "fp4h"
++                        else "2 bits over")
++                log(f"using the tiered MoE arena, all-resident: every routed expert stays in the "
++                    f"arena, the hottest at full-width FP4, the tail at {tail} "
++                    f"{self._tier_inter_h} of 2304 intermediate channels "
++                    f"(fp4 share {self._tier_fp4_share:.2f} of the headroom). Nothing streams.")
++            else:
++                log(f"using the tiered MoE arena, streaming: fp4 share {self._tier_fp4_frac:.2f} of "
++                    f"the byte budget, cold tier {self._tier_cold_fmt}, the rest read from NVMe at FP4")
++        if self.expert_format == "cbf8":
++            # a100-vq/cbf8: CB3's record byte for byte, its eight `cb` bytes read as int8 level
++            # codes instead of E2M1 codes. Two prmt fetch an arbitrary fp16 level's low and high
++            # byte and two more interleave them, so the codebook stops being the E2M1 grid without
++            # the decode ever touching memory -- and `cvt.rn.f16x2.e2m1x2` is no longer needed.
++            import sys as _sys
++            _sys.path.insert(0, os.path.expanduser("~/dsv41-spark/a100-vq"))
++            import cbf8_moe as F8M
++            from cbf8 import CBF8
++            cb3_cls = F8M.CBF8Arena
++            self._cbf8 = CBF8(device)
++            cb3_moe_fn = F8M.moe_forward_cbf8
++            self.kernel = "triton-cbf8"
++            log("using the Triton CBF8 (eight free fp16 levels, register-only) MoE kernel "
++                "for the routed experts")
++        if self.expert_format == "vq6":
++            # a100-vq/vq6: dim-2 vector quantisation, 64 entries, the same 3 bit/weight and the
++            # same slot geometry. The codebook is small enough that a warp's gather stays inside a
++            # sector, which is what VQ12's 4096-entry table costs on this GPU.
++            import sys as _sys
++            _sys.path.insert(0, os.path.expanduser("~/dsv41-spark/a100-vq"))
++            import vq6_moe as V6M
++            from vq6 import VQ6
++            cb3_cls = V6M.VQ6Arena
++            self._vq6 = VQ6(os.environ.get("DSV41_VQ6_CODEBOOK",
++                                           os.path.expanduser("~/dsv41-spark/a100-vq/vq2_3.npz")),
++                            device)
++            cb3_moe_fn = V6M.moe_forward_vq6
++            self.kernel = "triton-vq6"
++            log("using the Triton VQ6 (dim-2 vector codebook) MoE kernel for the routed experts")
++        if self.expert_format == "vq12":
++            # a100-vq/vq12: CB3's slot geometry and rate, a dim-4 vector codebook instead of a
++            # per-row scalar one. Same bytes, half the quantisation damage (+4.23 % wikitext PPL
++            # against the FP4 checkpoint where CB3 costs +8.54 %).
++            import sys as _sys
++            _sys.path.insert(0, os.path.expanduser("~/dsv41-spark/a100-vq"))
++            import vq12_moe as VQM
++            from vq12 import VQ12
++            cb3_cls = VQM.VQ12Arena
++            self._vq12 = VQ12(os.environ.get("DSV41_VQ12_CODEBOOK",
++                                             os.path.expanduser("~/dsv41-spark/a100-vq/vq_3.0.npz")),
++                              device)
++            cb3_moe_fn = VQM.moe_forward_vq
++            self.kernel = "triton-vq12"
++            log("using the Triton VQ12 (dim-4 vector codebook) MoE kernel for the routed experts")
+         if self.expert_format == "cb3":
+             import cb3_moe as C3
+             from engine.codebook_sim import CodebookSim
+@@ -284,6 +364,8 @@ class V41Engine:
+             """Dispatch on the arena's format. The DSpark draft arena stays FP4 whatever the main
+             arena is -- it is 384 experts (7.2 GB), it is read five times per step, and a 3-bit
+             drafter would cost acceptance for nothing."""
++            if tiered_cls is not None and isinstance(arena, tiered_cls):
++                return tiered_moe_fn(x, slots, weights, arena, limit)
+             if cb3_cls is not None and isinstance(arena, cb3_cls):
+                 return cb3_moe_fn(x, slots, weights, arena, limit)
+             return fp4_moe_fn(x, slots, weights, arena, limit)
+@@ -292,12 +374,35 @@ class V41Engine:
+         arena_cls = fp4_arena_cls
+ 
+         def make_expert_arena(n_slots):
++            if tiered_cls is not None:
++                raise AssertionError("the tiered arena is built from bytes, not a slot count")
+             if cb3_cls is None:
+                 return fp4_arena_cls(n_slots, device)
+             a = cb3_cls(n_slots, device)
++            if self.expert_format == "cbf8":
++                return a.attach(self._cbf8)
++            if self.expert_format == "vq6":
++                return a.attach(self._vq6)
++            if self.expert_format == "vq12":
++                return a.attach(self._vq12)
+             a.sim = self._cb3_sim
+             return a
+ 
++        def make_tiered_arena(arena_bytes, transient):
++            import tiered_moe as TM
++            ih = self._tier_inter_h
++            if self._tier_mode == "allres":
++                tf = self._tier_tail_fmt
++                n0, n1 = TM.fit_all_resident(arena_bytes, ih, self._tier_fp4_share, tail_fmt=tf)
++                plan = TM.plan_all_resident(n0, n1, ih, transient_slots=transient, tail_fmt=tf)
++            else:
++                plan = TM.plan_tiers(arena_bytes, self._tier_fp4_frac, self._tier_cold_fmt,
++                                     transient_slots=transient)
++            a = TM.TieredArena(plan, device, sims=self._tier_sims, inter_h=ih)
++            log(f"tiered arena: {a.plan_str()} = {a.slots} slots "
++                f"({a.slots / 15360 * 100:.1f} % of all routed experts resident)")
++            return a
++
+         self.expert_bytes = (EX.EXPERT_BYTES if cb3_cls is None
+                              else __import__("cb3_moe").CB3_BYTES_PER_SLOT)
+ 
+@@ -342,13 +447,19 @@ class V41Engine:
+                 log(f"arena {arena_gb:.1f} GB capped to {cap:.1f} GB (MemAvailable {host_avail / 1e9:.1f} GB, "
+                     f"keep_free {keep_free_gb} GB)")
+                 arena_gb = max(10.0, cap)
+-        slots = int(arena_gb * 1e9 / self.expert_bytes)
++        if tiered_cls is not None:
++            self.arena = make_tiered_arena(arena_gb * 1e9, transient_slots)
++            slots = self.arena.slots
++            self.expert_bytes = self.arena.bytes_per_slot
++        else:
++            slots = int(arena_gb * 1e9 / self.expert_bytes)
+         self.arena_gb, self.slots = round(arena_gb, 1), slots
+         log(f"CUDA free {free / 1e9:.1f} GB of {total / 1e9:.1f}; host MemAvailable "
+             f"{(host_avail or 0) / 1e9:.1f} GB; arena {arena_gb:.1f} GB = {slots} {self.expert_format} "
+             f"expert slots of {self.expert_bytes / 1e6:.2f} MB "
+             f"({slots / 15360 * 100:.0f}% of all routed experts, {'auto' if auto else 'pinned'})")
+-        self.arena = make_expert_arena(slots)
++        if tiered_cls is None:
++            self.arena = make_expert_arena(slots)
+         self.store = EX.ExpertStore(model_dir, index, self.arena, self.args.n_layers, transient_slots=transient_slots,
+                                     io_threads=io_threads)
+         # load the DSpark experts (all 3 x 128 resident in their own arena)
+@@ -371,7 +482,19 @@ class V41Engine:
+             # pruned, all-resident mode: per layer only the top-N experts (by trace frequency) stay
+             # routable, and exactly those are warm-started, so decode never touches NVMe
+             cc, cg = EX.category_counts(trace_stats, "coding"), EX.category_counts(trace_stats, "general")
+-            assert len(cc) == 40 and len(cg) == 40, "pruned mode needs the per-layer trace npz files next to trace_stats"
++            if len(cc) != 40 or len(cg) != 40:
++                # The published stats carry the MIXED histogram in coverage.json but not the raw
++                # per-layer traces the coding/general split is recomputed from. Without them a
++                # pruned run is still possible -- just ranked on the mixed corpus, which is what
++                # `rank_from_trace` uses -- so fall back to it instead of refusing to start. The
++                # workload-specific hot sets are not available in this mode; `DSV41_PRUNE_RANK`
++                # then has no effect, because both halves of the sum are the same histogram.
++                mixed = json.load(open(trace_stats))["per_layer"]
++                mix = {int(L): np.array(v["counts"], dtype=np.float64) for L, v in mixed.items()}
++                assert len(mix) == 40, f"coverage.json has {len(mix)} layers, need 40"
++                cc = cg = mix
++                log("pruned mode: per-layer coding/general traces absent; ranking on the mixed "
++                    "histogram from coverage.json")
+             # How the two workloads are combined into one ranking. "sum" (the 0.2.0-wip default)
+             # adds the per-layer-normalized frequencies, which favours experts moderately used by
+             # both and drops each workload's specialists -- the coding and prose top sets overlap by
+@@ -437,9 +560,18 @@ class V41Engine:
+         if spec and os.environ.get("DSV41_FAST", "1") == "1":
+             from engine.fastdecode import FastDecoder
+             self.fast = FastDecoder(self.model, self, use_graphs=os.environ.get("DSV41_GRAPHS", "1") == "1")
+-            resident = (self.prune_keep and self.prune_keep < 1.0 and
+-                        len(self.store.lru) >= 40 * max(6, int(np.ceil(self.prune_keep * 384))) and
+-                        os.environ.get("DSV41_LUT", "1") == "1")
++            # The device slot LUT replaces the per-layer host resolve (a D2H copy, a numpy set
++            # pass and a H2D copy, 40 times a step). It is valid exactly while nothing can miss,
++            # which is true in pruned mode and equally true when the arena simply holds every
++            # routed expert -- which is what the tiered arena is for.
++            fully_resident = len(self.store.lru) >= 40 * self.args.n_routed_experts
++            resident = ((fully_resident or
++                         (self.prune_keep and self.prune_keep < 1.0 and
++                          len(self.store.lru) >= 40 * max(6, int(np.ceil(self.prune_keep * 384)))))
++                        and os.environ.get("DSV41_LUT", "1") == "1")
++            if fully_resident:
++                log(f"every routed expert is resident ({len(self.store.lru)} slots): "
++                    f"the decode path never touches NVMe and the slot LUT is permanent")
+             if resident:
+                 self.fast.build_lut()
+             log("fast decode path enabled (CUDA graphs=%s, device slot LUT=%s)" % (self.fast.use_graphs, self.fast.lut is not None))
+@@ -532,6 +664,7 @@ class V41Engine:
+                 "decode_s": round(t_dec, 3), "decode_tok_s": round(max(n_out - 1, 0) / t_dec, 2),
+                 "steps": steps,
+                 "accept_len_mean": round(float(np.mean(accepted_hist)) + 1, 2) if accepted_hist else None,
++                "accepted_hist": list(accepted_hist),
+                 "expert_hit_rate": round(self.store.hit_rate(), 4), "expert_misses": st["misses"],
+                 "prefill_expert_misses": st["prefill_misses"], "nvme_gb": round(st["bytes_read"] / 1e9, 2),
+                 "nvme_read_s": round(st["read_s"], 2),
+@@ -542,6 +675,9 @@ class V41Engine:
+                 # where the MoE time actually goes: routing+slot bookkeeping, waiting for the
+                 # NVMe loads of this layer, and the Triton kernel itself (moe_s minus the rest).
+                 "route_s": round(st["route_s"], 2), "load_wait_s": round(st["load_s"], 2),
++                "d2h_sync_s": round(st.get("d2h_sync_s", 0.0), 2),
++                "gpu_drain_s": round(st.get("gpu_drain_s", 0.0), 2),
++                "host_set_s": round(st.get("host_set_s", 0.0), 2),
+                 "lease_s": round(st["lease_s"], 2), "h2d_s": round(st["h2d_s"], 2),
+                 "kernel_s": round(m.stats["moe_s"] - st["resolve_s"], 2),
+                 "nvme_gb_per_token": round(st["bytes_read"] / 1e9 / max(n_out, 1), 3),
+@@ -701,7 +837,7 @@ class V41Engine:
+                 a = 0
+                 new = []
+                 bonus = None
+-                for i in range(5):
++                for i in range(self._tv - 1):        # the block's draft count, not a constant
+                     pt = sample_probs(logits[i], temperature, top_p)
+                     d = int(drafts[i])
+                     if temperature <= 0:
+@@ -724,7 +860,8 @@ class V41Engine:
+                             bonus = int(torch.multinomial(resid / resid.sum(), 1))
+                         break
+                 if bonus is None and not (new and new[-1] in stop_ids):
+-                    pt = sample_probs(logits[a] if a < 5 else logits[5], temperature, top_p)
++                    pt = sample_probs(logits[a] if a < self._tv - 1 else logits[self._tv - 1],
++                                      temperature, top_p)
+                     bonus = int(torch.multinomial(pt, 1)) if temperature > 0 else int(pt.argmax())
+                 if ph is not None:
+                     ph.mark("verify")
+@@ -956,7 +1093,7 @@ if __name__ == "__main__":
+     ap.add_argument("--transient-slots", type=int, default=None,
+                     help="prefill-miss ring slots (default 400 = a whole layer; 16 is enough when every kept expert is resident)")
+     ap.add_argument("--keep-free-gb", type=float, default=None, help="host memory to leave free when auto-sizing the arena (default 20)")
+-    ap.add_argument("--expert-format", default=os.environ.get("EXPERT_FORMAT") or "fp4", choices=["fp4", "cb3"],
++    ap.add_argument("--expert-format", default=os.environ.get("EXPERT_FORMAT") or "fp4", choices=["fp4", "cb3", "vq12", "vq6", "cbf8", "tiered"],
+                     help="routed-expert arena format: fp4 = the checkpoint's packed FP4 (18.80 MB/expert); "
+                          "cb3 = the 3-bit per-row codebook format (14.45 MB/expert, 0.769x), packed at warm "
+                          "start, which fits ~40.8%% of all routed experts in 90.5 GB instead of 31.3%%")
+diff --git a/start.sh b/start.sh
+index 4e367e1..f5cccbf 100755
+--- a/start.sh
++++ b/start.sh
+@@ -39,7 +39,13 @@ for v in MODEL_DIR PYTHON SERVED_MODEL_NAME HOST PORT MAX_SEQ ARENA_GB \
+     [[ -n "${!v:-}" ]] && _CLI[$v]="${!v}"
+ done
+ # shellcheck disable=SC1091
++# DSV41_* are read straight from the environment by the engine and are not in _CLI, so they
++# have to be saved across the .env source or .env wins over an explicit A/B setting.
++declare -A _DSV=()
++while IFS= read -r _k; do _DSV[$_k]="${!_k}"; done \
++    < <(env | sed -n 's/^\(DSV41_[A-Z0-9_]*\)=.*/\1/p')
+ [[ -f .env ]] && { set -a; . ./.env; set +a; }
++for v in "${!_DSV[@]}"; do export "$v"="${_DSV[$v]}"; done
+ for v in "${!_CLI[@]}"; do printf -v "$v" '%s' "${_CLI[$v]}"; done
+ 
+ MODEL_DIR="${MODEL_DIR:-./models/DeepSeek-V4.1-Flash}"
+diff --git a/tools/fp4_linear.py b/tools/fp4_linear.py
+index 92defff..b958046 100644
+--- a/tools/fp4_linear.py
++++ b/tools/fp4_linear.py
+@@ -211,6 +211,11 @@ def fp4_linear(x: torch.Tensor, W: FP4Weight, use_f16: bool | None = None,
+     M = x2.size(0)
+     y = torch.empty(M, W.N, dtype=torch.bfloat16, device=x.device)
+     BLOCK_M = 16 if M <= 16 else 64
++    # A weight may carry (block_n, num_warps, num_stages) measured for its own decode shape; see
++    # a100-vq/tile_policy.py. Only consulted for a generic decode-sized call.
++    _hint = getattr(W, "tile", None) if (block_n is None and BLOCK_M <= 16) else None
++    if _hint is not None:
++        block_n, num_warps, num_stages = _hint
+     BLOCK_N = pick_block_n(W.N, M, BLOCK_M) if block_n is None else block_n
+     grid = (triton.cdiv(W.N, BLOCK_N), triton.cdiv(M, BLOCK_M))
+     _fp4_linear_kernel[grid](x2, W.w, W.s, y, M, W.N, W.K // 128,
+diff --git a/tools/v41_ref.py b/tools/v41_ref.py
+index b5796a0..ae860c5 100644
+--- a/tools/v41_ref.py
++++ b/tools/v41_ref.py
+@@ -343,6 +343,31 @@ class LayerWeights:
+                 self.comp_wkv = bf("attn.compressor.wkv.weight")
+ 
+ 
++def attach_fused_qkv(blocks, tile=(16, 1, 3)):
++    """Give each block a `wqkv` = [wq_a ; wkv] so decode runs one projection instead of two.
++
++    `_attention` applies both to the same x and both scan K = 5120; neither is bandwidth-bound at
++    decode M (wkv moves 1.56 MB and costs as much as wq_a's 3.91 MB, which is what a serial K loop
++    costs whatever the byte count). Concatenating along N leaves every output row's dot product
++    unchanged, so this is a scheduling change: measured bit-exact at the kernel and token-identical
++    end to end. `tile` is the decode tile measured for the fused shape; None leaves the generic one.
++    """
++    n = 0
++    for b in blocks:
++        qa, kv = getattr(b, "wq_a", None), getattr(b, "wkv", None)
++        if FP4Weight is None or not isinstance(qa, FP4Weight) or not isinstance(kv, FP4Weight):
++            continue
++        if qa.K != kv.K:
++            continue
++        b.wqkv = FP4Weight(torch.cat([qa.w, kv.w], 0).contiguous(),
++                           torch.cat([qa.s, kv.s], 0).contiguous(), qa.N + kv.N, qa.K)
++        b.wqkv_split = qa.N
++        if tile is not None:
++            b.wqkv.tile = tile
++        n += 1
++    return n
++
++
+ def make_wo_a(weight, scale, args, groups=None):
+     """The attention output LoRA. `convert.py` dequantizes wo_a to bf16 and everything downstream
+     kept it that way: [8, 1024, 4096] bf16 = 67 MB per layer, 2.7 GB read per decode step. With
+@@ -530,6 +555,10 @@ def rms_rsqrt(x: torch.Tensor, eps: float) -> torch.Tensor:
+ 
+ 
+ def rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
++    if (_EF is not None and _EF.RMSNORM and x.ndim == 2 and x.dtype == torch.bfloat16
++            and w.dtype == torch.bfloat16 and x.stride(1) == 1 and w.is_contiguous()
++            and x.shape[0] <= _EF.RMSNORM_MAX_M and x.shape[1] <= _EF.RMSNORM_MAX_N):
++        return _EF.fused_rmsnorm(x, w, eps)      # nine launches -> one, same fp32 arithmetic
+     dtype = x.dtype
+     xf = x.float()
+     xf = xf * rms_rsqrt(xf, eps)
+@@ -594,6 +623,10 @@ def hc_post(x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: t
+     of this port summed over the second index, comb @ residual: a transposed mixing matrix that
+     left the model coherent but measurably worse -- teacher-forced NLL and stuttering generation.)
+     """
++    if (_EF is not None and getattr(_EF, "HC_POST", False) and x.dtype == torch.bfloat16
++            and residual.dtype == torch.bfloat16 and x.is_contiguous()
++            and residual.is_contiguous() and residual.shape[1] in (2, 4, 8)):
++        return _EF.fused_hc_post(x, residual, post, comb)
+     mixed = torch.einsum("sij,sid->sjd", comb.float(), residual.float())
+     y = post.unsqueeze(-1) * x.float().unsqueeze(1) + mixed
+     return y.type_as(x)
+@@ -610,10 +643,23 @@ def router(x: torch.Tensor, w: LayerWeights, args: Args):
+     return weights, indices, scores
+ 
+ 
++try:
++    import elem_fused as _EF
++except Exception:
++    _EF = None
++
++
+ def expert_ffn(x: torch.Tensor, w1, w2, w3, limit: float, weights: torch.Tensor | None = None) -> torch.Tensor:
+     dtype = x.dtype
+-    gate = qlinear(x, w1).float()
+-    up = qlinear(x, w3).float()
++    g = qlinear(x, w1)
++    u = qlinear(x, w3)
++    if (weights is None and limit > 0 and _EF is not None and _EF.SWIGLU
++            and g.dtype == torch.bfloat16 and u.dtype == torch.bfloat16):
++        # one kernel instead of two casts, two clamps, a silu, a multiply and a cast back;
++        # bit-identical to the sequence below (a100-vq/elem_fuse.py, T = 1..8)
++        return qlinear(_EF.fused_swiglu(g, u, limit), w2)
++    gate = g.float()
++    up = u.float()
+     if limit > 0:
+         up = torch.clamp(up, min=-limit, max=limit)
+         gate = torch.clamp(gate, max=limit)
