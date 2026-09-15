@@ -185,14 +185,90 @@ def load_model(ckpt_path: str, devices: list[int], max_seq_len: int = 16384, max
     print("placement:", {str(d): placement.count(d) for d in dict.fromkeys(placement)}, flush=True)
     model = Transformer(args)
     t0 = time.time()
-    # per-(owner layer, device) mirrors of the shared compressed-KV and index-key caches
-    for owner in cfg["kv_source_layers"]:
-        if owner >= n_layers:
-            continue
-        rows = max_seq_len // cfg["compress_ratios"][owner] + 1  # + one dummy row for the static decode path
-        for d in dict.fromkeys(placement):
-            model.shared.compress_kv[(owner, d)] = torch.zeros(max_seqs, rows, cfg["head_dim"], dtype=torch.bfloat16, device=d)
-            model.shared.index_k[(owner, d)] = torch.zeros(max_seqs, rows, cfg["index_head_dim"], dtype=torch.bfloat16, device=d)
+    # Per-(owner layer, device) mirrors of compressed-KV/index-K.
+    #
+    # Do NOT mirror every owner onto every GPU.  An owner's cache is only
+    # consumed by layers from that owner up to (but excluding) the next
+    # KV source layer.  With long contexts, full mirroring wastes several
+    # times the required VRAM.
+    #
+    # DSV41_FULL_CACHE_MIRROR=1 restores the historical behaviour.
+    owners = [o for o in cfg["kv_source_layers"] if o < n_layers]
+    all_devices = list(dict.fromkeys(placement))
+    # Safe default: mirror caches on every device.
+    #
+    # Consumer-local cache placement is still experimental and can miss
+    # valid cross-device accesses such as (owner_layer, cuda:0).
+    #
+    # Opt in explicitly with:
+    #   DSV41_CONSUMER_LOCAL_CACHE=1
+    consumer_local_cache = (
+        os.environ.get("DSV41_CONSUMER_LOCAL_CACHE", "0") == "1"
+    )
+
+    cache_total_bytes = 0
+
+    for oi, owner in enumerate(owners):
+        ratio = cfg["compress_ratios"][owner]
+        rows = max_seq_len // ratio + 1  # + dummy row for static decode
+
+        next_owner = owners[oi + 1] if oi + 1 < len(owners) else n_layers
+
+        if consumer_local_cache:
+            # Experimental memory-saving mode.
+            # May be unsafe if a later execution path accesses this owner's
+            # cache from a device not represented in placement[owner:next_owner].
+            consumer_devices = list(
+                dict.fromkeys(placement[owner:next_owner])
+            )
+        else:
+            # Safe/default mode.
+            consumer_devices = all_devices
+
+        if not consumer_devices:
+            raise RuntimeError(
+                f"no cache consumer device for owner layer {owner}"
+            )
+
+        one_mirror_bytes = (
+            max_seqs
+            * rows
+            * (cfg["head_dim"] + cfg["index_head_dim"])
+            * 2  # bf16
+        )
+
+        for d in consumer_devices:
+            model.shared.compress_kv[(owner, d)] = torch.zeros(
+                max_seqs,
+                rows,
+                cfg["head_dim"],
+                dtype=torch.bfloat16,
+                device=d,
+            )
+
+            model.shared.index_k[(owner, d)] = torch.zeros(
+                max_seqs,
+                rows,
+                cfg["index_head_dim"],
+                dtype=torch.bfloat16,
+                device=d,
+            )
+
+            cache_total_bytes += one_mirror_bytes
+
+        print(
+            f"  cache owner {owner:2d}: rows={rows:,} "
+            f"ratio={ratio} devices={[str(d) for d in consumer_devices]} "
+            f"mirror={one_mirror_bytes / 2**30:.3f} GiB/device",
+            flush=True,
+        )
+
+    print(
+        f"shared compressed cache total: "
+        f"{cache_total_bytes / 2**30:.3f} GiB "
+        f"({'consumer-local mirrors' if consumer_local_cache else 'FULL MIRROR'})",
+        flush=True,
+    )
     for i in range(n_layers):
         dev = placement[i]
         w = load_layer(ckpt, i, dev, offload=offload_experts, ep=ep_shards)

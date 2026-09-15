@@ -73,6 +73,47 @@ def precompute_freqs_cis(dim, seqlen, original_seq_len, base, factor, beta_fast,
     return torch.polar(torch.ones_like(freqs), freqs).to(device)
 
 
+
+@lru_cache(32)
+def get_rope_tables(
+    dim,
+    seqlen,
+    original_seq_len,
+    base,
+    factor,
+    beta_fast,
+    beta_slow,
+    device,
+):
+    """Shared RoPE tables.
+
+    The old Attention.__init__ reused freqs_cis only opportunistically,
+    then materialized fresh contiguous cos/sin arrays for every layer.
+
+    At large max_seq_len that wastes substantial VRAM.  Layers with the
+    same RoPE configuration on the same GPU can safely share these
+    immutable tables.
+    """
+    freqs_cis = precompute_freqs_cis(
+        dim,
+        seqlen,
+        original_seq_len,
+        base,
+        factor,
+        beta_fast,
+        beta_slow,
+        device,
+    )
+
+    # view_as_real itself is a view.  Do not materialize an unnecessary
+    # full [seq, dim/2, 2] temporary.
+    cs = torch.view_as_real(freqs_cis)
+
+    cos = cs[..., 0].contiguous()
+    sin = cs[..., 1].contiguous()
+
+    return freqs_cis, cos, sin
+
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False) -> torch.Tensor:
     """In-place rotation of the last dim (pairs as complex). x: [b, s, d] or [b, s, h, d]."""
     y = x
@@ -476,10 +517,16 @@ class Attention:
             original_seq_len, rope_theta = args.original_seq_len, args.compress_rope_theta
         else:
             original_seq_len, rope_theta = 0, args.rope_theta
-        self.freqs_cis = precompute_freqs_cis(self.rope_head_dim, args.max_seq_len, original_seq_len, rope_theta,
-                                              args.rope_factor, args.beta_fast, args.beta_slow, device)
-        cs = torch.view_as_real(self.freqs_cis).contiguous()
-        self.cos, self.sin = cs[..., 0].contiguous(), cs[..., 1].contiguous()
+        self.freqs_cis, self.cos, self.sin = get_rope_tables(
+            self.rope_head_dim,
+            args.max_seq_len,
+            original_seq_len,
+            rope_theta,
+            args.rope_factor,
+            args.beta_fast,
+            args.beta_slow,
+            device,
+        )
         if self.indexer is not None:
             self.indexer.freqs_cis = self.freqs_cis
             self.indexer.cos, self.indexer.sin = self.cos, self.sin
