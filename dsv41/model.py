@@ -217,37 +217,234 @@ class Indexer:
     def __call__(self, x, qr, latent, start_pos: int, offset: int):
         bsz, seqlen, _ = x.size()
         ratio, rd, end_pos = self.ratio, self.rope_head_dim, start_pos + seqlen
+
         if self.owns_k:
-            # consumers up to the next owner read this layer's keys, whether or not a new group completed
+            # consumers up to the next owner read this layer's keys
             self.shared.index_owner = self.layer_id
+
         if self.owns_k and latent is not None:
             k = rmsnorm(F.linear(latent, self.wk), self.k_norm_w, self.eps)
             if start_pos == 0:
                 rope_(k, rd, self.cos, self.sin, 0, pos_stride=ratio)
             else:
                 rope_(k, rd, self.cos, self.sin, start_pos + 1 - ratio)
+
             k = fake_quant_fp4(k, 32)
-            self.shared.write_index_k(self.layer_id, bsz, start_pos // ratio, k)
-        q = linear_fp8(qr, self.wq_b).unflatten(-1, (self.n_heads, self.head_dim))
+            self.shared.write_index_k(
+                self.layer_id,
+                bsz,
+                start_pos // ratio,
+                k,
+            )
+
+        q = linear_fp8(qr, self.wq_b).unflatten(
+            -1, (self.n_heads, self.head_dim)
+        )
         rope_(q, rd, self.cos, self.sin, start_pos)
         q = fake_quant_fp4(q, 32)
-        index_k = self.shared.index_k[(self.shared.index_owner, self.device)][:bsz, : end_pos // ratio]
-        weights = F.linear(x, self.weights_proj) * (self.softmax_scale * self.n_heads**-0.5)
-        index_score = torch.einsum("bshd,btd->bsht", q.float(), index_k.float())
-        index_score = (index_score.relu_() * weights.float().unsqueeze(-1)).sum(dim=2)
+
+        index_k = self.shared.index_k[
+            (self.shared.index_owner, self.device)
+        ][:bsz, : end_pos // ratio]
+
+        weights = F.linear(x, self.weights_proj) * (
+            self.softmax_scale * self.n_heads**-0.5
+        )
+
+        # ===============================================================
+        # CHUNKED PREFILL
+        #
+        # Original:
+        #   [B,S,H,T] fp32
+        #
+        # 5767 x 32 x 5767 x 4 bytes ~= 3.96 GiB.
+        #
+        # Chunk only the query dimension. This is mathematically the same
+        # operation, but peak scratch becomes roughly:
+        #
+        #   [B,128,H,T]
+        #
+        # Decode keeps the original path.
+        # ===============================================================
+        if start_pos == 0 and seqlen > 128:
+            QUERY_CHUNK = 128
+
+            key_len = index_k.size(1)
+            key_pos = torch.arange(
+                key_len,
+                device=x.device,
+            )
+
+            # One conversion per layer instead of per query chunk.
+            index_k_f = index_k.float()
+
+            idx_chunks = []
+            candidate_chunks = [] if self.is_candidate_source else None
+
+            topk = min(self.topk, end_pos // ratio)
+
+            for q0 in range(0, seqlen, QUERY_CHUNK):
+                q1 = min(q0 + QUERY_CHUNK, seqlen)
+
+                qc = q[:, q0:q1].float()
+                wc = weights[:, q0:q1].float()
+
+                # [B,C,H,D] x [B,T,D] => [B,C,H,T]
+                score = torch.einsum(
+                    "bshd,btd->bsht",
+                    qc,
+                    index_k_f,
+                )
+
+                # Avoid another full [B,C,H,T] temporary.
+                score.relu_()
+                score.mul_(wc.unsqueeze(-1))
+
+                # Reduce heads immediately.
+                # [B,C,H,T] -> [B,C,T]
+                score = score.sum(dim=2)
+
+                # Preserve original causal/compression visibility.
+                compress_lens = (
+                    torch.arange(
+                        q0 + 1,
+                        q1 + 1,
+                        device=x.device,
+                    ) // ratio
+                ).unsqueeze(-1)
+
+                score.masked_fill_(
+                    key_pos >= compress_lens,
+                    -torch.inf,
+                )
+
+                if self.is_candidate_source:
+                    cand = select_candidate_blocks(
+                        score,
+                        compress_lens,
+                        self.candidate_topk_blocks,
+                        self.candidate_block_size,
+                    )
+                    candidate_chunks.append(cand)
+
+                elif self.uses_candidates:
+                    cand = self.shared.candidates[:, q0:q1]
+
+                    if cand.device != score.device:
+                        cand = cand.to(
+                            score.device,
+                            non_blocking=True,
+                        )
+
+                    score.masked_fill_(
+                        ~cand,
+                        -torch.inf,
+                    )
+
+                idx = (
+                    score
+                    .topk(
+                        topk,
+                        dim=-1,
+                        sorted=False,
+                    )
+                    .indices
+                    .sort(dim=-1)
+                    .values
+                )
+
+                idx_chunks.append(
+                    torch.where(
+                        idx < compress_lens,
+                        idx + offset,
+                        -1,
+                    ).int()
+                )
+
+                del qc, wc, score
+
+            if self.is_candidate_source:
+                self.shared.candidates = torch.cat(
+                    candidate_chunks,
+                    dim=1,
+                )
+
+            return torch.cat(idx_chunks, dim=1)
+
+        # ===============================================================
+        # Original path for decode / short prefill
+        # ===============================================================
+
+        index_score = torch.einsum(
+            "bshd,btd->bsht",
+            q.float(),
+            index_k.float(),
+        )
+
+        # Original was:
+        #
+        # (index_score.relu_() *
+        #  weights.float().unsqueeze(-1)).sum(dim=2)
+        #
+        # mul_ avoids another huge allocation.
+        index_score.relu_()
+        index_score.mul_(
+            weights.float().unsqueeze(-1)
+        )
+        index_score = index_score.sum(dim=2)
+
         if start_pos == 0:
-            compress_lens = (torch.arange(1, seqlen + 1, device=x.device) // ratio).unsqueeze(-1)
-            index_score.masked_fill_(torch.arange(seqlen // ratio, device=x.device) >= compress_lens, -torch.inf)
+            compress_lens = (
+                torch.arange(
+                    1,
+                    seqlen + 1,
+                    device=x.device,
+                ) // ratio
+            ).unsqueeze(-1)
+
+            index_score.masked_fill_(
+                torch.arange(
+                    seqlen // ratio,
+                    device=x.device,
+                ) >= compress_lens,
+                -torch.inf,
+            )
         else:
             compress_lens = end_pos // ratio
-        if self.is_candidate_source:
-            self.shared.candidates = select_candidate_blocks(index_score, compress_lens, self.candidate_topk_blocks, self.candidate_block_size)
-        elif self.uses_candidates:
-            index_score = index_score.masked_fill(~self.shared.candidates.to(index_score.device), -torch.inf)
-        topk = min(self.topk, end_pos // ratio)
-        idxs = index_score.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values
-        return torch.where(idxs < compress_lens, idxs + offset, -1).int()
 
+        if self.is_candidate_source:
+            self.shared.candidates = select_candidate_blocks(
+                index_score,
+                compress_lens,
+                self.candidate_topk_blocks,
+                self.candidate_block_size,
+            )
+
+        elif self.uses_candidates:
+            index_score = index_score.masked_fill(
+                ~self.shared.candidates.to(index_score.device),
+                -torch.inf,
+            )
+
+        topk = min(self.topk, end_pos // ratio)
+
+        idxs = (
+            index_score
+            .topk(
+                topk,
+                dim=-1,
+                sorted=False,
+            )
+            .indices
+            .sort(dim=-1)
+            .values
+        )
+
+        return torch.where(
+            idxs < compress_lens,
+            idxs + offset,
+            -1,
+        ).int()
 
 class Attention:
     def __init__(self, args: Args, layer_id: int, w: dict, device, shared: SharedAttn):

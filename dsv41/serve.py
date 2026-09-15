@@ -6,6 +6,7 @@
 
 Endpoints: GET /v1/models, POST /v1/chat/completions (stream or not), POST /v1/completions, GET /health.
 One request is generated at a time; others wait on the engine lock."""
+import torch
 import argparse
 import json
 import time
@@ -78,7 +79,69 @@ class Handler(BaseHTTPRequestHandler):
         params = _params(body)
         rid = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created = int(time.time())
+        print(
+          f"[chat] prompt_tokens={len(ids)} "
+          f"max_seq_len={eng.max_seq_len} "
+          f"max_tokens={body.get('max_tokens')} "
+          f"stream={body.get('stream')}",
+          flush=True,
+        )
         if body.get("stream"):
+            # Generate before sending HTTP 200 so generation failures can
+            # still be returned as proper HTTP errors.
+            try:
+                text, n = eng.generate_text(ids, params)
+
+            except torch.OutOfMemoryError as e:
+                torch.cuda.empty_cache()
+                return self._json(
+                    507,
+                    {
+                        "error": {
+                            "message": f"CUDA out of memory: {e}",
+                            "type": "cuda_out_of_memory",
+                        }
+                    },
+                )
+
+            except Exception as e:
+                return self._json(
+                    500,
+                    {
+                        "error": {
+                            "message": str(e),
+                            "type": "generation_error",
+                        }
+                    },
+                )
+
+            # DeepSeek completion may contain thinking / DSML tool calls.
+            # Always parse it before exposing an OpenAI-compatible response.
+            msg = eng.parse_completion(text, thinking)
+
+            if isinstance(msg, dict):
+                content = msg.get("content")
+                reasoning = msg.get("reasoning_content")
+                tool_calls = msg.get("tool_calls") or []
+            else:
+                content = text
+                reasoning = None
+                tool_calls = []
+
+            # Never silently discard generated text.
+            if not content and not tool_calls:
+                content = text
+
+            print(
+                f"[chat] GENERATED n={n} "
+                f"raw_chars={len(text)} "
+                f"content_chars={len(content or '')} "
+                f"tool_calls={len(tool_calls)} "
+                f"raw_preview={text[:300]!r}",
+                flush=True,
+            )
+
+            # Generation succeeded. Now it is safe to send HTTP 200.
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
@@ -86,22 +149,99 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
 
             def chunk(delta, finish=None):
-                obj = {"id": rid, "object": "chat.completion.chunk", "created": created, "model": eng.model_name,
-                       "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
-                self.wfile.write(f"data: {json.dumps(obj, ensure_ascii=False)}\n\n".encode())
+                obj = {
+                    "id": rid,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": eng.model_name,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": delta,
+                            "finish_reason": finish,
+                        }
+                    ],
+                }
+
+                payload = (
+                    "data: "
+                    + json.dumps(obj, ensure_ascii=False)
+                    + "\n\n"
+                )
+
+                self.wfile.write(payload.encode("utf-8"))
                 self.wfile.flush()
 
-            chunk({"role": "assistant", "content": ""})
-            n = 0
             try:
-                for _, piece in eng.generate(ids, params):
-                    chunk({"content": piece})
-                    n += 1
+                # Do NOT emit content:"" here.
+                chunk({"role": "assistant"})
+
+                if reasoning:
+                    # LiteLLM understands reasoning_content for OpenAI-style
+                    # backends. Keep it separate from visible answer text.
+                    chunk({"reasoning_content": reasoning})
+
+                if content:
+                    # Send text in moderate chunks rather than one huge
+                    # delta. This is friendlier to LiteLLM's Anthropic
+                    # streaming bridge.
+                    for i in range(0, len(content), 64):
+                        chunk(
+                            {
+                                "content": content[i:i + 64]
+                            }
+                        )
+
+                if tool_calls:
+                    for i, tc in enumerate(tool_calls):
+                        tc = dict(tc)
+
+                        tc.setdefault(
+                            "id",
+                            f"call_{uuid.uuid4().hex[:24]}",
+                        )
+                        tc.setdefault("type", "function")
+
+                        fn = tc.get("function") or {}
+                        args = fn.get("arguments", "")
+
+                        if not isinstance(args, str):
+                            args = json.dumps(
+                                args,
+                                ensure_ascii=False,
+                            )
+
+                        chunk(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": i,
+                                        "id": tc["id"],
+                                        "type": tc["type"],
+                                        "function": {
+                                            "name": fn.get("name", ""),
+                                            "arguments": args,
+                                        },
+                                    }
+                                ]
+                            }
+                        )
+
+                if tool_calls:
+                    finish = "tool_calls"
+                elif n >= params.max_new_tokens:
+                    finish = "length"
+                else:
+                    finish = "stop"
+
+                chunk({}, finish)
+
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+
             except (BrokenPipeError, ConnectionResetError):
                 return
-            chunk({}, "length" if n >= params.max_new_tokens else "stop")
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
+
             return
         text, n = eng.generate_text(ids, params)
         msg = eng.parse_completion(text, thinking)

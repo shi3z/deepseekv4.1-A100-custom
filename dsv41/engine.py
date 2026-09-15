@@ -100,9 +100,15 @@ class Engine:
             out: list[int] = []
             decoded_upto = 0
             pending = ""
-            for _ in range(max_new):
+            for step in range(max_new):
                 t = sample_token(logits[0], p.temperature, p.top_p, gen)
                 if t == self.eos:
+                    print(
+                     f"[generate] STOP=eos step={step} pos={pos} "
+                     f"max_new={max_new}",
+                     flush=True,
+                    )
+
                     break
                 out.append(t)
                 # decode incrementally; hold back a partial multi-byte character
