@@ -249,20 +249,6 @@ def grouped_fp4_gemm(a: torch.Tensor, w: torch.Tensor, s: torch.Tensor, pairs: G
     split = 1
     while not DETERMINISTIC and tiles * triton.cdiv(N, bn) * split < 432 and split < 8 and (K // (split * 2)) % bk == 0:
         split *= 2
-    print(
-        "[GEMM-DEV] "
-        f"a={a.device} "
-        f"w={w.device} "
-        f"s={s.device} "
-        f"out={out.device} "
-        f"row_in={pairs.row_in.device} "
-        f"row_out={pairs.row_out.device} "
-        f"weight={pairs.weight.device} "
-        f"tile_expert={pairs.tile_expert.device} "
-        f"tile_start={pairs.tile_start.device} "
-        f"tile_count={pairs.tile_count.device}",
-        flush=True,
-    )
 
     with torch.cuda.device(a.device):  # Triton launches on the current device; our layers live on many
         _grouped_fp4_kernel_masked[(tiles, triton.cdiv(N, bn), split)](

@@ -22,6 +22,7 @@ from .kernels import sparse_attn as sparse_attn_prefill
 from .moe_kernels import GroupedPairs, grouped_fp4_gemm, grouped_fp4_gemm_chunked
 from . import cukern
 from .quant import maybe_compile
+import os
 
 
 @dataclass
@@ -129,17 +130,128 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = F
 
 
 @lru_cache(4)
-def get_window_topk_idxs(window_size: int, bsz: int, seqlen: int, start_pos: int, device):
-    if start_pos == 0:
-        end = torch.arange(seqlen).unsqueeze(1)
-        idxs = (end - window_size + 1).clamp(0) + torch.arange(min(seqlen, window_size))
-        idxs = torch.where(idxs > end, -1, idxs)
-    else:
-        oldest = start_pos % window_size + 1
-        idxs = torch.cat([torch.arange(oldest, window_size), torch.arange(oldest)])
-        idxs = torch.where(idxs > start_pos, -1, idxs)
-    return idxs.int().unsqueeze(0).expand(bsz, -1, -1).contiguous().to(device)
+def get_window_topk_idxs(
+    window_size: int,
+    bsz: int,
+    seqlen: int,
+    start_pos: int,
+    device,
+):
+    """Return physical ring-buffer KV indices for every query token.
 
+    Shape:
+        [bsz, seqlen, width]
+
+    For continuation prefill (start_pos > 0, seqlen > 1), each query row
+    gets its own causal sliding window.  This is important because the
+    whole continuation chunk is already written into the ring buffer
+    before attention runs; later tokens in the same chunk must therefore
+    be excluded from earlier query rows.
+
+    The returned values are physical slots in window_kv_cache, not
+    absolute token positions.
+    """
+
+    if seqlen <= 0:
+        return torch.empty(
+            (bsz, 0, 0),
+            dtype=torch.int32,
+            device=device,
+        )
+
+    # Keep the old compact representation for an initial prompt.  It
+    # avoids materialising a full window width when the prompt itself is
+    # shorter than the window.
+    if start_pos == 0:
+        qpos = torch.arange(
+            seqlen,
+            dtype=torch.long,
+        ).unsqueeze(1)
+
+        width = min(
+            seqlen,
+            window_size,
+        )
+
+        # Absolute positions represented by each row.
+        abs_idx = (
+            (qpos - window_size + 1).clamp_min(0)
+            + torch.arange(
+                width,
+                dtype=torch.long,
+            ).unsqueeze(0)
+        )
+
+        valid = abs_idx <= qpos
+
+        # Initial prefill uses non-wrapped KV order.
+        idxs = torch.where(
+            valid,
+            abs_idx,
+            -1,
+        )
+
+    else:
+        # --------------------------------------------------------
+        # Continuation prefill / decode.
+        #
+        # Query i corresponds to absolute position:
+        #
+        #     q = start_pos + i
+        #
+        # Its causal window consists of:
+        #
+        #     q-window+1 ... q
+        #
+        # and each absolute position maps to the physical ring slot:
+        #
+        #     abs_pos % window_size
+        # --------------------------------------------------------
+
+        qpos = (
+            start_pos
+            + torch.arange(
+                seqlen,
+                dtype=torch.long,
+            )
+        ).unsqueeze(1)
+
+        rel = torch.arange(
+            window_size,
+            dtype=torch.long,
+        ).unsqueeze(0)
+
+        abs_idx = (
+            qpos
+            - window_size
+            + 1
+            + rel
+        )
+
+        valid = (
+            (abs_idx >= 0)
+            & (abs_idx <= qpos)
+        )
+
+        physical = torch.remainder(
+            abs_idx,
+            window_size,
+        )
+
+        idxs = torch.where(
+            valid,
+            physical,
+            -1,
+        )
+
+    return (
+        idxs
+        .to(torch.int32)
+        .unsqueeze(0)
+        .expand(bsz, -1, -1)
+        .contiguous()
+        .to(device)
+    )
 
 def select_candidate_blocks(logits, compress_lens, topk_blocks: int, block_size: int) -> torch.Tensor:
     width = logits.size(-1)
@@ -346,15 +458,74 @@ class Compressor:
             score = score.unflatten(1, (-1, ratio))
             kv = (kv * score.softmax(dim=2)).sum(dim=2)
         else:
-            should = (start_pos + 1) % ratio == 0
-            slot = start_pos % ratio
-            self.kv_state[:bsz, slot] = kv.squeeze(1)
-            self.score_state[:bsz, slot] = score.squeeze(1)
-            if should:
-                kv = (self.kv_state[:bsz] * self.score_state[:bsz].softmax(dim=1)).sum(dim=1, keepdim=True)
-        if not should:
-            return None
-        return rmsnorm(kv.to(dtype), self.norm_w, self.eps)
+            # ----------------------------------------------------
+            # Multi-token continuation.
+            #
+            # The old path assumed seqlen == 1:
+            #
+            #   slot = start_pos % ratio
+            #   state[:, slot] = kv.squeeze(1)
+            #
+            # Instead, consume the continuation chunk in pieces up
+            # to each compression boundary.  This preserves exactly
+            # the same state evolution as scalar decode, while a
+            # 64-token continuation requires only ~64/ratio loop
+            # iterations rather than 64 model.forward() calls.
+            # ----------------------------------------------------
+            pooled = []
+
+            j = 0
+            abs_pos = start_pos
+
+            while j < seqlen:
+                slot = abs_pos % ratio
+
+                # Number of tokens that fit before this compression
+                # group reaches its boundary.
+                take = min(
+                    ratio - slot,
+                    seqlen - j,
+                )
+
+                self.kv_state[
+                    :bsz,
+                    slot:slot + take,
+                ] = kv[:, j:j + take]
+
+                self.score_state[
+                    :bsz,
+                    slot:slot + take,
+                ] = score[:, j:j + take]
+
+                j += take
+                abs_pos += take
+
+                # A complete ratio-sized compression group is ready.
+                if abs_pos % ratio == 0:
+                    pooled.append(
+                        (
+                            self.kv_state[:bsz]
+                            * self.score_state[:bsz]
+                                .softmax(dim=1)
+                        ).sum(
+                            dim=1,
+                            keepdim=True,
+                        )
+                    )
+
+            if not pooled:
+                return None
+
+            kv = torch.cat(
+                pooled,
+                dim=1,
+            )
+
+        return rmsnorm(
+            kv.to(dtype),
+            self.norm_w,
+            self.eps,
+        )
 
 
 class Indexer:
@@ -668,10 +839,38 @@ class Attention:
                 self.window_kv_cache[:bsz, :seqlen] = kv
             else:
                 cut = seqlen % win
-                self.window_kv_cache[:bsz, cut:win], self.window_kv_cache[:bsz, :cut] = kv[:, -win:].split([win - cut, cut], dim=1)
+                self.window_kv_cache[:bsz, cut:win], self.window_kv_cache[:bsz, :cut] = (
+                    kv[:, -win:].split([win - cut, cut], dim=1)
+                )
             window_kv = kv
-        else:
+
+        elif seqlen == 1:
+            # Existing fast decode path.
             self.window_kv_cache[:bsz, start_pos % win] = kv.squeeze(1)
+            window_kv = self.window_kv_cache[:bsz]
+
+        else:
+            # Continuation-prefill path.
+            #
+            # Write all incoming tokens to their ring-buffer positions.
+            # Advanced indexing naturally handles wrap-around.
+            pos = (
+                start_pos
+                + torch.arange(
+                    seqlen,
+                    device=x.device,
+                    dtype=torch.long,
+                )
+            ) % win
+
+            self.window_kv_cache[:bsz, pos] = kv
+
+            # sparse_attn_prefill expects the current chunk to be visible
+            # together with the historical window.
+            #
+            # The cache is physically ring ordered. get_window_topk_idxs()
+            # already receives start_pos and maps logical positions into
+            # this ring layout, so keep the physical cache ordering here.
             window_kv = self.window_kv_cache[:bsz]
         return window_kv, get_window_topk_idxs(win, bsz, seqlen, start_pos, x.device)
 
@@ -694,9 +893,31 @@ class Attention:
         if latent is not None:
             latent = latent.contiguous()
             if start_pos == 0:
-                rope_(latent, self.rope_head_dim, self.cos, self.sin, 0, pos_stride=ratio)
+                rope_(
+                    latent,
+                    self.rope_head_dim,
+                    self.cos,
+                    self.sin,
+                    0,
+                    pos_stride=ratio,
+                )
             else:
-                rope_(latent, self.rope_head_dim, self.cos, self.sin, start_pos + 1 - ratio)
+                # The first compressed row belongs to the compression
+                # group containing start_pos.  Additional rows are
+                # spaced by `ratio` absolute token positions.
+                first_group_start = (
+                    start_pos
+                    - (start_pos % ratio)
+                )
+
+                rope_(
+                    latent,
+                    self.rope_head_dim,
+                    self.cos,
+                    self.sin,
+                    first_group_start,
+                    pos_stride=ratio,
+                )
             latent = fake_quant_fp4(latent, 16, scale_e4m3=True)
             self.shared.write_compress_kv(self.layer_id, bsz, start_pos // ratio, latent)
         return self.shared.compress_kv[(self.shared.kv_owner, self.device)][:bsz, :compress_len], idxs
@@ -713,10 +934,30 @@ class Attention:
             ckv, cidx = self._compress_kv(x, qr, start_pos, kv.size(1))
             kv = torch.cat([kv, ckv], dim=1)
             topk_idxs = torch.cat([topk_idxs, cidx], dim=-1)
-        if seqlen == 1:
-            o = sparse_attn_decode(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
+        # Prefix-cache replay deliberately uses the prefill kernel even
+        # for a single token.  The optimized decode Triton kernel assumes
+        # the normal decode layout and currently fails to compile for the
+        # rollback/replay path at arbitrary start_pos.
+        force_prefill = bool(
+            getattr(self, "_prefix_replay_prefill", False)
+        )
+
+        if seqlen == 1 and not force_prefill:
+            o = sparse_attn_decode(
+                q,
+                kv,
+                self.attn_sink,
+                topk_idxs,
+                self.softmax_scale,
+            )
         else:
-            o = sparse_attn_prefill(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
+            o = sparse_attn_prefill(
+                q,
+                kv,
+                self.attn_sink,
+                topk_idxs,
+                self.softmax_scale,
+            )
         rope_(o, rd, self.cos, self.sin, start_pos, inverse=True)
         o = o.view(bsz, seqlen, self.n_groups, -1)
         o = oproj_a(o, self.wo_a, self.n_groups, self.o_lora_rank)
@@ -781,32 +1022,276 @@ class MoE:
         return linear_w(h, self.sh_w2).float()
 
     def _forward_ep(self, xq, eid, tok, weights, n_tok, n_pairs):
-        """Eager / prefill path with sharded experts: each shard computes its pairs on its own device, the
-        per-token sums come back to the owner device (used for prefill; decode uses dsv41/ep.py)."""
-        # one output row per (token, expert) pair, filled by the shard that holds the expert, summed in a fixed
-        # order per token: deterministic (no atomics across a token's experts)
-        yp = torch.zeros(n_pairs, self.dim, device=xq.device, dtype=torch.float32)
+        """Parallel low-memory EP prefill with routed-xq compaction.
+
+        Remote shards normally receive only the token rows that actually
+        route to experts resident on that shard.
+
+        Set:
+            DSV41_EP_COMPACT_XQ=0
+        to restore full-xq peer copies for an A/B benchmark.
+
+        The pair output is reduced directly into [n_tok, dim], so the
+        old [n_pairs, dim] FP32 owner buffer remains eliminated.
+        """
+        owner = xq.device
+
+        compact_xq = os.environ.get(
+            "DSV41_EP_COMPACT_XQ",
+            "1",
+        ) != "0"
+
+        y = torch.zeros(
+            n_tok,
+            self.dim,
+            dtype=torch.float32,
+            device=owner,
+        )
+
         wflat = weights.flatten().float()
+
+        if not hasattr(self, "_ep_prefill_streams"):
+            self._ep_prefill_streams = {}
+
+        jobs = []
+
+        remote_full_rows = 0
+        remote_sent_rows = 0
+
+        # --------------------------------------------------------------
+        # Route preparation on layer owner.
+        #
+        # tok is monotonically nondecreasing because it originates from
+        # repeat_interleave(topk).  After sel preserves pair order,
+        # unique_consecutive is sufficient and avoids a sorting unique().
+        # --------------------------------------------------------------
         for sh in self.ep:
-            sel = ((eid >= sh["start"]) & (eid < sh["start"] + sh["n"])).nonzero().flatten()
-            if sel.numel() == 0:
+            sel = (
+                (eid >= sh["start"])
+                & (eid < sh["start"] + sh["n"])
+            ).nonzero().flatten()
+
+            m = int(sel.numel())
+            if m == 0:
                 continue
+
             d = sh["device"]
-            xs = xq.to(d)
-            le = (eid[sel] - sh["start"]).to(d)
-            tk = tok[sel].to(d)
-            wt = wflat[sel].to(d)
-            m = sel.numel()
-            local_rows = torch.arange(m, device=d, dtype=torch.int32)
-            ones = torch.ones(m, device=d)
-            block_m = 64
-            p1 = GroupedPairs(le, tk, local_rows, ones, block_m)
-            gu = grouped_fp4_gemm(xs, sh["w13"], sh["s13"], p1, m)
-            hq = swiglu_quant(gu, wt.contiguous(), self.inter, self.swiglu_limit)
-            p2 = GroupedPairs(le, local_rows, local_rows, ones, block_m)
-            ys = grouped_fp4_gemm(hq, sh["w2"], sh["s2"], p2, m)
-            yp[sel] = ys.to(xq.device)
-        return yp.view(n_tok, self.topk, self.dim).sum(dim=1)
+
+            stream = self._ep_prefill_streams.get(d)
+            if stream is None:
+                stream = torch.cuda.Stream(device=d)
+                self._ep_prefill_streams[d] = stream
+
+            pair_tok_owner = tok[sel].to(torch.int64)
+
+            job = {
+                "sh": sh,
+                "sel": sel,
+                "m": m,
+                "device": d,
+                "stream": stream,
+                "pair_tok_owner": pair_tok_owner,
+                "le_owner": (
+                    eid[sel] - sh["start"]
+                ).to(torch.int32),
+                "wt_owner": wflat[sel].contiguous(),
+            }
+
+            if d != owner:
+                remote_full_rows += n_tok
+
+                if compact_xq:
+                    uniq, inv = torch.unique_consecutive(
+                        pair_tok_owner,
+                        return_inverse=True,
+                    )
+
+                    job["uniq_tok_owner"] = uniq
+                    job["tk_compute_owner"] = inv.to(torch.int32)
+
+                    remote_sent_rows += int(uniq.numel())
+                else:
+                    job["tk_compute_owner"] = pair_tok_owner.to(
+                        torch.int32
+                    )
+                    remote_sent_rows += n_tok
+            else:
+                # Local owner shard needs no P2P transfer and therefore
+                # uses original xq row indices directly.
+                job["tk_compute_owner"] = pair_tok_owner.to(
+                    torch.int32
+                )
+
+            jobs.append(job)
+
+        # Finish route tensors before remote devices consume them.
+        torch.cuda.current_stream(owner).synchronize()
+
+        # --------------------------------------------------------------
+        # Launch expert work.
+        #
+        # For compact remote jobs, create only routed xq rows on owner,
+        # copy them to the destination, wait only for that copy, release
+        # the temporary source, then launch expert compute.
+        #
+        # This is deliberately conservative about source lifetime.  GPU N
+        # can compute while the next shard's compact input is prepared.
+        # --------------------------------------------------------------
+        for job in jobs:
+            sh = job["sh"]
+            d = job["device"]
+            m = job["m"]
+            stream = job["stream"]
+
+            if d == owner:
+                xs = xq
+
+            elif compact_xq:
+                # Gather only rows needed by this expert shard.
+                xs_src = xq.index_select(
+                    0,
+                    job["uniq_tok_owner"],
+                )
+
+                # Ensure gather has materialized before peer copy.
+                torch.cuda.current_stream(owner).synchronize()
+
+                with torch.cuda.device(d), torch.cuda.stream(stream):
+                    xs = xs_src.to(
+                        d,
+                        non_blocking=True,
+                    )
+
+                # Make source lifetime unambiguous and keep owner peak low:
+                # complete only this P2P copy, not all shard compute.
+                stream.synchronize()
+                del xs_src
+
+            else:
+                with torch.cuda.device(d), torch.cuda.stream(stream):
+                    xs = xq.to(
+                        d,
+                        non_blocking=True,
+                    )
+
+            with torch.cuda.device(d), torch.cuda.stream(stream):
+                le = job["le_owner"].to(
+                    d,
+                    dtype=torch.int32,
+                    non_blocking=True,
+                )
+
+                tk_compute = job["tk_compute_owner"].to(
+                    d,
+                    dtype=torch.int32,
+                    non_blocking=True,
+                )
+
+                wt = job["wt_owner"].to(
+                    d,
+                    non_blocking=True,
+                ).contiguous()
+
+                local_rows = torch.arange(
+                    m,
+                    dtype=torch.int32,
+                    device=d,
+                )
+
+                ones = torch.ones(
+                    m,
+                    device=d,
+                )
+
+                p1 = GroupedPairs(
+                    le,
+                    tk_compute,
+                    local_rows,
+                    ones,
+                    64,
+                )
+
+                gu = grouped_fp4_gemm(
+                    xs,
+                    sh["w13"],
+                    sh["s13"],
+                    p1,
+                    m,
+                )
+
+                hq = swiglu_quant(
+                    gu,
+                    wt,
+                    self.inter,
+                    self.swiglu_limit,
+                )
+
+                p2 = GroupedPairs(
+                    le,
+                    local_rows,
+                    local_rows,
+                    ones,
+                    64,
+                )
+
+                ys = grouped_fp4_gemm(
+                    hq,
+                    sh["w2"],
+                    sh["s2"],
+                    p2,
+                    m,
+                )
+
+                job["ys_remote"] = ys
+                job["xs_remote"] = xs
+
+                del gu
+                del hq
+
+        # --------------------------------------------------------------
+        # Low-memory gather: one shard at a time.
+        # --------------------------------------------------------------
+        for job in jobs:
+            stream = job["stream"]
+            stream.synchronize()
+
+            ys = job["ys_remote"]
+
+            if ys.device == owner:
+                ys_owner = ys
+            else:
+                ys_owner = ys.to(owner)
+
+            y.index_add_(
+                0,
+                job["pair_tok_owner"],
+                ys_owner,
+            )
+
+            del ys_owner
+            del job["ys_remote"]
+            del job["xs_remote"]
+
+        # One representative routing/transfer statistic is enough.
+        # Avoid log spam during 1-token prefix replay.
+        # Print EP transfer statistics only for real multi-token prefill.
+        if (
+            self.layer_id == 0
+            and remote_full_rows
+            and n_tok >= 64
+        ):
+            ratio = remote_sent_rows / remote_full_rows
+            print(
+                f"[ep-xq] layer=0 "
+                f"compact={int(compact_xq)} "
+                f"remote_rows={remote_sent_rows:,}/"
+                f"{remote_full_rows:,} "
+                f"ratio={ratio:.3f} "
+                f"saved={(1.0-ratio)*100:.1f}%",
+                flush=True,
+            )
+
+        return y
 
     def _pair_tables(self, n_tok: int, device):
         """Constant index tensors for a dispatch of n_tok tokens (cached: no per-step allocations)."""
@@ -950,12 +1435,181 @@ class MoE:
             y = y2.view(n_tok, self.topk, self.dim).sum(dim=1)
         else:
             block_m = 64
-            p1 = GroupedPairs(eid, tok, pair_rows, ones, block_m)
-            gu = grouped_fp4_gemm_chunked(xq, self.w13, self.s13, p1, n_pairs)  # fp32 [pairs, 2*inter]
-            hq = swiglu_quant(gu, weights.flatten().float().contiguous(), self.inter, self.swiglu_limit)
-            # one output row per pair (no atomics across a token's experts), summed in a fixed order: deterministic prefill
-            p2 = GroupedPairs(eid, pair_rows, pair_rows, ones, block_m)
-            y = grouped_fp4_gemm_chunked(hq, self.w2, self.s2, p2, n_pairs).view(n_tok, self.topk, self.dim).sum(dim=1)
+
+            # ---------------------------------------------------------------
+            # Memory-bounded MoE prefill
+            #
+            # Do the complete expert path per token chunk:
+            #
+            #   GEMM1 -> SwiGLU -> GEMM2 -> expert reduction
+            #
+            # and write only the reduced [tokens, dim] result into y.
+            #
+            # This deliberately avoids grouped_fp4_gemm_chunked(), whose
+            # final torch.cat() rebuilt the full multi-GiB pair tensor.
+            # ---------------------------------------------------------------
+            moe_chunk = int(
+                os.environ.get("DSV41_MOE_PREFILL_CHUNK", "256")
+            )
+
+            moe_chunk = max(1, moe_chunk)
+
+            if n_tok <= moe_chunk:
+                p1 = GroupedPairs(
+                    eid,
+                    tok,
+                    pair_rows,
+                    ones,
+                    block_m,
+                )
+
+                gu = grouped_fp4_gemm(
+                    xq,
+                    self.w13,
+                    self.s13,
+                    p1,
+                    n_pairs,
+                )
+
+                hq = swiglu_quant(
+                    gu,
+                    weights.flatten().float().contiguous(),
+                    self.inter,
+                    self.swiglu_limit,
+                )
+
+                p2 = GroupedPairs(
+                    eid,
+                    pair_rows,
+                    pair_rows,
+                    ones,
+                    block_m,
+                )
+
+                y = grouped_fp4_gemm(
+                    hq,
+                    self.w2,
+                    self.s2,
+                    p2,
+                    n_pairs,
+                ).view(
+                    n_tok,
+                    self.topk,
+                    self.dim,
+                ).sum(dim=1)
+
+            else:
+                print(
+                    f"[moe-prefill] layer={self.layer_id} "
+                    f"tokens={n_tok:,} chunk={moe_chunk:,}",
+                    flush=True,
+                )
+
+                # Only the final reduced result persists across chunks.
+                # This is far smaller than [n_pairs, 2*inter].
+                y = torch.empty(
+                    (n_tok, self.dim),
+                    dtype=torch.float32,
+                    device=x.device,
+                )
+
+                for t0 in range(0, n_tok, moe_chunk):
+                    t1 = min(t0 + moe_chunk, n_tok)
+                    nc = t1 - t0
+                    npairs = nc * self.topk
+
+                    # Slice token-local inputs.
+                    xc = xq[t0:t1]
+                    wc = weights[t0:t1]
+                    ic = indices[t0:t1]
+
+                    # Build pair tables for THIS chunk only.
+                    ctok, cpair_rows, cones = self._pair_tables(
+                        nc,
+                        x.device,
+                    )
+
+                    ceid = ic.flatten().to(
+                        device=x.device,
+                        dtype=torch.int32,
+                        non_blocking=True,
+                    ).contiguous()
+
+                    ctok = ctok.to(
+                        device=x.device,
+                        dtype=torch.int32,
+                        non_blocking=True,
+                    ).contiguous()
+
+                    cpair_rows = cpair_rows.to(
+                        device=x.device,
+                        dtype=torch.int32,
+                        non_blocking=True,
+                    ).contiguous()
+
+                    cones = cones.to(
+                        device=x.device,
+                        dtype=torch.float32,
+                        non_blocking=True,
+                    ).contiguous()
+
+                    p1 = GroupedPairs(
+                        ceid,
+                        ctok,
+                        cpair_rows,
+                        cones,
+                        block_m,
+                    )
+
+                    # Temporary size now depends on nc, not total n_tok.
+                    gu = grouped_fp4_gemm(
+                        xc,
+                        self.w13,
+                        self.s13,
+                        p1,
+                        npairs,
+                    )
+
+                    hq = swiglu_quant(
+                        gu,
+                        wc.flatten().float().contiguous(),
+                        self.inter,
+                        self.swiglu_limit,
+                    )
+
+                    p2 = GroupedPairs(
+                        ceid,
+                        cpair_rows,
+                        cpair_rows,
+                        cones,
+                        block_m,
+                    )
+
+                    yc = grouped_fp4_gemm(
+                        hq,
+                        self.w2,
+                        self.s2,
+                        p2,
+                        npairs,
+                    ).view(
+                        nc,
+                        self.topk,
+                        self.dim,
+                    ).sum(dim=1)
+
+                    y[t0:t1].copy_(yc)
+
+                    # Release pair-sized intermediates immediately.
+                    del gu
+                    del hq
+                    del yc
+                    del p1
+                    del p2
+                    del ceid
+                    del ctok
+                    del cpair_rows
+                    del cones
+
         y += self.shared_expert(x)
         return y.to(x.dtype).view(shape)
 

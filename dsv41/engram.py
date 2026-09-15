@@ -4,6 +4,7 @@ Hash ids depend only on token ids, so for every forward we compute the ids on th
 FP8 rows + E8M0 scales on the CPU (189 GiB of tables never touch VRAM), ship ~12 KB per token to
 the GPU and dequantize there. The hashing itself follows the checkpoint's definition (compressed
 vocab, per-layer multipliers, XOR-rolling n-gram hash into prime-sized buckets)."""
+import os
 import numpy as np
 import torch
 from sympy import isprime
@@ -168,9 +169,56 @@ class Engram(torch.nn.Module):
         self.clamp_value = 1e-6
 
     def forward(self, x: torch.Tensor, hash_ids: torch.Tensor) -> torch.Tensor:
-        """x: [B, L, hc, dim] bf16; hash_ids: [B, L, n_hash_cols]."""
-        emb = self.table.lookup(hash_ids, x.device).flatten(-2)  # [B, L, cols*head_dim]
-        return self.apply(x, emb)
+        """x: [B, L, hc, dim] bf16; hash_ids: [B, L, n_hash_cols].
+
+        Long prefill is processed in sequence chunks so apply() never
+        materializes x.float() for the entire prompt at once.
+
+        Engram application is token-local once hash_ids are known, so
+        chunking along L preserves the computation.
+        """
+        B, L = x.shape[:2]
+
+        chunk = int(
+            os.environ.get("DSV41_ENGRAM_PREFILL_CHUNK", "256")
+        )
+        chunk = max(1, chunk)
+
+        if L <= chunk:
+            emb = self.table.lookup(
+                hash_ids,
+                x.device,
+            ).flatten(-2)
+
+            return self.apply(x, emb)
+
+        print(
+            f"[engram-prefill] tokens={L:,} chunk={chunk:,} "
+            f"device={x.device}",
+            flush=True,
+        )
+
+        # Modify x chunk-by-chunk. The caller immediately replaces h with
+        # this return value, so keeping a second full [B,L,hc,dim] tensor
+        # would only waste VRAM.
+        for s0 in range(0, L, chunk):
+            s1 = min(s0 + chunk, L)
+
+            xs = x[:, s0:s1]
+
+            emb = self.table.lookup(
+                hash_ids[:, s0:s1],
+                x.device,
+            ).flatten(-2)
+
+            ys = self.apply(xs, emb)
+
+            xs.copy_(ys)
+
+            del emb
+            del ys
+
+        return x
 
     def apply(self, x: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
         """The GPU half: emb [B, L, cols*head_dim] bf16 (already gathered + dequantized)."""

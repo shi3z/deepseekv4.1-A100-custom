@@ -20,30 +20,121 @@ RESERVE_GB = 2.0  # activations / temporaries per device
 RESERVE_GB_OFFLOAD = 6.0  # + expert staging buffers (decode 1.8 GiB, prefill chunk 1.2 GiB) and prefill temporaries
 
 
-def plan_placement(n_layers: int, devices: list[int], budgets_gb: dict[int, float] | None = None,
-                   offload: bool = False) -> list[torch.device]:
-    """Greedy: fill each device (in the given order) with as many layers as its free memory allows."""
-    free = {}
+def plan_placement(
+    n_layers: int,
+    devices: list[int],
+    budgets_gb: dict[int, float] | None = None,
+    offload: bool = False,
+) -> list[torch.device]:
+    """Capacity-aware balanced layer placement.
+
+    The old implementation greedily filled devices in order, which meant
+    later devices were never used if earlier GPUs could already fit all
+    layers.
+
+    This implementation:
+      1. computes how many layers each GPU can safely hold,
+      2. distributes layers across all requested GPUs,
+      3. never exceeds a GPU's calculated capacity.
+
+    --budgets can still be used to reserve extra memory on selected GPUs.
+    """
+
+    free: dict[int, float] = {}
+
     for d in devices:
         if budgets_gb and d in budgets_gb:
             free[d] = budgets_gb[d]
         else:
             f, _ = torch.cuda.mem_get_info(d)
             free[d] = f / 2**30
-    placement: list[torch.device] = []
-    layer_gb = LAYER_GB_OFFLOAD if offload else LAYER_GB
-    if offload and HOT_EXPERTS:
-        layer_gb += 18.8e6 * (max(len(v) for v in HOT_EXPERTS.values()) + 1) / 2**30
-    reserve = RESERVE_GB_OFFLOAD if offload else RESERVE_GB
-    for d in devices:
-        n = int(max(0, free[d] - reserve - (2.6 if d == devices[0] else 0)) // layer_gb)
-        for _ in range(n):
-            if len(placement) < n_layers:
-                placement.append(torch.device(f"cuda:{d}"))
-    if len(placement) < n_layers:
-        raise RuntimeError(f"not enough GPU memory: placed {len(placement)}/{n_layers} layers with free={free}")
-    return placement
 
+    layer_gb = LAYER_GB_OFFLOAD if offload else LAYER_GB
+
+    if offload and HOT_EXPERTS:
+        layer_gb += (
+            18.8e6
+            * (max(len(v) for v in HOT_EXPERTS.values()) + 1)
+            / 2**30
+        )
+
+    reserve = RESERVE_GB_OFFLOAD if offload else RESERVE_GB
+
+    capacity: dict[int, int] = {}
+
+    for d in devices:
+        extra = 2.6 if d == devices[0] else 0.0
+
+        capacity[d] = int(
+            max(
+                0.0,
+                free[d] - reserve - extra,
+            )
+            // layer_gb
+        )
+
+    if sum(capacity.values()) < n_layers:
+        raise RuntimeError(
+            f"not enough GPU memory: capacity={capacity}, "
+            f"need={n_layers}, free={free}"
+        )
+
+    # Allocate layer counts as evenly as possible while respecting
+    # per-device capacities.
+    counts = {d: 0 for d in devices}
+
+    remaining = n_layers
+
+    while remaining > 0:
+        candidates = [
+            d
+            for d in devices
+            if counts[d] < capacity[d]
+        ]
+
+        if not candidates:
+            raise RuntimeError(
+                f"placement exhausted unexpectedly: "
+                f"counts={counts} capacity={capacity}"
+            )
+
+        # Prefer the GPU with the lowest fraction of its capacity used.
+        #
+        # Tie-break by the original --devices ordering so placement stays
+        # deterministic.
+        d = min(
+            candidates,
+            key=lambda dev: (
+                counts[dev] / max(capacity[dev], 1),
+                devices.index(dev),
+            ),
+        )
+
+        counts[d] += 1
+        remaining -= 1
+
+    # Preserve pipeline locality: each GPU gets one contiguous block.
+    placement: list[torch.device] = []
+
+    for d in devices:
+        placement.extend(
+            [torch.device(f"cuda:{d}")] * counts[d]
+        )
+
+    print(
+        "placement capacity:",
+        {
+            f"cuda:{d}": {
+                "layers": counts[d],
+                "capacity": capacity[d],
+                "budget_gb": round(free[d], 2),
+            }
+            for d in devices
+        },
+        flush=True,
+    )
+
+    return placement
 
 def _dense(ckpt: Checkpoint, name: str, device):
     """A Linear weight on device: FP8 block-scaled stays packed (W8, tensor-core GEMV) unless DSV41_W8=0
