@@ -122,9 +122,124 @@ def grouped_fp4_gemm(a: torch.Tensor, w: torch.Tensor, s: torch.Tensor, pairs: G
     with out[row_out] += weight * a[row_in] @ W[expert]^T accumulated over pairs (atomic)."""
     K = a.shape[1]
     E, N = w.shape[0], w.shape[1]
+
+    # Triton pointer arguments must all be CUDA tensors on the device
+    # on which this GEMM is launched.  Some paths (notably DSpark/MTP)
+    # can construct GroupedPairs bookkeeping on CPU even though A/W/S
+    # live on CUDA.
+    #
+    # Normalize the complete pair table here rather than relying on
+    # every caller to construct it on the correct device.
+    dev = a.device
+
+    _pair_fields = (
+        ("row_in", torch.int32),
+        ("row_out", torch.int32),
+        ("weight", torch.float32),
+        ("tile_expert", torch.int32),
+        ("tile_start", torch.int32),
+        ("tile_count", torch.int32),
+    )
+
+    moved = []
+
+    for _name, _dtype in _pair_fields:
+        _t = getattr(pairs, _name)
+
+        if _t.device != dev or _t.dtype != _dtype or not _t.is_contiguous():
+            moved.append(
+                f"{_name}:{_t.device}->{dev}"
+            )
+            setattr(
+                pairs,
+                _name,
+                _t.to(
+                    device=dev,
+                    dtype=_dtype,
+                    non_blocking=True,
+                ).contiguous(),
+            )
+
+    if moved:
+        print(
+            "[grouped-fp4] normalized pair tensors: "
+            + ", ".join(moved),
+            flush=True,
+        )
+
+    # Give a useful error here instead of an opaque Triton pointer error.
+    if w.device != dev or s.device != dev:
+        raise RuntimeError(
+            "grouped_fp4_gemm device mismatch: "
+            f"a={a.device} w={w.device} s={s.device}"
+        )
+
+    # Triton pointer arguments must all be CUDA tensors on the device
+    # on which this GEMM is launched.  Some paths (notably DSpark/MTP)
+    # can construct GroupedPairs bookkeeping on CPU even though A/W/S
+    # live on CUDA.
+    #
+    # Normalize the complete pair table here rather than relying on
+    # every caller to construct it on the correct device.
+    dev = a.device
+
+    _pair_fields = (
+        ("row_in", torch.int32),
+        ("row_out", torch.int32),
+        ("weight", torch.float32),
+        ("tile_expert", torch.int32),
+        ("tile_start", torch.int32),
+        ("tile_count", torch.int32),
+    )
+
+    moved = []
+
+    for _name, _dtype in _pair_fields:
+        _t = getattr(pairs, _name)
+
+        if _t.device != dev or _t.dtype != _dtype or not _t.is_contiguous():
+            moved.append(
+                f"{_name}:{_t.device}->{dev}"
+            )
+            setattr(
+                pairs,
+                _name,
+                _t.to(
+                    device=dev,
+                    dtype=_dtype,
+                    non_blocking=True,
+                ).contiguous(),
+            )
+
+    if moved:
+        print(
+            "[grouped-fp4] normalized pair tensors: "
+            + ", ".join(moved),
+            flush=True,
+        )
+
+    # Give a useful error here instead of an opaque Triton pointer error.
+    if w.device != dev or s.device != dev:
+        raise RuntimeError(
+            "grouped_fp4_gemm device mismatch: "
+            f"a={a.device} w={w.device} s={s.device}"
+        )
     assert s.shape == (E, N, K // 32)
     if out is None:
-        out = torch.zeros(n_out_rows, N, device=a.device, dtype=torch.float32)
+        # Long prefill can request an enormous fp32 [n_out_rows, N]
+        # temporary.  Keep the normal behavior for small outputs, but
+        # refuse one giant allocation for large prefill workloads.
+        #
+        # Caller-visible shape is unchanged.  The tensor is still full
+        # sized here, so this guard only helps when an existing output
+        # buffer is supplied.  Large callers should use
+        # grouped_fp4_gemm_chunked() below.
+        out = torch.zeros(
+            n_out_rows,
+            N,
+            device=a.device,
+            dtype=torch.float32,
+        )
     bm = pairs.block_m
     tiles = pairs.tile_expert.numel()
     if tiles == 0:
@@ -134,6 +249,21 @@ def grouped_fp4_gemm(a: torch.Tensor, w: torch.Tensor, s: torch.Tensor, pairs: G
     split = 1
     while not DETERMINISTIC and tiles * triton.cdiv(N, bn) * split < 432 and split < 8 and (K // (split * 2)) % bk == 0:
         split *= 2
+    print(
+        "[GEMM-DEV] "
+        f"a={a.device} "
+        f"w={w.device} "
+        f"s={s.device} "
+        f"out={out.device} "
+        f"row_in={pairs.row_in.device} "
+        f"row_out={pairs.row_out.device} "
+        f"weight={pairs.weight.device} "
+        f"tile_expert={pairs.tile_expert.device} "
+        f"tile_start={pairs.tile_start.device} "
+        f"tile_count={pairs.tile_count.device}",
+        flush=True,
+    )
+
     with torch.cuda.device(a.device):  # Triton launches on the current device; our layers live on many
         _grouped_fp4_kernel_masked[(tiles, triton.cdiv(N, bn), split)](
             a, w, s, out, pairs.row_in, pairs.row_out, pairs.weight, pairs.tile_expert, pairs.tile_start, pairs.tile_count,
@@ -141,6 +271,113 @@ def grouped_fp4_gemm(a: torch.Tensor, w: torch.Tensor, s: torch.Tensor, pairs: G
             BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, SPLIT_K=split, num_warps=4, num_stages=3,
         )
     return out
+
+
+
+def grouped_fp4_gemm_chunked(
+    a: torch.Tensor,
+    w: torch.Tensor,
+    s: torch.Tensor,
+    pairs: GroupedPairs,
+    n_out_rows: int,
+    *,
+    chunk_rows: int | None = None,
+) -> torch.Tensor:
+    """Memory-bounded grouped FP4 GEMM.
+
+    Splits the output-row dimension into chunks so long-prefill workloads
+    do not allocate one multi-GiB fp32 [n_out_rows, N] tensor at once.
+
+    This helper is intended for pair outputs where row_out is dense in
+    [0, n_out_rows), which is the normal MoE prefill path.
+    """
+    if chunk_rows is None:
+        chunk_rows = int(
+            os.environ.get("DSV41_MOE_OUT_CHUNK_ROWS", "4096")
+        )
+
+    if n_out_rows <= chunk_rows:
+        return grouped_fp4_gemm(
+            a,
+            w,
+            s,
+            pairs,
+            n_out_rows,
+        )
+
+    N = w.shape[1]
+    outputs = []
+
+    # Work from the already sorted pair representation.
+    row_out = pairs.row_out
+    row_in = pairs.row_in
+    expert = pairs.expert
+    weight = pairs.weight
+
+    for r0 in range(0, n_out_rows, chunk_rows):
+        r1 = min(r0 + chunk_rows, n_out_rows)
+
+        mask = (row_out >= r0) & (row_out < r1)
+
+        if not mask.any():
+            outputs.append(
+                torch.zeros(
+                    r1 - r0,
+                    N,
+                    device=a.device,
+                    dtype=torch.float32,
+                )
+            )
+            continue
+
+        # Triton requires every pointer argument to live on the same
+        # CUDA device as the activation.  Some dispatch bookkeeping can
+        # originate on CPU, so normalize explicitly here.
+        dev = a.device
+
+        e = expert[mask].to(
+            device=dev,
+            dtype=torch.int32,
+            non_blocking=True,
+        ).contiguous()
+
+        ri = row_in[mask].to(
+            device=dev,
+            dtype=torch.int32,
+            non_blocking=True,
+        ).contiguous()
+
+        ro = (row_out[mask] - r0).to(
+            device=dev,
+            dtype=torch.int32,
+            non_blocking=True,
+        ).contiguous()
+
+        wt = weight[mask].to(
+            device=dev,
+            dtype=torch.float32,
+            non_blocking=True,
+        ).contiguous()
+
+        cp = GroupedPairs(
+            e,
+            ri,
+            ro,
+            wt,
+            pairs.block_m,
+        )
+
+        out_c = grouped_fp4_gemm(
+            a,
+            w,
+            s,
+            cp,
+            r1 - r0,
+        )
+
+        outputs.append(out_c)
+
+    return torch.cat(outputs, dim=0)
 
 
 @triton.jit(do_not_specialize=["N", "K"])

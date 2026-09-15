@@ -1,3 +1,4 @@
+from pathlib import Path
 """OpenAI-compatible HTTP server (no web framework needed: stdlib http.server, threaded).
 
   python -m dsv41.serve --devices 2,0,1,4,5,6,7,3 --port 8000
@@ -14,6 +15,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import os as _os
+import traceback
 _os.environ.setdefault("OMP_WAIT_POLICY", "active")  # CPU expert threads keep spinning between layers (libgomp reads this once)
 from .engine import Engine, GenParams, parse_budgets
 
@@ -105,12 +107,30 @@ class Handler(BaseHTTPRequestHandler):
                 )
 
             except Exception as e:
+                tb = traceback.format_exc()
+
+                print(
+                    "\n========== GENERATION TRACEBACK ==========",
+                    flush=True,
+                )
+                print(tb, flush=True)
+                print(
+                    "==========================================",
+                    flush=True,
+                )
+
+                try:
+                    Path("/tmp/dsv41-last-traceback.log").write_text(tb)
+                except Exception:
+                    pass
+
                 return self._json(
                     500,
                     {
                         "error": {
                             "message": str(e),
                             "type": "generation_error",
+                            "traceback": tb,
                         }
                     },
                 )
@@ -302,10 +322,22 @@ def main():
     ap.add_argument("--hot-stats", default="", help="route stats .pt used to pick the hot experts (default: results/route_stats.pt)")
     ap.add_argument("--ep", action="store_true", help="expert parallelism: experts sharded over the devices (e.g. --devices 2,3,0,1 --ep-shards 100,100,100,84)")
     ap.add_argument("--ep-shards", default="", help="experts per device for --ep (default: even split)")
+    ap.add_argument(
+        "--mtp",
+        type=int,
+        default=0,
+        help="speculative decoding: DSpark drafts verified per step (3-5; 0 = off)",
+    )
+    ap.add_argument(
+        "--mtp-device",
+        type=int,
+        default=None,
+        help="CUDA device used exclusively for DSpark/MTP weights",
+    )
     a = ap.parse_args()
     kw = dict(devices=[int(d) for d in a.devices.split(",")], max_seq_len=a.max_seq_len, budgets=parse_budgets(a.budgets),
               use_graphs=not a.no_graphs, offload_experts=a.offload_experts, hot_experts=a.hot_experts, route_stats=a.hot_stats,
-              ep=a.ep, ep_shards=[int(v) for v in a.ep_shards.split(",")] if a.ep_shards else None)
+              ep=a.ep, ep_shards=[int(v) for v in a.ep_shards.split(",")] if a.ep_shards else None, mtp=a.mtp, mtp_device=a.mtp_device)
     ENGINE = Engine(a.ckpt, **kw) if a.ckpt else Engine(**kw)
     srv = ThreadingHTTPServer((a.host, a.port), Handler)
     print(f"serving OpenAI-compatible API on http://{a.host}:{a.port}/v1 (model '{ENGINE.model_name}')", flush=True)

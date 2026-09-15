@@ -30,7 +30,11 @@ class DSpark:
         self.block = cfg["dspark_block_size"]
         self.noise = cfg["dspark_noise_token_id"]
         self.targets = list(cfg["dspark_target_layer_ids"])
-        self.embed, self.head = embed.to(device), head  # the embedding table lives on the first GPU: a copy (1.3 GB) here
+        # DSpark runs entirely on its own device.  Both embedding and
+        # LM head must live there; leaving head on the main model's last
+        # GPU causes cuda:N / cuda:M mismatch during draft generation.
+        self.embed = embed.to(device)
+        self.head = head.to(device)
         self.eps = cfg["norm_eps"]
         self.blocks: list[Block] = []
         self.ws = []
@@ -142,8 +146,38 @@ class DSparkRows(DSpark):
 
     @torch.no_grad()
     def write_main_rows(self, main_hidden: torch.Tensor, seq: torch.Tensor, pos: torch.Tensor):
-        """main_hidden [R, 3*dim] (rows of the main forward), seq / pos int64 [R] on the device."""
-        main_x = norm_quant(linear_fp8(main_hidden.to(self.device), self.main_proj), self.main_norm_w, self.eps)  # fp8-rounded for wkv
+        """main_hidden [R, 3*dim]; seq / pos int64 [R].
+
+        DSpark may live on a different GPU from the main model, so do not
+        assume caller-created indexing tensors are already on self.device.
+        Triton kv_write requires POS and SEQ to be CUDA pointers on the
+        same device as the MTP attention tensors.
+        """
+        dev = self.device
+
+        main_hidden = main_hidden.to(
+            device=dev,
+            non_blocking=True,
+        )
+
+        seq = seq.to(
+            device=dev,
+            dtype=torch.int64,
+            non_blocking=True,
+        ).contiguous()
+
+        pos = pos.to(
+            device=dev,
+            dtype=torch.int64,
+            non_blocking=True,
+        ).contiguous()
+
+        main_x = norm_quant(
+            linear_fp8(main_hidden, self.main_proj),
+            self.main_norm_w,
+            self.eps,
+        )
+
         for blk in self.blocks:
             A = blk.attn
             from .w8 import linear_w

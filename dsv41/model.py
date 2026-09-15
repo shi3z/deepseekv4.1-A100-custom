@@ -19,7 +19,7 @@ import torch.nn.functional as F
 from .w8 import W8, linear_w, oproj_a
 from .fused import fake_quant_fp4, fake_quant_fp8, hc_post as _fused_hc_post, hc_pre as _fused_hc_pre, hc_split_sinkhorn, rmsnorm, rope_, sparse_attn_decode, swiglu_quant
 from .kernels import sparse_attn as sparse_attn_prefill
-from .moe_kernels import GroupedPairs, grouped_fp4_gemm
+from .moe_kernels import GroupedPairs, grouped_fp4_gemm, grouped_fp4_gemm_chunked
 from . import cukern
 from .quant import maybe_compile
 
@@ -155,30 +155,156 @@ def select_candidate_blocks(logits, compress_lens, topk_blocks: int, block_size:
 
 # --------------------------------------------------------------------------- shared attention state
 class SharedAttn:
-    """Caches produced by source layers and read by later layers, possibly on other GPUs. Each owner's
-    cache is mirrored on every device; the owner pushes only the new rows to all mirrors. Consumers
-    read the cache of the most recent owner before them (set by that owner when it runs)."""
+    """Shared compressed attention caches.
+
+    Cache topology remains FULL MIRROR: every owner has a cache on every
+    participating device.
+
+    The difference is capacity management.  Instead of allocating the
+    complete max_seq_len cache at startup, mirrors start small and grow
+    geometrically when more compressed rows are actually needed.
+    """
 
     def __init__(self):
         self.compress_kv: dict[tuple[int, torch.device], torch.Tensor] = {}
         self.index_k: dict[tuple[int, torch.device], torch.Tensor] = {}
+
+        # Hard maximum number of compressed rows for each owner.
+        # Filled by load_model().
+        self.cache_max_rows: dict[int, int] = {}
+
         self.kv_owner: int = -1
         self.index_owner: int = -1
         self.topk_idxs: torch.Tensor | None = None
         self.candidates: torch.Tensor | None = None
 
-    def write_compress_kv(self, owner: int, bsz: int, pos: int, rows: torch.Tensor):
+    def _ensure_capacity(
+        self,
+        table: dict,
+        owner: int,
+        need_rows: int,
+        kind: str,
+    ):
+        """Grow every mirror of one owner's cache when necessary."""
+
+        keys = [
+            key
+            for key in table.keys()
+            if key[0] == owner
+        ]
+
+        if not keys:
+            raise KeyError(
+                f"{kind}: no cache mirrors exist for owner {owner}"
+            )
+
+        max_rows = self.cache_max_rows.get(owner)
+
+        if max_rows is not None and need_rows > max_rows:
+            raise RuntimeError(
+                f"{kind}: owner {owner} needs {need_rows:,} rows, "
+                f"but configured maximum is {max_rows:,}"
+            )
+
+        current = table[keys[0]].size(1)
+
+        if need_rows <= current:
+            return
+
+        # Geometric growth.  This makes reallocations rare:
+        #
+        # 32K logical context
+        #   -> 64K
+        #   -> 128K
+        #   -> 256K
+        #   -> 512K
+        #   -> 1M
+        #
+        # Rows themselves are compressed according to the owner's ratio.
+        target = max(need_rows, max(current * 2, 1))
+
+        if max_rows is not None:
+            target = min(target, max_rows)
+
+        print(
+            f"[cache-grow] {kind} owner={owner} "
+            f"rows={current:,}->{target:,} "
+            f"need={need_rows:,} mirrors={len(keys)}",
+            flush=True,
+        )
+
+        # Grow mirrors one at a time so we do not hold all old+new
+        # mirrors simultaneously.
+        for key in keys:
+            old = table[key]
+
+            if old.size(1) >= need_rows:
+                continue
+
+            new = torch.empty(
+                old.size(0),
+                target,
+                old.size(2),
+                dtype=old.dtype,
+                device=old.device,
+            )
+
+            # Only existing rows need preserving.  Future rows need not
+            # be initialized because callers never read beyond the
+            # current logical compressed length.
+            new[:, :old.size(1)].copy_(old)
+
+            table[key] = new
+
+            del old
+
+    def write_compress_kv(
+        self,
+        owner: int,
+        bsz: int,
+        pos: int,
+        rows: torch.Tensor,
+    ):
         self.kv_owner = owner
+
+        end = pos + rows.size(1)
+
+        self._ensure_capacity(
+            self.compress_kv,
+            owner,
+            end,
+            "compress_kv",
+        )
+
         for (o, dev), cache in self.compress_kv.items():
             if o == owner:
-                cache[:bsz, pos : pos + rows.size(1)] = rows.to(dev, non_blocking=True)
+                cache[:bsz, pos:end].copy_(
+                    rows.to(dev, non_blocking=True)
+                )
 
-    def write_index_k(self, owner: int, bsz: int, pos: int, rows: torch.Tensor):
+    def write_index_k(
+        self,
+        owner: int,
+        bsz: int,
+        pos: int,
+        rows: torch.Tensor,
+    ):
         self.index_owner = owner
+
+        end = pos + rows.size(1)
+
+        self._ensure_capacity(
+            self.index_k,
+            owner,
+            end,
+            "index_k",
+        )
+
         for (o, dev), cache in self.index_k.items():
             if o == owner:
-                cache[:bsz, pos : pos + rows.size(1)] = rows.to(dev, non_blocking=True)
-
+                cache[:bsz, pos:end].copy_(
+                    rows.to(dev, non_blocking=True)
+                )
 
 # --------------------------------------------------------------------------- attention
 class Compressor:
@@ -825,11 +951,11 @@ class MoE:
         else:
             block_m = 64
             p1 = GroupedPairs(eid, tok, pair_rows, ones, block_m)
-            gu = grouped_fp4_gemm(xq, self.w13, self.s13, p1, n_pairs)  # fp32 [pairs, 2*inter]
+            gu = grouped_fp4_gemm_chunked(xq, self.w13, self.s13, p1, n_pairs)  # fp32 [pairs, 2*inter]
             hq = swiglu_quant(gu, weights.flatten().float().contiguous(), self.inter, self.swiglu_limit)
             # one output row per pair (no atomics across a token's experts), summed in a fixed order: deterministic prefill
             p2 = GroupedPairs(eid, pair_rows, pair_rows, ones, block_m)
-            y = grouped_fp4_gemm(hq, self.w2, self.s2, p2, n_pairs).view(n_tok, self.topk, self.dim).sum(dim=1)
+            y = grouped_fp4_gemm_chunked(hq, self.w2, self.s2, p2, n_pairs).view(n_tok, self.topk, self.dim).sum(dim=1)
         y += self.shared_expert(x)
         return y.to(x.dtype).view(shape)
 

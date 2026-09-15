@@ -291,11 +291,32 @@ def _kv_write_kernel(X, W, COS, SIN, POS, SEQ, CACHE, eps, WIN: tl.constexpr, D:
 
 
 def kv_write(x: torch.Tensor, w: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, pos: torch.Tensor, cache: torch.Tensor, rd: int, eps: float, seq: torch.Tensor):
-    """x: bf16 [B, d] (wkv output); pos, seq: int64 [B]. Writes kv_norm -> rope(pos) -> fp8 fake quant into cache[seq, pos % win]."""
+    """x: bf16 [B, d]; pos, seq: int64 [B].
+
+    Normalize index tensors onto the launch device. Triton pointer
+    arguments cannot point at CPU memory.
+    """
+    dev = x.device
+
+    if pos.device != dev or pos.dtype != torch.int64 or not pos.is_contiguous():
+        pos = pos.to(
+            device=dev,
+            dtype=torch.int64,
+            non_blocking=True,
+        ).contiguous()
+
+    if seq.device != dev or seq.dtype != torch.int64 or not seq.is_contiguous():
+        seq = seq.to(
+            device=dev,
+            dtype=torch.int64,
+            non_blocking=True,
+        ).contiguous()
+
     d = x.shape[-1]
     win = cache.shape[1]
     B = x.numel() // d
-    with torch.cuda.device(x.device):
+
+    with torch.cuda.device(dev):
         _kv_write_kernel[(B,)](x.contiguous(), w, cos, sin, pos, seq, cache, eps, WIN=win, D=d, RD=rd, num_warps=4)
 
 

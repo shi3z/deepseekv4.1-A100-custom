@@ -201,74 +201,116 @@ def load_model(ckpt_path: str, devices: list[int], max_seq_len: int = 16384, max
     # valid cross-device accesses such as (owner_layer, cuda:0).
     #
     # Opt in explicitly with:
-    #   DSV41_CONSUMER_LOCAL_CACHE=1
-    consumer_local_cache = (
-        os.environ.get("DSV41_CONSUMER_LOCAL_CACHE", "0") == "1"
+    # -----------------------------------------------------------------
+    # Dynamically sized FULL-MIRROR compressed caches.
+    #
+    # max_seq_len remains the logical context limit, but we do NOT reserve
+    # max_seq_len worth of compressed KV/index cache at startup.
+    #
+    # Default initial capacity corresponds to 32K logical tokens.
+    #
+    # Override, for example:
+    #
+    #   DSV41_CACHE_INIT_TOKENS=65536
+    #
+    # Mirrors still exist on every participating device.  This deliberately
+    # avoids the unsafe consumer-local placement experiment.
+    # -----------------------------------------------------------------
+
+    cache_init_tokens = int(
+        os.environ.get("DSV41_CACHE_INIT_TOKENS", "32768")
     )
 
-    cache_total_bytes = 0
+    cache_init_tokens = max(
+        1024,
+        min(cache_init_tokens, max_seq_len),
+    )
 
-    for oi, owner in enumerate(owners):
+    cache_devices = list(dict.fromkeys(placement))
+
+    print(
+        f"dynamic cache: initial logical capacity "
+        f"{cache_init_tokens:,}/{max_seq_len:,} tokens; "
+        f"full mirrors on {[str(d) for d in cache_devices]}",
+        flush=True,
+    )
+
+    cache_initial_bytes = 0
+    cache_max_bytes = 0
+
+    for owner in cfg["kv_source_layers"]:
+        if owner >= n_layers:
+            continue
+
         ratio = cfg["compress_ratios"][owner]
-        rows = max_seq_len // ratio + 1  # + dummy row for static decode
 
-        next_owner = owners[oi + 1] if oi + 1 < len(owners) else n_layers
-
-        if consumer_local_cache:
-            # Experimental memory-saving mode.
-            # May be unsafe if a later execution path accesses this owner's
-            # cache from a device not represented in placement[owner:next_owner].
-            consumer_devices = list(
-                dict.fromkeys(placement[owner:next_owner])
-            )
-        else:
-            # Safe/default mode.
-            consumer_devices = all_devices
-
-        if not consumer_devices:
-            raise RuntimeError(
-                f"no cache consumer device for owner layer {owner}"
-            )
-
-        one_mirror_bytes = (
-            max_seqs
-            * rows
-            * (cfg["head_dim"] + cfg["index_head_dim"])
-            * 2  # bf16
+        max_rows = (
+            max_seq_len // ratio + 1
         )
 
-        for d in consumer_devices:
-            model.shared.compress_kv[(owner, d)] = torch.zeros(
+        initial_rows = min(
+            max_rows,
+            cache_init_tokens // ratio + 1,
+        )
+
+        model.shared.cache_max_rows[owner] = max_rows
+
+        one_initial = (
+            max_seqs
+            * initial_rows
+            * (
+                cfg["head_dim"]
+                + cfg["index_head_dim"]
+            )
+            * 2
+        )
+
+        one_max = (
+            max_seqs
+            * max_rows
+            * (
+                cfg["head_dim"]
+                + cfg["index_head_dim"]
+            )
+            * 2
+        )
+
+        for d in cache_devices:
+            model.shared.compress_kv[(owner, d)] = torch.empty(
                 max_seqs,
-                rows,
+                initial_rows,
                 cfg["head_dim"],
                 dtype=torch.bfloat16,
                 device=d,
             )
 
-            model.shared.index_k[(owner, d)] = torch.zeros(
+            model.shared.index_k[(owner, d)] = torch.empty(
                 max_seqs,
-                rows,
+                initial_rows,
                 cfg["index_head_dim"],
                 dtype=torch.bfloat16,
                 device=d,
             )
 
-            cache_total_bytes += one_mirror_bytes
+            cache_initial_bytes += one_initial
+            cache_max_bytes += one_max
 
         print(
-            f"  cache owner {owner:2d}: rows={rows:,} "
-            f"ratio={ratio} devices={[str(d) for d in consumer_devices]} "
-            f"mirror={one_mirror_bytes / 2**30:.3f} GiB/device",
+            f"  cache owner {owner:2d}: "
+            f"ratio={ratio} "
+            f"rows={initial_rows:,}/{max_rows:,} "
+            f"mirrors={len(cache_devices)}",
             flush=True,
         )
 
     print(
-        f"shared compressed cache total: "
-        f"{cache_total_bytes / 2**30:.3f} GiB "
-        f"({'consumer-local mirrors' if consumer_local_cache else 'FULL MIRROR'})",
+        f"compressed cache allocated at startup: "
+        f"{cache_initial_bytes / 2**30:.2f} GiB "
+        f"(1M full capacity would be "
+        f"{cache_max_bytes / 2**30:.2f} GiB)",
         flush=True,
     )
+
     for i in range(n_layers):
         dev = placement[i]
         w = load_layer(ckpt, i, dev, offload=offload_experts, ep=ep_shards)
