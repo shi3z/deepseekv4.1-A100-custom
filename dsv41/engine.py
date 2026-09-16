@@ -1656,7 +1656,56 @@ class Engine:
                         flush=True,
                     )
 
+                # Reclaim immutable blocks only after the old manifest has
+                # been removed.  Every remaining manifest is scanned and
+                # its block references are retained, so shared blocks can
+                # never be collected while another anchor uses them.
+                if os.environ.get("DSV41_PREFIX_BLOCK_GC", "1") == "1":
+                    self._gc_prefix_blocks(root)
+
         self._prune_prefix_tmpfs()
+
+    @staticmethod
+    def _gc_prefix_blocks(root):
+        block_root = os.path.join(root, "blocks")
+        if not os.path.isdir(block_root):
+            return
+        refs = set()
+        for name in os.listdir(root):
+            if not (name.startswith("prefix-") and name.endswith(".pt")):
+                continue
+            try:
+                payload = torch.load(
+                    os.path.join(root, name),
+                    map_location="cpu",
+                    weights_only=False,
+                )
+                for spec in payload.get("block_refs", []) or []:
+                    if spec:
+                        refs.update(spec.get("refs", []))
+            except Exception:
+                # A malformed manifest is left for fsck; never collect
+                # blocks based on incomplete metadata.
+                return
+        removed = 0
+        removed_bytes = 0
+        for name in os.listdir(block_root):
+            if not name.endswith(".pt") or name[:-3] in refs:
+                continue
+            path = os.path.join(block_root, name)
+            try:
+                removed_bytes += os.path.getsize(path)
+                os.unlink(path)
+                removed += 1
+            except OSError:
+                pass
+        if removed:
+            print(
+                f"[prefix-store-gc] removed={removed} "
+                f"bytes={removed_bytes/2**20:.1f}MiB "
+                f"referenced={len(refs)}",
+                flush=True,
+            )
 
     def _prune_prefix_tmpfs(self):
         """Bound tmpfs usage using the same entry/count style limits."""
