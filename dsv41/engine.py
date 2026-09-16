@@ -2706,10 +2706,10 @@ class Engine:
                 gc.collect()
                 torch.cuda.empty_cache()
                 print("[mtp] long-prompt DSpark unloaded", flush=True)
-            try:
-                yield from self.generate(prompt_ids, p)
-            finally:
-                self.mtp = saved_mtp
+            # Keep plain mode after unloading DSpark. Restoring self.mtp here
+            # races with concurrent Claude retries that can enter the MTP
+            # path while ds is still absent. A server restart re-enables MTP.
+            yield from self.generate(prompt_ids, p)
             return
         max_new = min(p.max_new_tokens, self.max_seq_len - len(prompt_ids) - 1)
         # Claude may request 32K output even for a 100K+ context. Keep
