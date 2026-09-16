@@ -530,8 +530,10 @@ class Engine:
 
         snap = []
         total = 0
+        allocated_total = 0
+        inventory = []
 
-        for kind, holder, key, src in slots:
+        for slot_no, (kind, holder, key, src) in enumerate(slots):
 
             # scalar_attr carries a synthetic CPU tensor representing
             # the current integer metadata value.
@@ -540,6 +542,9 @@ class Engine:
                     int(getattr(holder, key)),
                     dtype=torch.int64,
                 )
+
+            allocated_bytes = src.numel() * src.element_size()
+            allocated_total += allocated_bytes
 
             # Dynamic compressed/index caches may be allocated well beyond
             # the logical prefix. Persist only rows that can be read when
@@ -560,6 +565,17 @@ class Engine:
 
             nbytes = save_src.numel() * save_src.element_size()
             total += nbytes
+            used_rows = (
+                int(save_src.shape[1])
+                if kind == "dict" and save_src.ndim >= 2
+                else None
+            )
+            inventory.append({
+                "slot": slot_no, "kind": kind, "key": repr(key),
+                "shape": tuple(int(x) for x in src.shape),
+                "dtype": str(src.dtype), "allocated_bytes": allocated_bytes,
+                "used_rows": used_rows, "used_bytes": nbytes,
+            })
 
             # Pinned memory is preferred for future fast restores.
             # Fall back to normal host memory if the system pin limit
@@ -582,12 +598,28 @@ class Engine:
                 (kind, holder, key, host)
             )
 
+        saved_pct = 100.0 * (1.0 - total / max(allocated_total, 1))
         print(
-            f"[prefix-snapshot] SAVE "
-            f"slots={len(snap)} "
-            f"size={total / 2**20:,.1f} MiB",
+            f"[prefix-snapshot] SAVE slots={len(snap)} "
+            f"logical={total / 2**20:,.1f}MiB "
+            f"allocated={allocated_total / 2**20:,.1f}MiB "
+            f"saved={saved_pct:.1f}%",
             flush=True,
         )
+        if os.environ.get("DSV41_DEBUG_PREFIX_INVENTORY", "0") == "1":
+            for item in inventory:
+                print(
+                    f"[prefix-inventory] slot={item['slot']} "
+                    f"kind={item['kind']} key={item['key']} "
+                    f"shape={item['shape']} dtype={item['dtype']} "
+                    f"allocated={item['allocated_bytes']} "
+                    f"used_rows={item['used_rows']} used={item['used_bytes']}",
+                    flush=True,
+                )
+            print(
+                f"[prefix-inventory] TOTAL allocated={allocated_total} "
+                f"logical={total} saved={saved_pct:.1f}%", flush=True
+            )
 
         return snap, total
 
