@@ -519,6 +519,7 @@ class Engine:
 
         return slots
 
+    @torch.inference_mode()
     def _snapshot_prefix_state(self, used_tokens=None):
         """Copy attention state to host RAM, slicing caches to used rows."""
         slots = self._prefix_cache_slots()
@@ -623,93 +624,94 @@ class Engine:
 
         return snap, total
 
+    @torch.inference_mode()
     def _restore_prefix_state(self, snap):
         """Restore a previously captured attention-cache snapshot."""
         touched = set()
 
-        for kind, holder, key, src in snap:
-            if kind == "scalar_attr":
-                setattr(
-                    holder,
-                    key,
-                    int(src.item()),
-                )
-                continue
+        try:
+            for kind, holder, key, src in snap:
+                if kind == "scalar_attr":
+                    setattr(
+                        holder,
+                        key,
+                        int(src.item()),
+                    )
+                    continue
 
-            if kind == "attr":
-                dst = getattr(holder, key)
-            else:
-                dst = holder[key]
+                if kind == "attr":
+                    dst = getattr(holder, key)
+                else:
+                    dst = holder[key]
 
-            if not torch.is_tensor(dst):
-                raise RuntimeError(
-                    f"prefix snapshot target disappeared: "
-                    f"{kind}:{key!r}"
-                )
+                if not torch.is_tensor(dst):
+                    raise RuntimeError(
+                        f"prefix snapshot target disappeared: "
+                        f"{kind}:{key!r}"
+                    )
 
-            if dst.dtype != src.dtype:
-                raise RuntimeError(
-                    f"prefix snapshot dtype mismatch: "
-                    f"{dst.dtype} != {src.dtype}"
-                )
+                if dst.dtype != src.dtype:
+                    raise RuntimeError(
+                        f"prefix snapshot dtype mismatch: "
+                        f"{dst.dtype} != {src.dtype}"
+                    )
 
-            if dst.numel() < src.numel():
-                raise RuntimeError(
-                    f"prefix snapshot target shrank: "
-                    f"{dst.numel()} < {src.numel()}"
-                )
+                if dst.numel() < src.numel():
+                    raise RuntimeError(
+                        f"prefix snapshot target shrank: "
+                        f"{dst.numel()} < {src.numel()}"
+                    )
 
-            # Dynamic compressed caches can have grown since SAVE.
-            # Restore the old allocated prefix; later rows are logically
-            # invisible because start_pos determines valid cache length.
-            # prefix-restore-check
-            if not torch.is_tensor(src) or not torch.is_tensor(dst):
-                raise RuntimeError(
-                    f"prefix restore non-tensor slot: "
-                    f"kind={kind!r} key={key!r}"
-                )
+                # Dynamic compressed caches can have grown since SAVE.
+                # Restore the old allocated prefix; later rows are logically
+                # invisible because start_pos determines valid cache length.
+                # prefix-restore-check
+                if not torch.is_tensor(src) or not torch.is_tensor(dst):
+                    raise RuntimeError(
+                        f"prefix restore non-tensor slot: "
+                        f"kind={kind!r} key={key!r}"
+                    )
 
-            if src.dtype != dst.dtype:
-                raise RuntimeError(
-                    f"prefix restore dtype mismatch: "
-                    f"kind={kind!r} key={key!r} "
-                    f"src={src.dtype} dst={dst.dtype}"
-                )
+                if src.dtype != dst.dtype:
+                    raise RuntimeError(
+                        f"prefix restore dtype mismatch: "
+                        f"kind={kind!r} key={key!r} "
+                        f"src={src.dtype} dst={dst.dtype}"
+                    )
 
-            if src.numel() > dst.numel():
-                raise RuntimeError(
-                    f"prefix restore size mismatch: "
-                    f"kind={kind!r} key={key!r} "
-                    f"src={tuple(src.shape)} "
-                    f"dst={tuple(dst.shape)}"
-                )
+                if src.numel() > dst.numel():
+                    raise RuntimeError(
+                        f"prefix restore size mismatch: "
+                        f"kind={kind!r} key={key!r} "
+                        f"src={tuple(src.shape)} "
+                        f"dst={tuple(dst.shape)}"
+                    )
 
-            try:
-                dst.view(-1)[:src.numel()].copy_(
-                src.view(-1),
-                non_blocking=src.is_pinned(),
-            )
-            except Exception as exc:
-                print(
-                    f"[prefix-snapshot] RESTORE-FAIL "
-                    f"kind={kind!r} "
-                    f"key={key!r} "
-                    f"src_shape={tuple(src.shape)} "
-                    f"dst_shape={tuple(dst.shape)} "
-                    f"src_dtype={src.dtype} "
-                    f"dst_dtype={dst.dtype} "
-                    f"device={dst.device} "
-                    f"error={exc}",
-                    flush=True,
-                )
-                raise
+                try:
+                    dst.view(-1)[:src.numel()].copy_(
+                        src.view(-1),
+                        non_blocking=src.is_pinned(),
+                    )
+                except Exception as exc:
+                    print(
+                        f"[prefix-snapshot] RESTORE-FAIL "
+                        f"kind={kind!r} "
+                        f"key={key!r} "
+                        f"src_shape={tuple(src.shape)} "
+                        f"dst_shape={tuple(dst.shape)} "
+                        f"src_dtype={src.dtype} "
+                        f"dst_dtype={dst.dtype} "
+                        f"device={dst.device} "
+                        f"error={exc}",
+                        flush=True,
+                    )
+                    raise
 
-
-            if dst.is_cuda:
-                touched.add(dst.device)
-
-        for dev in touched:
-            torch.cuda.synchronize(dev)
+                if dst.is_cuda:
+                    touched.add(dst.device)
+        finally:
+            for dev in touched:
+                torch.cuda.synchronize(dev)
 
         print(
             f"[prefix-snapshot] RESTORE "
@@ -854,6 +856,7 @@ class Engine:
         positions = torch.arange(end_pos - len(rows), end_pos, device=ds.device)
         ds.write_main_rows(rows, torch.zeros_like(positions), positions)
 
+    @torch.inference_mode()
     def _replay_prefix_tail(
         self,
         prompt_ids,
@@ -2337,6 +2340,7 @@ class Engine:
 
         return len(entries), total
 
+    @torch.inference_mode()
     def _prefill_with_prefix_reuse(
         self,
         prompt_ids: list[int],
@@ -2882,6 +2886,7 @@ class Engine:
 
         return logits, 0
 
+    @torch.inference_mode()
     def generate(self, prompt_ids: list[int], p: GenParams) -> Iterator[tuple[int, str]]:
         """Yields (token_id, text_piece) as they are produced. Holds the engine lock for the duration."""
         assert len(prompt_ids) < self.max_seq_len, f"prompt of {len(prompt_ids)} tokens exceeds max_seq_len={self.max_seq_len}"
@@ -3436,6 +3441,7 @@ class Engine:
                 flush=True,
             )
 
+    @torch.inference_mode()
     def generate_text(self, prompt_ids: list[int], p: GenParams) -> tuple[str, int]:
         pieces, n = [], 0
         for _, piece in self.generate(prompt_ids, p):

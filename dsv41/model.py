@@ -290,6 +290,7 @@ class SharedAttn:
         self.topk_idxs: torch.Tensor | None = None
         self.candidates: torch.Tensor | None = None
 
+    @torch.inference_mode()
     def _ensure_capacity(
         self,
         table: dict,
