@@ -146,6 +146,143 @@ class EPRuntime(DecodeRuntime):
         self.streams = {d: torch.cuda.Stream(d) for d in self.devs}
         self.trace = {d: torch.zeros(nl, 16, dtype=torch.int64, device=d) for d in self.devs} if EP_TRACE else None
 
+        # ------------------------------------------------------------
+        # Exact preallocation BEFORE CUDA graph capture.
+        #
+        # Do NOT use SharedAttn._ensure_capacity() here: it grows
+        # geometrically (typically 2x), which wastes several GiB across
+        # five mirrors and can make cold prefill OOM.
+        #
+        # We allocate exactly enough compressed rows for a configurable
+        # logical-token horizon.  Because this happens before CUDA graph
+        # capture, the resulting pointers remain stable during decode.
+        # ------------------------------------------------------------
+        _prealloc_tokens = int(
+            os.environ.get(
+                "DSV41_EP_PREALLOC_TOKENS",
+                "40000",
+            )
+        )
+
+        def _exact_grow(table, owner, target, kind):
+            keys = [
+                key
+                for key in list(table.keys())
+                if key[0] == owner
+            ]
+
+            if not keys:
+                return
+
+            max_rows = self.m.shared.cache_max_rows.get(owner)
+
+            if max_rows is not None:
+                target = min(
+                    int(target),
+                    int(max_rows),
+                )
+
+            current = int(table[keys[0]].size(1))
+
+            if target <= current:
+                print(
+                    f"[ep-prealloc-exact] "
+                    f"{kind} owner={owner} "
+                    f"rows={current:,} already>=target={target:,}",
+                    flush=True,
+                )
+                return
+
+            print(
+                f"[ep-prealloc-exact] "
+                f"{kind} owner={owner} "
+                f"rows={current:,}->{target:,} "
+                f"mirrors={len(keys)}",
+                flush=True,
+            )
+
+            # Grow mirrors one at a time to limit peak allocation.
+            for key in keys:
+                old = table[key]
+                old_rows = int(old.size(1))
+
+                if old_rows >= target:
+                    continue
+
+                new_cache = torch.empty(
+                    old.size(0),
+                    target,
+                    old.size(2),
+                    dtype=old.dtype,
+                    device=old.device,
+                )
+
+                new_cache[:, :old_rows].copy_(old)
+
+                table[key] = new_cache
+                del old
+
+        if _prealloc_tokens > 0:
+            owners = sorted(
+                set(
+                    owner
+                    for owner, _dev
+                    in (
+                        list(self.m.shared.compress_kv.keys())
+                        + list(self.m.shared.index_k.keys())
+                    )
+                )
+            )
+
+            for owner in owners:
+                A = self.m.blocks[owner].attn
+
+                ratio = max(
+                    int(A.ratio),
+                    1,
+                )
+
+                # ceil(logical_tokens / compression_ratio)
+                target = (
+                    _prealloc_tokens
+                    + ratio
+                    - 1
+                ) // ratio
+
+                if any(
+                    o == owner
+                    for o, _dev
+                    in self.m.shared.compress_kv.keys()
+                ):
+                    _exact_grow(
+                        self.m.shared.compress_kv,
+                        owner,
+                        target,
+                        "compress_kv",
+                    )
+
+                if any(
+                    o == owner
+                    for o, _dev
+                    in self.m.shared.index_k.keys()
+                ):
+                    _exact_grow(
+                        self.m.shared.index_k,
+                        owner,
+                        target,
+                        "index_k",
+                    )
+
+                print(
+                    f"[ep-prealloc] "
+                    f"owner={owner} "
+                    f"ratio={ratio} "
+                    f"tokens={_prealloc_tokens:,} "
+                    f"rows={target:,}",
+                    flush=True,
+                )
+
+
     def _stamp(self, d, L, k):
         if self.trace is not None:
             p2p_stamp(self.trace[d][L, k], d)
@@ -390,11 +527,44 @@ class EPRuntime(DecodeRuntime):
     def step(self, token, pos, seq=None, pmax=None) -> torch.Tensor:
         tok, p, sq = self.set_rows(token, pos, seq, pmax)
         self._engram_rows(tok, p, sq)
-        if self.use_graphs and self.graphs:
+
+        # Debug dynamic-cache growth vs captured CUDA Graph pointers.
+        # Switch to eager execution only around/after the 32K boundary.
+        _debug_eager = False
+
+        if os.environ.get(
+            "DSV41_DEBUG_EP_EAGER_BOUNDARY",
+            "0",
+        ) == "1":
+            if torch.is_tensor(p):
+                _debug_pos = int(p.flatten()[0].item())
+            elif isinstance(p, (list, tuple)):
+                _debug_pos = int(p[0])
+            else:
+                _debug_pos = int(p)
+
+            _debug_eager = _debug_pos >= 32760
+
+            if _debug_eager and (
+                _debug_pos <= 32780
+                or _debug_pos % 256 == 0
+            ):
+                print(
+                    f"[ep-boundary] pos={_debug_pos} "
+                    f"mode=EAGER",
+                    flush=True,
+                )
+
+        if (
+            self.use_graphs
+            and self.graphs
+            and not _debug_eager
+        ):
             for d in self.devs:
                 self.graphs[d].replay()
         else:
             self._eager_token()
+
         torch.cuda.synchronize(self.devs[-1])
         return self.logits
 

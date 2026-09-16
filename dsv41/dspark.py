@@ -271,9 +271,44 @@ class DSparkRows(DSpark):
         logits = F.linear(x, self.head).float().view(S, B, -1)
         prev = tokens
         out = []
+
+        markov_n = int(self.markov_embed.shape[0])
+
         for i in range(B):
-            e = self.markov_embed[prev]  # [S, 256]
-            logits[:, i] += F.linear(e.float(), self.markov_head.float())
+            # CUDA-graph-safe bounds protection.
+            #
+            # IMPORTANT:
+            # Do not use .item(), .tolist(), CPU copies, printing, or
+            # data-dependent Python branching here. _draft_rows() is
+            # executed while DSpark.capture() is recording a CUDA graph.
+            #
+            # Invalid token ids are redirected to a safe embedding row,
+            # then their Markov residual is masked to zero.
+            valid_prev = (
+                (prev >= 0)
+                & (prev < markov_n)
+            )
+
+            safe_prev = prev.clamp(
+                min=0,
+                max=markov_n - 1,
+            )
+
+            e = self.markov_embed[safe_prev]
+
+            markov_delta = F.linear(
+                e.float(),
+                self.markov_head.float(),
+            )
+
+            markov_delta = markov_delta * (
+                valid_prev
+                .to(markov_delta.dtype)
+                .unsqueeze(-1)
+            )
+
+            logits[:, i] += markov_delta
+
             prev = logits[:, i].argmax(-1)
             out.append(prev)
         return torch.stack(out, dim=1)

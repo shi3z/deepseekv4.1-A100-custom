@@ -72,6 +72,35 @@ class Handler(BaseHTTPRequestHandler):
     # ---------------------------------------------------------------- chat
     def _chat(self, body: dict):
         eng = ENGINE
+
+        # Per-request prefix cache control:
+        #
+        #   X-DSV41-Prefix-Cache: off
+        #   X-DSV41-Prefix-Cache: on
+        #
+        # "off" bypasses prefix reuse only for this request.
+        # "on" leaves normal cache behaviour enabled.
+        _prefix_header = (
+            self.headers.get(
+                "X-DSV41-Prefix-Cache",
+                "",
+            )
+            .strip()
+            .lower()
+        )
+
+        if _prefix_header in ("off", "0", "false", "disable", "disabled"):
+            eng._disable_prefix_cache_once = True
+            print(
+                "[http-debug] prefix-cache=OFF for this request",
+                flush=True,
+            )
+        elif _prefix_header in ("on", "1", "true", "enable", "enabled"):
+            eng._disable_prefix_cache_once = False
+            print(
+                "[http-debug] prefix-cache=ON for this request",
+                flush=True,
+            )
         messages = body.get("messages") or []
         thinking = "thinking" if body.get("reasoning_effort") or body.get("thinking") else None
         try:

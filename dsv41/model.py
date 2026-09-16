@@ -563,9 +563,32 @@ class Indexer:
         if self.owns_k and latent is not None:
             k = rmsnorm(F.linear(latent, self.wk), self.k_norm_w, self.eps)
             if start_pos == 0:
-                rope_(k, rd, self.cos, self.sin, 0, pos_stride=ratio)
+                rope_(
+                    k,
+                    rd,
+                    self.cos,
+                    self.sin,
+                    0,
+                    pos_stride=ratio,
+                )
             else:
-                rope_(k, rd, self.cos, self.sin, start_pos + 1 - ratio)
+                # Multi-token continuation can emit more than one
+                # compressed key.  The first emitted key belongs to
+                # the compression group containing start_pos; later
+                # keys are `ratio` tokens apart.
+                first_group_start = (
+                    start_pos
+                    - (start_pos % ratio)
+                )
+
+                rope_(
+                    k,
+                    rd,
+                    self.cos,
+                    self.sin,
+                    first_group_start,
+                    pos_stride=ratio,
+                )
 
             k = fake_quant_fp4(k, 32)
             self.shared.write_index_k(
@@ -742,13 +765,55 @@ class Indexer:
 
             index_score.masked_fill_(
                 torch.arange(
-                    seqlen // ratio,
+                    index_k.size(1),
                     device=x.device,
                 ) >= compress_lens,
                 -torch.inf,
             )
         else:
-            compress_lens = end_pos // ratio
+            # ----------------------------------------------------
+            # Causal continuation visibility.
+            #
+            # Old code used:
+            #
+            #     compress_lens = end_pos // ratio
+            #
+            # for the whole continuation chunk.  That exposed keys
+            # produced near the END of the chunk to queries near its
+            # BEGINNING.
+            #
+            # Query i has absolute position:
+            #
+            #     start_pos + i
+            #
+            # and may see only compression groups fully completed by
+            # that position:
+            #
+            #     (start_pos + i + 1) // ratio
+            #
+            # Shape [S,1] broadcasts against [B,S,T].
+            # ----------------------------------------------------
+            compress_lens = (
+                (
+                    start_pos
+                    + torch.arange(
+                        seqlen,
+                        device=x.device,
+                    )
+                    + 1
+                )
+                // ratio
+            ).unsqueeze(-1)
+
+            key_pos = torch.arange(
+                index_k.size(1),
+                device=x.device,
+            )
+
+            index_score.masked_fill_(
+                key_pos >= compress_lens,
+                -torch.inf,
+            )
 
         if self.is_candidate_source:
             self.shared.candidates = select_candidate_blocks(
@@ -829,50 +894,234 @@ class Attention:
             self.indexer.cos, self.indexer.sin = self.cos, self.sin
 
     def _window_kv(self, x, freqs_cis, start_pos):
+        """Build causal sliding-window KV.
+
+        Important continuation invariant:
+
+        For start_pos > 0 and seqlen > 1 we MUST NOT use the mutable
+        ring buffer itself as the attention KV after writing the whole
+        chunk.
+
+        Doing so lets earlier queries in the chunk observe ring slots
+        already overwritten by later (future) tokens.
+
+        Instead:
+
+          1. copy the required OLD history out of the ring
+          2. concatenate old history + current chunk into temporary KV
+          3. build per-query causal indices into that temporary KV
+          4. commit the current chunk into the persistent ring
+
+        The temporary tensor remains independent after the ring commit,
+        so attention sees the correct historical contents.
+        """
         bsz, seqlen, _ = x.size()
         win = self.window
-        kv = rmsnorm(linear_fp8(x, self.wkv), self.kv_norm_w, self.eps)
-        rope_(kv, self.rope_head_dim, self.cos, self.sin, start_pos)
+
+        kv = rmsnorm(
+            linear_fp8(x, self.wkv),
+            self.kv_norm_w,
+            self.eps,
+        )
+
+        rope_(
+            kv,
+            self.rope_head_dim,
+            self.cos,
+            self.sin,
+            start_pos,
+        )
+
         kv = fake_quant_fp8(kv, 32)
+
+        # ----------------------------------------------------
+        # Normal initial prefill.
+        # ----------------------------------------------------
         if start_pos == 0:
             if seqlen <= win:
-                self.window_kv_cache[:bsz, :seqlen] = kv
+                self.window_kv_cache[
+                    :bsz,
+                    :seqlen,
+                ] = kv
             else:
                 cut = seqlen % win
-                self.window_kv_cache[:bsz, cut:win], self.window_kv_cache[:bsz, :cut] = (
-                    kv[:, -win:].split([win - cut, cut], dim=1)
+
+                self.window_kv_cache[
+                    :bsz,
+                    cut:win,
+                ], self.window_kv_cache[
+                    :bsz,
+                    :cut,
+                ] = kv[:, -win:].split(
+                    [win - cut, cut],
+                    dim=1,
                 )
+
             window_kv = kv
 
-        elif seqlen == 1:
-            # Existing fast decode path.
-            self.window_kv_cache[:bsz, start_pos % win] = kv.squeeze(1)
+            topk_idxs = get_window_topk_idxs(
+                win,
+                bsz,
+                seqlen,
+                start_pos,
+                x.device,
+            )
+
+            return window_kv, topk_idxs
+
+        # ----------------------------------------------------
+        # Fast scalar decode.
+        # Keep the original behaviour.
+        # ----------------------------------------------------
+        if seqlen == 1:
+            slot = start_pos % win
+
+            self.window_kv_cache[
+                :bsz,
+                slot,
+            ] = kv.squeeze(1)
+
             window_kv = self.window_kv_cache[:bsz]
 
+            topk_idxs = get_window_topk_idxs(
+                win,
+                bsz,
+                1,
+                start_pos,
+                x.device,
+            )
+
+            return window_kv, topk_idxs
+
+        # ----------------------------------------------------
+        # Causal multi-token continuation.
+        # ----------------------------------------------------
+
+        # A query at start_pos needs at most win-1 OLD tokens plus
+        # itself.  Capture them BEFORE modifying the ring.
+        hist_len = min(
+            int(start_pos),
+            int(win - 1),
+        )
+
+        if hist_len:
+            hist_abs = torch.arange(
+                start_pos - hist_len,
+                start_pos,
+                device=x.device,
+                dtype=torch.long,
+            )
+
+            hist_slots = torch.remainder(
+                hist_abs,
+                win,
+            )
+
+            # Advanced indexing creates a separate temporary tensor.
+            history = self.window_kv_cache[
+                :bsz,
+                hist_slots,
+            ].clone()
+
+            window_kv = torch.cat(
+                [history, kv],
+                dim=1,
+            )
         else:
-            # Continuation-prefill path.
-            #
-            # Write all incoming tokens to their ring-buffer positions.
-            # Advanced indexing naturally handles wrap-around.
-            pos = (
+            window_kv = kv
+
+        # temp layout:
+        #
+        #   [ old-history ][ current chunk ]
+        #     hist_len       seqlen
+        #
+        # Query i is temporary position hist_len+i and may attend to
+        # at most the preceding win-1 positions plus itself.
+        temp_len = hist_len + seqlen
+        width = min(
+            win,
+            temp_len,
+        )
+
+        q = (
+            hist_len
+            + torch.arange(
+                seqlen,
+                device=x.device,
+                dtype=torch.long,
+            )
+        ).unsqueeze(1)
+
+        rel = torch.arange(
+            width,
+            device=x.device,
+            dtype=torch.long,
+        ).unsqueeze(0)
+
+        first = (
+            q - win + 1
+        ).clamp_min(0)
+
+        idxs = first + rel
+
+        valid = idxs <= q
+
+        idxs = torch.where(
+            valid,
+            idxs,
+            -1,
+        )
+
+        topk_idxs = (
+            idxs
+            .to(torch.int32)
+            .unsqueeze(0)
+            .expand(bsz, -1, -1)
+            .contiguous()
+        )
+
+        # Now that the historical values used by attention have been
+        # copied, commit the whole new chunk to the persistent ring.
+        #
+        # If seqlen >= win only the final win tokens can survive.
+        if seqlen >= win:
+            tail = kv[:, -win:]
+
+            end_pos = start_pos + seqlen
+            first_abs = end_pos - win
+
+            slots = torch.remainder(
+                torch.arange(
+                    first_abs,
+                    end_pos,
+                    device=x.device,
+                    dtype=torch.long,
+                ),
+                win,
+            )
+
+            self.window_kv_cache[
+                :bsz,
+                slots,
+            ] = tail
+
+        else:
+            slots = torch.remainder(
                 start_pos
                 + torch.arange(
                     seqlen,
                     device=x.device,
                     dtype=torch.long,
-                )
-            ) % win
+                ),
+                win,
+            )
 
-            self.window_kv_cache[:bsz, pos] = kv
+            self.window_kv_cache[
+                :bsz,
+                slots,
+            ] = kv
 
-            # sparse_attn_prefill expects the current chunk to be visible
-            # together with the historical window.
-            #
-            # The cache is physically ring ordered. get_window_topk_idxs()
-            # already receives start_pos and maps logical positions into
-            # this ring layout, so keep the physical cache ordering here.
-            window_kv = self.window_kv_cache[:bsz]
-        return window_kv, get_window_topk_idxs(win, bsz, seqlen, start_pos, x.device)
+        return window_kv, topk_idxs
 
     def _compress_kv(self, x, qr, start_pos, offset):
         bsz, seqlen, _ = x.size()
@@ -930,10 +1179,170 @@ class Attention:
         q = linear_fp8(qr, self.wq_b).unflatten(-1, (self.n_heads, self.head_dim))
         rope_(q, rd, self.cos, self.sin, start_pos)
         kv, topk_idxs = self._window_kv(x, freqs_cis, start_pos)
+
+        if (
+            os.environ.get(
+                "DSV41_DEBUG_COLD_PREFILL_STAGE",
+                "0",
+            ) == "1"
+            and start_pos == 0
+        ):
+            torch.cuda.synchronize(self.device)
+            print(
+                f"[cold-prefill-stage] "
+                f"layer={self.layer_id} "
+                f"AFTER-WINDOW "
+                f"seqlen={seqlen} "
+                f"kv={tuple(kv.shape)} "
+                f"topk={tuple(topk_idxs.shape)}",
+                flush=True,
+            )
+
+
+        if (
+            os.environ.get("DSV41_DEBUG_ATTN_STAGE", "0") == "1"
+            and 32760 <= start_pos <= 32780
+        ):
+            torch.cuda.synchronize(self.device)
+            print(
+                f"[attn-stage] layer={self.layer_id} "
+                f"pos={start_pos} AFTER-WINDOW "
+                f"kv={tuple(kv.shape)} "
+                f"topk={tuple(topk_idxs.shape)}",
+                flush=True,
+            )
+
         if self.ratio:
-            ckv, cidx = self._compress_kv(x, qr, start_pos, kv.size(1))
+            if (
+                os.environ.get("DSV41_DEBUG_ATTN_STAGE", "0") == "1"
+                and 32760 <= start_pos <= 32780
+            ):
+                print(
+                    f"[attn-stage] layer={self.layer_id} "
+                    f"pos={start_pos} BEFORE-COMPRESS "
+                    f"ratio={self.ratio} "
+                    f"offset={kv.size(1)}",
+                    flush=True,
+                )
+
+            ckv, cidx = self._compress_kv(
+                x,
+                qr,
+                start_pos,
+                kv.size(1),
+            )
+
+            if (
+                os.environ.get(
+                    "DSV41_DEBUG_COLD_PREFILL_STAGE",
+                    "0",
+                ) == "1"
+                and start_pos == 0
+            ):
+                torch.cuda.synchronize(self.device)
+                print(
+                    f"[cold-prefill-stage] "
+                    f"layer={self.layer_id} "
+                    f"AFTER-COMPRESS "
+                    f"ckv={tuple(ckv.shape)} "
+                    f"cidx={tuple(cidx.shape)}",
+                    flush=True,
+                )
+
+
+            if (
+                os.environ.get("DSV41_DEBUG_ATTN_STAGE", "0") == "1"
+                and 32760 <= start_pos <= 32780
+            ):
+                torch.cuda.synchronize(self.device)
+                print(
+                    f"[attn-stage] layer={self.layer_id} "
+                    f"pos={start_pos} AFTER-COMPRESS "
+                    f"ckv={tuple(ckv.shape)} "
+                    f"cidx={tuple(cidx.shape)}",
+                    flush=True,
+                )
+
             kv = torch.cat([kv, ckv], dim=1)
             topk_idxs = torch.cat([topk_idxs, cidx], dim=-1)
+
+        # ------------------------------------------------------------
+        # Prefix replay boundary guard.
+        #
+        # Catch a malformed sparse-attention index before it reaches
+        # torch advanced indexing / gather and poisons the CUDA context.
+        # Enabled only for explicit debugging.
+        # ------------------------------------------------------------
+        if (
+            os.environ.get(
+                "DSV41_DEBUG_ATTN_BOUNDARY",
+                "0",
+            ) == "1"
+            and 32760 <= start_pos <= 32780
+        ):
+            # Make sure a failure reported below really belongs to this
+            # attention invocation rather than an earlier async kernel.
+            torch.cuda.synchronize(self.device)
+
+            valid_idx = topk_idxs[topk_idxs >= 0]
+
+            if valid_idx.numel():
+                idx_min = int(valid_idx.min().item())
+                idx_max = int(valid_idx.max().item())
+            else:
+                idx_min = -1
+                idx_max = -1
+
+            kv_rows = int(kv.size(1))
+
+            ckv_rows = (
+                int(ckv.size(1))
+                if self.ratio
+                else 0
+            )
+
+            cidx_valid = (
+                cidx[cidx >= 0]
+                if self.ratio
+                else None
+            )
+
+            if (
+                cidx_valid is not None
+                and cidx_valid.numel()
+            ):
+                cidx_min = int(cidx_valid.min().item())
+                cidx_max = int(cidx_valid.max().item())
+            else:
+                cidx_min = -1
+                cidx_max = -1
+
+            print(
+                f"[attn-boundary] "
+                f"layer={self.layer_id} "
+                f"pos={start_pos} "
+                f"ratio={self.ratio} "
+                f"window={self.window} "
+                f"kv_rows={kv_rows} "
+                f"ckv_rows={ckv_rows} "
+                f"idx=[{idx_min},{idx_max}] "
+                f"cidx=[{cidx_min},{cidx_max}] "
+                f"topk_shape={tuple(topk_idxs.shape)}",
+                flush=True,
+            )
+
+            if idx_max >= kv_rows:
+                raise RuntimeError(
+                    "ATTN OOB BEFORE CUDA: "
+                    f"layer={self.layer_id} "
+                    f"pos={start_pos} "
+                    f"ratio={self.ratio} "
+                    f"idx_max={idx_max} "
+                    f"kv_rows={kv_rows} "
+                    f"cidx_max={cidx_max} "
+                    f"ckv_rows={ckv_rows}"
+                )
+
         # Prefix-cache replay deliberately uses the prefill kernel even
         # for a single token.  The optimized decode Triton kernel assumes
         # the normal decode layout and currently fails to compile for the
@@ -958,6 +1367,24 @@ class Attention:
                 topk_idxs,
                 self.softmax_scale,
             )
+
+            if (
+                os.environ.get(
+                    "DSV41_DEBUG_COLD_PREFILL_STAGE",
+                    "0",
+                ) == "1"
+                and start_pos == 0
+            ):
+                torch.cuda.synchronize(self.device)
+                print(
+                    f"[cold-prefill-stage] "
+                    f"layer={self.layer_id} "
+                    f"AFTER-ATTN "
+                    f"kv_rows={kv.size(1)} "
+                    f"topk={tuple(topk_idxs.shape)}",
+                    flush=True,
+                )
+
         rope_(o, rd, self.cos, self.sin, start_pos, inverse=True)
         o = o.view(bsz, seqlen, self.n_groups, -1)
         o = oproj_a(o, self.wo_a, self.n_groups, self.o_lora_rank)
@@ -1615,9 +2042,96 @@ class MoE:
 
 
 def _hc_mix_proj(x, fn, eps):
-    xf = x.flatten(2).float()
-    rsqrt = torch.rsqrt(xf.square().mean(-1, keepdim=True) + eps)
-    return F.linear(xf, fn) * rsqrt
+    """
+    HC mix projection.
+
+    Long prefill used to materialize the complete flattened activation
+    in fp32:
+
+        [B, S, HC*D] fp32
+
+    which becomes several GiB for 30K+ token prompts.
+
+    The operation is token-local, so chunking the sequence dimension is
+    mathematically identical while greatly reducing peak VRAM.
+    """
+    chunk = int(
+        os.environ.get(
+            "DSV41_HC_PREFILL_CHUNK",
+            "2048",
+        )
+    )
+
+    # Decode / short prompt: preserve the original fast path.
+    if (
+        chunk <= 0
+        or x.ndim < 3
+        or x.shape[1] <= chunk
+    ):
+        xf = x.flatten(2).float()
+        rsqrt = torch.rsqrt(
+            xf.square().mean(-1, keepdim=True) + eps
+        )
+        return F.linear(xf, fn) * rsqrt
+
+    B = x.shape[0]
+    S = x.shape[1]
+    out_features = fn.shape[0]
+
+    # F.linear(float32, ...) produces float32 here.
+    # Allocate only the comparatively small final projection once.
+    y = torch.empty(
+        (B, S, out_features),
+        dtype=torch.float32,
+        device=x.device,
+    )
+
+    if os.environ.get(
+        "DSV41_DEBUG_HC_PREFILL",
+        "0",
+    ) == "1":
+        print(
+            f"[hc-prefill] "
+            f"tokens={S:,} "
+            f"chunk={chunk:,} "
+            f"in_flat={x.flatten(2).shape[-1]:,} "
+            f"out={out_features:,} "
+            f"device={x.device}",
+            flush=True,
+        )
+
+    for s0 in range(0, S, chunk):
+        s1 = min(
+            s0 + chunk,
+            S,
+        )
+
+        # Only this slice is promoted to fp32.
+        xf = x[:, s0:s1].flatten(2).float()
+
+        rsqrt = torch.rsqrt(
+            xf.square().mean(
+                -1,
+                keepdim=True,
+            )
+            + eps
+        )
+
+        yc = F.linear(
+            xf,
+            fn,
+        )
+
+        yc.mul_(rsqrt)
+
+        y[:, s0:s1].copy_(yc)
+
+        # Drop the large fp32 temporaries immediately.
+        del xf
+        del rsqrt
+        del yc
+
+    return y
 
 
 def _hc_pre(x, pre_mix):
