@@ -129,14 +129,20 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Connection", "keep-alive")
             self.end_headers()
             heartbeat_stop = threading.Event()
+            sse_lock = threading.Lock()
+            heartbeat_thread = None
+            def _sse_write(data):
+                with sse_lock:
+                    self.wfile.write(data)
+                    self.wfile.flush()
             def _heartbeat():
                 while not heartbeat_stop.wait(10.0):
                     try:
-                        self.wfile.write(b": keep-alive\n\n")
-                        self.wfile.flush()
+                        _sse_write(b": keep-alive\n\n")
                     except (BrokenPipeError, ConnectionResetError, OSError):
                         break
-            threading.Thread(target=_heartbeat, daemon=True).start()
+            heartbeat_thread = threading.Thread(target=_heartbeat, daemon=True)
+            heartbeat_thread.start()
             # Generate while the heartbeat keeps the gateway connection alive.
             # still be returned as proper HTTP errors.
             try:
@@ -144,19 +150,21 @@ class Handler(BaseHTTPRequestHandler):
 
             except torch.OutOfMemoryError as e:
                 heartbeat_stop.set()
+                heartbeat_thread.join(timeout=1.0)
                 torch.cuda.empty_cache()
-                return self._json(
-                    507,
-                    {
-                        "error": {
-                            "message": f"CUDA out of memory: {e}",
-                            "type": "cuda_out_of_memory",
-                        }
-                    },
-                )
+                try:
+                    _sse_write(("data: " + json.dumps({"error": {
+                        "message": f"CUDA out of memory: {e}",
+                        "type": "cuda_out_of_memory",
+                    }}, ensure_ascii=False) + "\n\n").encode())
+                    _sse_write(b"data: [DONE]\n\n")
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+                return
 
             except Exception as e:
                 heartbeat_stop.set()
+                heartbeat_thread.join(timeout=1.0)
                 tb = traceback.format_exc()
 
                 print(
@@ -174,18 +182,19 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
 
-                return self._json(
-                    500,
-                    {
-                        "error": {
-                            "message": str(e),
-                            "type": "generation_error",
-                            "traceback": tb,
-                        }
-                    },
-                )
+                try:
+                    _sse_write(("data: " + json.dumps({"error": {
+                        "message": str(e),
+                        "type": "generation_error",
+                        "traceback": tb,
+                    }}, ensure_ascii=False) + "\n\n").encode())
+                    _sse_write(b"data: [DONE]\n\n")
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+                return
 
             heartbeat_stop.set()
+            heartbeat_thread.join(timeout=1.0)
 
             # DeepSeek completion may contain thinking / DSML tool calls.
             # Always parse it before exposing an OpenAI-compatible response.
@@ -234,8 +243,7 @@ class Handler(BaseHTTPRequestHandler):
                     + "\n\n"
                 )
 
-                self.wfile.write(payload.encode("utf-8"))
-                self.wfile.flush()
+                _sse_write(payload.encode("utf-8"))
 
             try:
                 # Do NOT emit content:"" here.
@@ -301,8 +309,7 @@ class Handler(BaseHTTPRequestHandler):
 
                 chunk({}, finish)
 
-                self.wfile.write(b"data: [DONE]\n\n")
-                self.wfile.flush()
+                _sse_write(b"data: [DONE]\n\n")
 
             except (BrokenPipeError, ConnectionResetError):
                 return
