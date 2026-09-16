@@ -143,6 +143,7 @@ class Handler(BaseHTTPRequestHandler):
                 text, n = eng.generate_text(ids, params)
 
             except torch.OutOfMemoryError as e:
+                heartbeat_stop.set()
                 torch.cuda.empty_cache()
                 return self._json(
                     507,
@@ -155,6 +156,7 @@ class Handler(BaseHTTPRequestHandler):
                 )
 
             except Exception as e:
+                heartbeat_stop.set()
                 tb = traceback.format_exc()
 
                 print(
