@@ -330,7 +330,7 @@ class Engine:
 
                 # Dynamic compressed cache mirrors.
                 if (
-                    name == "compress_kv"
+                    name in ("compress_kv", "index_k")
                     and isinstance(val, dict)
                 ):
                     for key, t in val.items():
@@ -379,6 +379,8 @@ class Engine:
                     visit(val, depth + 1)
 
         visit(self.model)
+        # Draft attention rings must rewind with the main prefix.
+        visit(getattr(self, "ds", None))
 
 
         # PREFIX-FULLSTATE-EXTRAS
@@ -436,6 +438,9 @@ class Engine:
             visited_extra.add(oid)
 
             cls = obj.__class__.__name__
+
+            if cls == "NgramHashState":
+                add_tensor_attr(obj, "cache")
 
             if cls == "Compressor":
                 for name in (
@@ -791,6 +796,15 @@ class Engine:
 
         visit(self.model)
 
+    def _write_prefix_draft_hidden(self, hidden, end_pos):
+        """Commit actual hidden history before publishing a prefix anchor."""
+        ds = getattr(self, "ds", None)
+        if ds is None:
+            return
+        rows = hidden.reshape(-1, hidden.shape[-1])[-ds.win:]
+        positions = torch.arange(end_pos - len(rows), end_pos, device=ds.device)
+        ds.write_main_rows(rows, torch.zeros_like(positions), positions)
+
     def _replay_prefix_tail(
         self,
         prompt_ids,
@@ -981,7 +995,7 @@ class Engine:
             )
 
             if old_collect is not None:
-                model.collect_main_hidden = ()
+                model.collect_main_hidden = tuple(self.ds.targets) if use_mtp_tail else ()
 
             pos = start_pos
 
@@ -1045,6 +1059,8 @@ class Engine:
                         if set_mode is not None:
                             set_mode(False)
 
+                    if use_mtp_tail:
+                        self._write_prefix_draft_hidden(model.main_hidden, end_pos)
                     n = end_pos - pos
                     done += n
                     pos = end_pos
@@ -1095,15 +1111,7 @@ class Engine:
                 decode_end,
             ):
 
-                # Snapshot is state BEFORE consuming snapshot_at.
-                if (
-                    snapshot_at is not None
-                    and new_snapshot is None
-                    and pos == snapshot_at
-                ):
-                    new_snapshot = (
-                        self._snapshot_prefix_state()
-                    )
+                _capture_prefix_anchor(pos)
 
                 token = int(
                     prompt_ids[pos]
@@ -1113,6 +1121,13 @@ class Engine:
                     token,
                     pos,
                 )
+
+                if use_mtp_tail:
+                    hidden = torch.cat([
+                        self.rt.main_hid[lid][0:1].to(self.ds.device)
+                        for lid in self.ds.targets
+                    ], dim=-1)
+                    self._write_prefix_draft_hidden(hidden, pos + 1)
 
                 # Local CUDA synchronization for prefix-replay debugging.
                 # Unlike CUDA_LAUNCH_BLOCKING=1 this does not serialize
@@ -1249,6 +1264,7 @@ class Engine:
                 )
 
             mh = model.main_hidden
+            self._write_prefix_draft_hidden(mh, total)
 
             if not torch.is_tensor(mh):
                 raise RuntimeError(
@@ -1413,7 +1429,7 @@ class Engine:
             "format": "dsv41-prefix-tmpfs-v1",
             "cache_epoch": os.environ.get(
                 "DSV41_PREFIX_CACHE_EPOCH",
-                "fullstate-v3-noephemeral",
+                "fullstate-v5-index-engram-dspark",
             ),
             "created_at": time.time(),
             "prompt_ids": list(ent["prompt_ids"]),
@@ -1712,7 +1728,7 @@ class Engine:
 
             _expected_epoch = os.environ.get(
                 "DSV41_PREFIX_CACHE_EPOCH",
-                "fullstate-v3-noephemeral",
+                "fullstate-v5-index-engram-dspark",
             )
 
             if (
@@ -2571,13 +2587,17 @@ class Engine:
 
         _prefill_t0 = time.perf_counter()
 
-        logits = self.model.forward(
-            torch.tensor(
-                [base_ids],
-                dtype=torch.long,
-            ),
-            0,
-        )
+        # Avoid materialising attention activations for a 100K+ prompt in
+        # one call. Continuation chunks preserve the persistent caches and
+        # keep the peak temporary allocation bounded by HC_PREFILL_CHUNK.
+        _chunk = max(1, int(os.environ.get("DSV41_HC_PREFILL_CHUNK", "256")))
+        logits = None
+        for _s in range(0, len(base_ids), _chunk):
+            _e = min(_s + _chunk, len(base_ids))
+            logits = self.model.forward(
+                torch.tensor([base_ids[_s:_e]], dtype=torch.long),
+                _s,
+            )
 
         # CUDA work can still be asynchronous.  Synchronize only the
         # GPUs actually used by this model, not every CUDA device.
@@ -2607,6 +2627,9 @@ class Engine:
             f"tok_s={_prefill_n/max(_prefill_dt,1e-9):,.1f}",
             flush=True,
         )
+
+        if getattr(self, "ds", None) is not None:
+            self._write_prefix_draft_hidden(self.model.main_hidden, target_base)
 
         snap, snap_bytes = (
             self._snapshot_prefix_state()
@@ -2658,6 +2681,36 @@ class Engine:
     def generate(self, prompt_ids: list[int], p: GenParams) -> Iterator[tuple[int, str]]:
         """Yields (token_id, text_piece) as they are produced. Holds the engine lock for the duration."""
         assert len(prompt_ids) < self.max_seq_len, f"prompt of {len(prompt_ids)} tokens exceeds max_seq_len={self.max_seq_len}"
+        # MTP keeps DSpark resident on GPU4. At very long cold-prefill
+        # lengths there may not be enough headroom for the indexer's
+        # temporary buffers; use the regular decode path for this request
+        # instead of returning HTTP 507. Prefix reuse and block replay stay
+        # enabled. The threshold is configurable for larger-memory hosts.
+        _mtp_long_limit = int(os.environ.get("DSV41_MTP_LONG_PROMPT_LIMIT", "65536"))
+        if self.mtp and self.ds is None:
+            # A previous long-prompt request may have unloaded DSpark. Do not
+            # route a subsequent request into the MTP path without its state.
+            print("[mtp] DSpark unavailable; forcing plain decode", flush=True)
+            self.mtp = 0
+        if self.mtp and len(prompt_ids) > _mtp_long_limit:
+            print(f"[mtp] long-prompt fallback prompt={len(prompt_ids):,} limit={_mtp_long_limit:,} mode=plain", flush=True)
+            saved_mtp = self.mtp
+            self.mtp = 0
+            # DSpark itself occupies most of GPU4. Drop its module before
+            # the plain prefill; merely skipping speculative decoding does
+            # not release those allocations and still yields HTTP 507.
+            if self.ds is not None and os.environ.get("DSV41_MTP_UNLOAD_ON_LONG", "1") == "1":
+                import gc
+                self.ds = None
+                self.model.collect_main_hidden = ()
+                gc.collect()
+                torch.cuda.empty_cache()
+                print("[mtp] long-prompt DSpark unloaded", flush=True)
+            try:
+                yield from self.generate(prompt_ids, p)
+            finally:
+                self.mtp = saved_mtp
+            return
         max_new = min(p.max_new_tokens, self.max_seq_len - len(prompt_ids) - 1)
         gen = None
         if p.seed is not None:

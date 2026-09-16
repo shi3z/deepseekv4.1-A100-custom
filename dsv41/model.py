@@ -333,7 +333,13 @@ class SharedAttn:
         #   -> 1M
         #
         # Rows themselves are compressed according to the owner's ratio.
-        target = max(need_rows, max(current * 2, 1))
+        # Long cold-prefill can run close to the VRAM limit. In exact mode
+        # avoid doubling a 64K allocation to 128K when only a few more
+        # rows are needed; the temporary attention buffers need that headroom.
+        if os.environ.get("DSV41_EXACT_CACHE_GROW", "0") == "1":
+            target = need_rows
+        else:
+            target = max(need_rows, max(current * 2, 1))
 
         if max_rows is not None:
             target = min(target, max_rows)
@@ -443,6 +449,15 @@ class Compressor:
             return rmsnorm(F.linear(x, self.wkv), self.norm_w, self.eps)
         xf = x.float()
         kv, score = F.linear(xf, self.wkv), F.linear(xf, self.wgate)
+        # DecodeRuntime.compressor2 updates the ring, not the legacy partial
+        # group buffers. Rebuild a continuation's partial group BEFORE this
+        # chunk overwrites its ring slots (large chunks wrap the entire ring).
+        if start_pos > 0:
+            partial = start_pos % ratio
+            if partial:
+                previous = torch.arange(start_pos - partial, start_pos, device=x.device) % self.RING
+                self.kv_state[:bsz, :partial].copy_(self.kv_ring[:bsz, previous])
+                self.score_state[:bsz, :partial].copy_(self.score_ring[:bsz, previous])
         n_ring = min(self.RING, seqlen)  # keep the last positions in the ring
         for j in range(seqlen - n_ring, seqlen):
             self.kv_ring[:bsz, (start_pos + j) % self.RING] = kv[:, j]
@@ -667,11 +682,16 @@ class Indexer:
 
                 # Preserve original causal/compression visibility.
                 compress_lens = (
-                    torch.arange(
-                        q0 + 1,
-                        q1 + 1,
-                        device=x.device,
-                    ) // ratio
+                    (
+                        start_pos
+                        + torch.arange(
+                            q0,
+                            q1,
+                            device=x.device,
+                        )
+                        + 1
+                    )
+                    // ratio
                 ).unsqueeze(-1)
 
                 score.masked_fill_(
@@ -2236,6 +2256,13 @@ class Transformer:
                 main_hiddens.append(h.mean(dim=2))
             h, pre_mix = blk(h, start_pos, pre_mix)
         if main_hiddens:
+            # MTP/DSpark only consumes the recent main attention window.
+            # Keeping every target-layer hidden row for a 100K+ prompt
+            # creates several GiB of avoidable GPU state and can surface
+            # as an asynchronous illegal-memory error on the next CUDA op.
+            keep = int(self.args.cfg.get("window_size", 0))
+            if keep > 0 and input_ids.shape[1] > keep:
+                main_hiddens = [m[:, -keep:] for m in main_hiddens]
             self.main_hidden = torch.cat([m.to(main_hiddens[-1].device) for m in main_hiddens], dim=-1)  # [b, s, 3*dim]
         h = self.blocks[-1].hc_pre(h, pre_mix)[:, -1]
         h = rmsnorm(h, self.norm_w, self.args.norm_eps)

@@ -1,3 +1,4 @@
+import os
 """A100 (sm80) kernels for DeepSeek-V4.1: FP4 expert GEMM in Triton (weights stay packed in VRAM and
 are expanded to bf16 inside the kernel), plus torch implementations of the sparse attention and the
 hyper-connection Sinkhorn split that the reference does in tilelang."""
@@ -179,8 +180,70 @@ def sparse_attn(q: torch.Tensor, kv: torch.Tensor, attn_sink: torch.Tensor, topk
     for s0 in range(0, s, q_chunk):
         s1 = min(s, s0 + q_chunk)
         idx = topk_idxs[:, s0:s1].long()  # [b, sc, t]
-        valid = idx >= 0
-        g = torch.gather(kv, 1, idx.clamp_min(0).reshape(b, -1, 1).expand(-1, -1, d)).view(b, s1 - s0, -1, d)  # [b, sc, t, d]
+
+        # A selected index is usable only when it lies inside the KV
+        # tensor actually supplied to this attention call.
+        #
+        # Previously only negative sentinel values were filtered:
+        #
+        #     valid = idx >= 0
+        #     idx.clamp_min(0)
+        #
+        # so any stale / offset index >= kv.size(1) reached
+        # torch.gather() and triggered a CUDA IndexKernel device assert,
+        # poisoning the whole CUDA context.
+        n_kv = kv.size(1)
+
+        if n_kv <= 0:
+            raise RuntimeError(
+                "sparse_attn received empty KV with non-empty queries"
+            )
+
+        valid = (
+            (idx >= 0)
+            & (idx < n_kv)
+        )
+
+        if os.environ.get(
+            "DSV41_DEBUG_ATTN_BOUNDS",
+            "0",
+        ) == "1":
+            bad_hi = idx >= n_kv
+
+            if bad_hi.any().item():
+                n_bad = int(
+                    bad_hi.sum().item()
+                )
+                max_idx = int(
+                    idx.max().item()
+                )
+
+                print(
+                    f"[attn-bounds] "
+                    f"OOB={n_bad:,} "
+                    f"max_idx={max_idx:,} "
+                    f"kv_rows={n_kv:,} "
+                    f"q={s0:,}:{s1:,}",
+                    flush=True,
+                )
+
+        safe_idx = idx.clamp(
+            min=0,
+            max=n_kv - 1,
+        )
+
+        g = torch.gather(
+            kv,
+            1,
+            safe_idx
+            .reshape(b, -1, 1)
+            .expand(-1, -1, d),
+        ).view(
+            b,
+            s1 - s0,
+            -1,
+            d,
+        )  # [b, sc, t, d]
         scores = torch.einsum("bshd,bstd->bsht", q[:, s0:s1].float(), g.float()) * softmax_scale
         scores = scores.masked_fill(~valid.unsqueeze(2), float("-inf"))
         mx = scores.amax(dim=-1, keepdim=True).clamp_min(-1e30)
