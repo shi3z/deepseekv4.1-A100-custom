@@ -116,12 +116,13 @@ class DecodeRuntime:
                 cache = self.m.shared.compress_kv[(A.layer_id, d)]
                 row = torch.where(should, compress_len - 1, torch.full_like(compress_len, cache.shape[1] - 1))  # [B]
             if A.is_index_source:
-                self.m.shared._ensure_capacity(
-                    self.m.shared.index_k,
-                    A.layer_id,
-                    int(compress_len.max().item()),
-                    "index_k",
-                )
+                if getattr(A.indexer, "owns_k", False):
+                    self.m.shared._ensure_capacity(
+                        self.m.shared.index_k,
+                        A.layer_id,
+                        int(compress_len.max().item()),
+                        "index_k",
+                    )
                 idxs = self.indexer(A, x3, qr.view(B, 1, -1), latent, pos, compress_len, d, row if A.is_kv_source else None)
                 self.topk_buf[d].copy_(idxs)
             else:
