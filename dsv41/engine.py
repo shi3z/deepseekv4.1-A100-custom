@@ -2716,7 +2716,7 @@ class Engine:
         # long-context requests bounded so the gateway can finish instead
         # of timing out during slow single-token decode. Override per host.
         if len(prompt_ids) > _mtp_long_limit:
-            max_new = min(max_new, int(os.environ.get("DSV41_LONG_PROMPT_MAX_NEW", "4096")))
+            max_new = min(max_new, int(os.environ.get("DSV41_LONG_PROMPT_MAX_NEW", "512")))
         gen = None
         if p.seed is not None:
             gen = torch.Generator(device=self.model.blocks[-1].device)
