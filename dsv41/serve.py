@@ -109,6 +109,14 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:  # malformed messages / unsupported content
             return self._json(400, {"error": f"cannot encode messages: {e}"})
         params = _params(body)
+        # Claude/LiteLLM may retry a stalled stream as a non-stream request
+        # with max_tokens=32000.  Keep interactive retries bounded so a
+        # response reaches the client and the request can complete.  Hosts
+        # that need longer answers can raise this explicitly.
+        _interactive_cap = int(os.environ.get("DSV41_INTERACTIVE_MAX_NEW", "2048"))
+        if _interactive_cap > 0 and params.max_new_tokens > _interactive_cap:
+            params.max_new_tokens = _interactive_cap
+            print(f"[chat] max_tokens capped={_interactive_cap}", flush=True)
         rid = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created = int(time.time())
         print(
