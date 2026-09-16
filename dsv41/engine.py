@@ -1491,6 +1491,10 @@ class Engine:
         os.makedirs(block_root, exist_ok=True)
         tensors = []
         block_refs = []
+        unique_refs = set()
+        reused_blocks = 0
+        new_blocks = 0
+        physical_delta = 0
         for kind, holder, key, host in snapshot:
             h = host.detach().cpu()
             if kind == "dict" and h.ndim >= 2 and h.shape[1] > block_rows:
@@ -1503,6 +1507,14 @@ class Engine:
                         tmp = path + f".tmp-{os.getpid()}-{time.time_ns()}"
                         torch.save(blk, tmp)
                         os.replace(tmp, path)
+                        new_blocks += 1
+                        try:
+                            physical_delta += os.path.getsize(path)
+                        except OSError:
+                            pass
+                    else:
+                        reused_blocks += 1
+                    unique_refs.add(digest)
                     refs.append(digest)
                 block_refs.append({"rows": int(h.shape[1]), "refs": refs})
                 tensors.append(torch.empty((0,), dtype=h.dtype))
@@ -1572,6 +1584,37 @@ class Engine:
             f"size={ent['bytes']/2**20:,.1f}MiB "
             f"time={dt:.3f}s "
             f"path={final_path}",
+            flush=True,
+        )
+
+        # Report physical immutable-block accounting separately from the
+        # logical snapshot payload.  This is intentionally derived from the
+        # files on disk so it remains meaningful after a restart.
+        try:
+            physical_total = sum(
+                os.path.getsize(os.path.join(block_root, name))
+                for name in os.listdir(block_root)
+                if name.endswith(".pt")
+            )
+            manifest_bytes = os.path.getsize(final_path)
+        except OSError:
+            physical_total = 0
+            manifest_bytes = 0
+        logical_bytes = int(ent.get("bytes", 0))
+        dedup_ratio = (
+            logical_bytes / physical_total
+            if physical_total
+            else 0.0
+        )
+        print(
+            f"[prefix-store] anchor={len(base_ids):,} "
+            f"logical={logical_bytes/2**20:,.1f}MiB "
+            f"unique_blocks={len(unique_refs)} "
+            f"reused_blocks={reused_blocks} new_blocks={new_blocks} "
+            f"physical_total={physical_total/2**20:,.1f}MiB "
+            f"physical_delta={physical_delta/2**20:,.1f}MiB "
+            f"manifest_bytes={manifest_bytes} "
+            f"dedup_ratio={dedup_ratio:.3f}",
             flush=True,
         )
 
