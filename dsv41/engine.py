@@ -2712,6 +2712,11 @@ class Engine:
                 self.mtp = saved_mtp
             return
         max_new = min(p.max_new_tokens, self.max_seq_len - len(prompt_ids) - 1)
+        # Claude may request 32K output even for a 100K+ context. Keep
+        # long-context requests bounded so the gateway can finish instead
+        # of timing out during slow single-token decode. Override per host.
+        if len(prompt_ids) > _mtp_long_limit:
+            max_new = min(max_new, int(os.environ.get("DSV41_LONG_PROMPT_MAX_NEW", "4096")))
         gen = None
         if p.seed is not None:
             gen = torch.Generator(device=self.model.blocks[-1].device)
