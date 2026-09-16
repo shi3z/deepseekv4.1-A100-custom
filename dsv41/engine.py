@@ -519,8 +519,8 @@ class Engine:
 
         return slots
 
-    def _snapshot_prefix_state(self):
-        """Copy the current attention-cache state to host RAM."""
+    def _snapshot_prefix_state(self, used_tokens=None):
+        """Copy attention state to host RAM, slicing caches to used rows."""
         slots = self._prefix_cache_slots()
 
         if not slots:
@@ -541,7 +541,24 @@ class Engine:
                     dtype=torch.int64,
                 )
 
-            nbytes = src.numel() * src.element_size()
+            # Dynamic compressed/index caches may be allocated well beyond
+            # the logical prefix. Persist only rows that can be read when
+            # restoring this anchor; unused capacity is recreated locally.
+            save_src = src
+            if (
+                used_tokens is not None
+                and kind == "dict"
+                and isinstance(key, tuple)
+                and key
+                and key[0] in self.model.shared.cache_max_rows
+                and src.ndim >= 2
+            ):
+                owner = int(key[0])
+                ratio = int(self.model.args.compress_ratios[owner])
+                rows = max(1, min(src.shape[1], int(used_tokens) // max(1, ratio) + 1))
+                save_src = src[:, :rows].contiguous()
+
+            nbytes = save_src.numel() * save_src.element_size()
             total += nbytes
 
             # Pinned memory is preferred for future fast restores.
@@ -549,17 +566,17 @@ class Engine:
             # refuses a large allocation.
             try:
                 host = torch.empty_like(
-                    src,
+                    save_src,
                     device="cpu",
                     pin_memory=True,
                 )
             except Exception:
                 host = torch.empty_like(
-                    src,
+                    save_src,
                     device="cpu",
                 )
 
-            host.copy_(src, non_blocking=False)
+            host.copy_(save_src, non_blocking=False)
 
             snap.append(
                 (kind, holder, key, host)
@@ -876,7 +893,14 @@ class Engine:
             ):
                 return
 
-            snap = self._snapshot_prefix_state()
+            try:
+                snap = self._snapshot_prefix_state(used_tokens=pos)
+            except TypeError as exc:
+                # Preserve compatibility with lightweight test doubles and
+                # older callers that provide a no-argument snapshot hook.
+                if "used_tokens" not in str(exc):
+                    raise
+                snap = self._snapshot_prefix_state()
             _captured_positions.add(pos)
 
             if _multi_snapshot:
@@ -1356,6 +1380,13 @@ class Engine:
         """
         kind, holder, key, tensor = slot
 
+        shape = tuple(int(x) for x in tensor.shape)
+        if kind == "dict" and isinstance(key, tuple) and key:
+            try:
+                if int(key[0]) >= 0:
+                    shape = (shape[0], -1, *shape[2:])
+            except Exception:
+                pass
         return {
             "kind": str(kind),
             "holder_class": (
@@ -1364,7 +1395,7 @@ class Engine:
                 + holder.__class__.__qualname__
             ),
             "key": repr(key),
-            "shape": tuple(int(x) for x in tensor.shape),
+            "shape": shape,
             "dtype": str(tensor.dtype),
         }
 
@@ -2632,7 +2663,7 @@ class Engine:
             self._write_prefix_draft_hidden(self.model.main_hidden, target_base)
 
         snap, snap_bytes = (
-            self._snapshot_prefix_state()
+            self._snapshot_prefix_state(used_tokens=target_base)
         )
 
         logits2, _ = self._replay_prefix_tail(
