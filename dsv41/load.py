@@ -260,7 +260,21 @@ def load_model(ckpt_path: str, devices: list[int], max_seq_len: int = 16384, max
     n_layers = n_layers or cfg["n_layers"]
     if ep:
         nd = len(devices)
-        placement = [torch.device(f"cuda:{devices[min(i * nd // n_layers, nd - 1)]}") for i in range(n_layers)]
+        # Optional pipeline rebalance for long-context cache headroom.
+        # Counts are in device order and must sum to n_layers; this lets a
+        # GPU with less free VRAM host fewer dense layers while preserving
+        # sequential pipeline order.
+        _counts = os.environ.get("DSV41_LAYER_COUNTS", "")
+        if _counts:
+            counts = [int(x) for x in _counts.split(",") if x.strip()]
+            if len(counts) != nd or sum(counts) != n_layers or any(x <= 0 for x in counts):
+                raise ValueError(f"DSV41_LAYER_COUNTS must be {nd} positive counts summing to {n_layers}: {_counts!r}")
+            placement = []
+            for dev, count in zip(devices, counts):
+                placement.extend([torch.device(f"cuda:{dev}")] * count)
+            print(f"layer counts override: {counts}", flush=True)
+        else:
+            placement = [torch.device(f"cuda:{devices[min(i * nd // n_layers, nd - 1)]}") for i in range(n_layers)]
         E = cfg["n_routed_experts"]
         if ep_shards:
             assert len(ep_shards) == nd and sum(ep_shards) == E, (ep_shards, E)
