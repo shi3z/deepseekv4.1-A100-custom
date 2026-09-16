@@ -16,6 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import os as _os
 import traceback
+import threading
 _os.environ.setdefault("OMP_WAIT_POLICY", "active")  # CPU expert threads keep spinning between layers (libgomp reads this once)
 from .engine import Engine, GenParams, parse_budgets
 
@@ -118,7 +119,25 @@ class Handler(BaseHTTPRequestHandler):
           flush=True,
         )
         if body.get("stream"):
-            # Generate before sending HTTP 200 so generation failures can
+            # Send SSE headers immediately and emit keep-alive comments while
+            # long-context prefill/generation is running. Previously the
+            # server buffered the entire response, so LiteLLM timed out on
+            # 100K+ prompts despite stream=True.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+            heartbeat_stop = threading.Event()
+            def _heartbeat():
+                while not heartbeat_stop.wait(10.0):
+                    try:
+                        self.wfile.write(b": keep-alive\n\n")
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        break
+            threading.Thread(target=_heartbeat, daemon=True).start()
+            # Generate while the heartbeat keeps the gateway connection alive.
             # still be returned as proper HTTP errors.
             try:
                 text, n = eng.generate_text(ids, params)
@@ -164,6 +183,8 @@ class Handler(BaseHTTPRequestHandler):
                     },
                 )
 
+            heartbeat_stop.set()
+
             # DeepSeek completion may contain thinking / DSML tool calls.
             # Always parse it before exposing an OpenAI-compatible response.
             msg = eng.parse_completion(text, thinking)
@@ -189,13 +210,6 @@ class Handler(BaseHTTPRequestHandler):
                 f"raw_preview={text[:300]!r}",
                 flush=True,
             )
-
-            # Generation succeeded. Now it is safe to send HTTP 200.
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "keep-alive")
-            self.end_headers()
 
             def chunk(delta, finish=None):
                 obj = {
