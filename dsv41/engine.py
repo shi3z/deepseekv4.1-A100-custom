@@ -2590,7 +2590,7 @@ class Engine:
         # Avoid materialising attention activations for a 100K+ prompt in
         # one call. Continuation chunks preserve the persistent caches and
         # keep the peak temporary allocation bounded by HC_PREFILL_CHUNK.
-        _chunk = max(1, int(os.environ.get("DSV41_HC_PREFILL_CHUNK", "256")))
+        _chunk = max(1, int(os.environ.get("DSV41_HC_PREFILL_CHUNK", "1024")))
         logits = None
         for _s in range(0, len(base_ids), _chunk):
             _e = min(_s + _chunk, len(base_ids))
