@@ -1482,14 +1482,38 @@ class Engine:
             for slot in snapshot
         ]
 
-        # Save only portable data.  Never save holder objects.
-        tensors = [
-            host.detach().cpu()
-            for _, _, _, host in snapshot
-        ]
+        # Save only portable data.  Never save holder objects.  Large
+        # canonical cache tensors are split into immutable 1024-row blocks;
+        # anchors then share blocks by content hash instead of duplicating
+        # the entire prefix.
+        block_rows = int(os.environ.get("DSV41_PREFIX_BLOCK_ROWS", "1024"))
+        block_root = os.path.join(root, "blocks")
+        os.makedirs(block_root, exist_ok=True)
+        tensors = []
+        block_refs = []
+        for kind, holder, key, host in snapshot:
+            h = host.detach().cpu()
+            if kind == "dict" and h.ndim >= 2 and h.shape[1] > block_rows:
+                refs = []
+                for start in range(0, h.shape[1], block_rows):
+                    blk = h[:, start:start + block_rows].contiguous()
+                    digest = hashlib.sha256(blk.view(torch.uint8).numpy().tobytes()).hexdigest()[:32]
+                    path = os.path.join(block_root, digest + ".pt")
+                    if not os.path.exists(path):
+                        tmp = path + f".tmp-{os.getpid()}-{time.time_ns()}"
+                        torch.save(blk, tmp)
+                        os.replace(tmp, path)
+                    refs.append(digest)
+                block_refs.append({"rows": int(h.shape[1]), "refs": refs})
+                tensors.append(torch.empty((0,), dtype=h.dtype))
+            else:
+                block_refs.append(None)
+                tensors.append(h)
 
         payload = {
-            "format": "dsv41-prefix-tmpfs-v1",
+            "format": "dsv41-prefix-tmpfs-v2-blocks",
+            "block_rows": block_rows,
+            "block_refs": block_refs,
             "cache_epoch": os.environ.get(
                 "DSV41_PREFIX_CACHE_EPOCH",
                 "fullstate-v5-index-engram-dspark",
@@ -1782,9 +1806,9 @@ class Engine:
                 skipped += 1
                 continue
 
-            if (
-                payload.get("format")
-                != "dsv41-prefix-tmpfs-v1"
+            if payload.get("format") not in (
+                "dsv41-prefix-tmpfs-v1",
+                "dsv41-prefix-tmpfs-v2-blocks",
             ):
                 skipped += 1
                 continue
@@ -1867,6 +1891,21 @@ class Engine:
                 "tensors",
                 [],
             )
+            block_refs = payload.get("block_refs") or []
+            if block_refs and len(block_refs) == len(tensors):
+                block_root = os.path.join(root, "blocks")
+                rebuilt = list(tensors)
+                try:
+                    for i, spec in enumerate(block_refs):
+                        if not spec:
+                            continue
+                        parts = [torch.load(os.path.join(block_root, ref + ".pt"), map_location="cpu", weights_only=False) for ref in spec["refs"]]
+                        rebuilt[i] = torch.cat(parts, dim=1)
+                    tensors = rebuilt
+                except Exception as exc:
+                    print(f"[prefix-tmpfs] SKIP reason=missing-block error={exc} path={path}", flush=True)
+                    skipped += 1
+                    continue
 
             if (
                 len(tensors)
