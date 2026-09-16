@@ -131,7 +131,13 @@ class EPRuntime(DecodeRuntime):
             o = blk.device
             self._ptrs[("own", L, o)] = torch.tensor([self.flag_part[o][L, self.idx[o]].data_ptr()], dtype=torch.int64, device=o)
         # the candidate buffers travel between devices with 16-byte copies: pad them
-        n_cand = -(-(model.args.max_seq_len + 1) // 16) * 16
+        # Candidate masks are only consumed by static-shape decode graphs.
+        # Do not make every graph buffer 1M tokens merely because the
+        # logical KV limit is 1M; that exhausts graph-capture workspace.
+        # Long prefill builds candidates dynamically in the model path.
+        _cand_tokens = int(os.environ.get("DSV41_EP_CAND_TOKENS", "131072"))
+        _cand_tokens = min(max(_cand_tokens, 1024), model.args.max_seq_len)
+        n_cand = -((_cand_tokens + 1) // -16) * 16
         self.cand_buf = {d: torch.zeros(B, 1, n_cand, dtype=torch.bool, device=d) for d in self.devs}
         for d in self.devs:
             self._tc_tables(B * topk, d, topk)
@@ -481,12 +487,38 @@ class EPRuntime(DecodeRuntime):
         # 1) dry pass without waits: compiles / loads every kernel on every device (a module load while the device
         #    spins in a wait deadlocks the host), 2) two real passes with the devices interleaved per layer,
         # 3) one graph per device
+        # Graph decode uses bounded static candidate storage. Keep the
+        # model's logical context limit unchanged, but clamp only the
+        # capture-time shape metadata so a 1M-context model does not make
+        # temporary graph workspaces explode.
+        _logical_max_seq = self.m.args.max_seq_len
+        _graph_limit = min(_logical_max_seq, int(os.environ.get("DSV41_EP_GRAPH_TOKENS", "131072")))
+        self.graph_token_limit = _graph_limit
+        self.m.args.max_seq_len = _graph_limit
+
+        # Capture against compact, dedicated RoPE storage. Capturing pointers
+        # into the full 256K-1M tables triggers an illegal access in the
+        # Triton decode RoPE kernel on sm80 even though position zero is used.
+        # Keep these clones alive because the graph owns their pointers.
+        self._graph_rope_tables = []
+        _rope_restore = []
+        for blk in self.m.blocks:
+            attn = blk.attn
+            old_cos, old_sin = attn.cos, attn.sin
+            graph_cos = old_cos[:_graph_limit].clone()
+            graph_sin = old_sin[:_graph_limit].clone()
+            _rope_restore.append((attn, old_cos, old_sin))
+            attn.cos, attn.sin = graph_cos, graph_sin
+            if attn.indexer is not None:
+                attn.indexer.cos, attn.indexer.sin = graph_cos, graph_sin
+            self._graph_rope_tables.append((graph_cos, graph_sin))
         self.dry = True
         for d in self.devs:
             with torch.cuda.stream(self.streams[d]):
                 self.token_graph(d)
             torch.cuda.synchronize(d)
         self.dry = False
+        self.m.args.max_seq_len = _logical_max_seq
         for d in self.devs:
             self.seqno[d].fill_(1)
             self.flag_route[d].zero_()
@@ -509,6 +541,11 @@ class EPRuntime(DecodeRuntime):
                 self.graphs[d] = g
         for d in self.devs:
             torch.cuda.synchronize(d)
+        self._graph_cache_signature = self._cache_signature()
+        for attn, old_cos, old_sin in _rope_restore:
+            attn.cos, attn.sin = old_cos, old_sin
+            if attn.indexer is not None:
+                attn.indexer.cos, attn.indexer.sin = old_cos, old_sin
 
     def _eager_token(self):
         """One token without graphs, the devices interleaved per layer on their own streams."""
@@ -531,6 +568,15 @@ class EPRuntime(DecodeRuntime):
         # Debug dynamic-cache growth vs captured CUDA Graph pointers.
         # Switch to eager execution only around/after the 32K boundary.
         _debug_eager = False
+
+        if torch.is_tensor(p):
+            _decode_pos = int(p.max().item())
+        elif isinstance(p, (list, tuple)):
+            _decode_pos = max(int(v) for v in p)
+        else:
+            _decode_pos = int(p)
+        if _decode_pos >= getattr(self, "graph_token_limit", self.m.args.max_seq_len):
+            _debug_eager = True
 
         if os.environ.get(
             "DSV41_DEBUG_EP_EAGER_BOUNDARY",

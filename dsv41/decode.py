@@ -103,26 +103,9 @@ class DecodeRuntime:
             if A.is_kv_source:
                 self.kv_owner = A.layer_id
                 latent, should = self.compressor2(A, x3, pos, seq)
-                # Scalar EPRuntime writes directly into cache mirrors.
-                # Grow them before deriving row indices; otherwise a
-                # long block-replay continuation can write past the
-                # preallocated horizon and poison the CUDA context.
-                self.m.shared._ensure_capacity(
-                    self.m.shared.compress_kv,
-                    A.layer_id,
-                    int(compress_len.max().item()),
-                    "compress_kv",
-                )
                 cache = self.m.shared.compress_kv[(A.layer_id, d)]
                 row = torch.where(should, compress_len - 1, torch.full_like(compress_len, cache.shape[1] - 1))  # [B]
             if A.is_index_source:
-                if getattr(A.indexer, "owns_k", False):
-                    self.m.shared._ensure_capacity(
-                        self.m.shared.index_k,
-                        A.layer_id,
-                        int(compress_len.max().item()),
-                        "index_k",
-                    )
                 idxs = self.indexer(A, x3, qr.view(B, 1, -1), latent, pos, compress_len, d, row if A.is_kv_source else None)
                 self.topk_buf[d].copy_(idxs)
             else:
@@ -473,6 +456,7 @@ class DecodeRuntime:
                     self.run_segment(si)
                 self.graphs[d] = g
         torch.cuda.synchronize()
+        self._graph_cache_signature = self._cache_signature()
 
     def copy_seq(self, src: int, dst: int):
         """Copy every per-sequence state (window rings, compressed caches, index keys, compressor rings, Engram history)
@@ -489,6 +473,40 @@ class DecodeRuntime:
         if self.m.engram_hash is not None:
             self.m.engram_hash.cache[dst].copy_(self.m.engram_hash.cache[src])
 
+    def _cache_signature(self):
+        return tuple((name, key, value.data_ptr(), tuple(value.shape))
+                     for name in ("compress_kv", "index_k")
+                     for key, value in getattr(self.m.shared, name).items())
+
+    def _prepare_decode_cache(self, end_pos):
+        """Grow before GPU dispatch; tensor .item() is illegal during capture.
+
+        Keep a dummy row beyond the visible keys. Prefill can also replace
+        cache tensors, so validate captured pointers even without growth here.
+        """
+        shared = self.m.shared
+        pending = []
+        for name in ("compress_kv", "index_k"):
+            table = getattr(shared, name)
+            for owner in {key[0] for key in table}:
+                ratio = self.m.blocks[owner].attn.ratio
+                needed = end_pos // ratio + 1
+                if any(v.size(1) < needed for (o, _), v in table.items() if o == owner):
+                    pending.append((table, owner, needed, name))
+        if pending:
+            for device in self.devices:
+                torch.cuda.synchronize(device)
+            for table, owner, needed, name in pending:
+                shared._ensure_capacity(table, owner, needed, name)
+        if self.graphs and self._cache_signature() != getattr(self, "_graph_cache_signature", None):
+            # Replaying a graph after reallocation reads stale pointers.
+            # Recapture performs warm-up writes into model state; use eager
+            # execution until an explicit safe recapture instead.
+            for device in self.devices:
+                torch.cuda.synchronize(device)
+            self.graphs.clear()
+            print("[decode-cache] cache storage changed; using eager decode", flush=True)
+
     def set_rows(self, token, pos, seq=None, pmax=None):
         """Fill the row tables: token(s), position(s), sequence id per row (default 0..B-1) and the newest position
         written to each row's sequence this step (default: the row's own position). Ints are broadcast."""
@@ -497,6 +515,10 @@ class DecodeRuntime:
         tok = as_rows(token, torch.int64)
         self.tok.copy_(tok.view(-1, 1))
         p = as_rows(pos, torch.int64)
+        # Cache sizing and pointer validation require host synchronization;
+        # CUDA graph capture must remain entirely device side.
+        if not torch.cuda.is_current_stream_capturing():
+            self._prepare_decode_cache(int(p.max().item()) + 1)
         sq = as_rows(seq, torch.int64) if seq is not None else torch.arange(B, dtype=torch.int64) % self.S
         pm = as_rows(pmax, torch.int64) if pmax is not None else p
         for d in self.devices:

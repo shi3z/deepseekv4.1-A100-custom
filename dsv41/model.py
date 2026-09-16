@@ -473,68 +473,36 @@ class Compressor:
             score = score.unflatten(1, (-1, ratio))
             kv = (kv * score.softmax(dim=2)).sum(dim=2)
         else:
-            # ----------------------------------------------------
-            # Multi-token continuation.
-            #
-            # The old path assumed seqlen == 1:
-            #
-            #   slot = start_pos % ratio
-            #   state[:, slot] = kv.squeeze(1)
-            #
-            # Instead, consume the continuation chunk in pieces up
-            # to each compression boundary.  This preserves exactly
-            # the same state evolution as scalar decode, while a
-            # 64-token continuation requires only ~64/ratio loop
-            # iterations rather than 64 model.forward() calls.
-            # ----------------------------------------------------
+            # Pool complete groups together. A Python loop per compression
+            # group launched thousands of tiny CUDA operations per block.
+            # Only the first partial group needs the previous ring state.
             pooled = []
-
             j = 0
-            abs_pos = start_pos
+            partial = start_pos % ratio
+            if partial:
+                take = min(ratio - partial, seqlen)
+                self.kv_state[:bsz, partial:partial + take] = kv[:, :take]
+                self.score_state[:bsz, partial:partial + take] = score[:, :take]
+                j = take
+                if partial + take == ratio:
+                    pooled.append((self.kv_state[:bsz] *
+                                   self.score_state[:bsz].softmax(dim=1)).sum(dim=1, keepdim=True))
 
-            while j < seqlen:
-                slot = abs_pos % ratio
-
-                # Number of tokens that fit before this compression
-                # group reaches its boundary.
-                take = min(
-                    ratio - slot,
-                    seqlen - j,
-                )
-
-                self.kv_state[
-                    :bsz,
-                    slot:slot + take,
-                ] = kv[:, j:j + take]
-
-                self.score_state[
-                    :bsz,
-                    slot:slot + take,
-                ] = score[:, j:j + take]
-
-                j += take
-                abs_pos += take
-
-                # A complete ratio-sized compression group is ready.
-                if abs_pos % ratio == 0:
-                    pooled.append(
-                        (
-                            self.kv_state[:bsz]
-                            * self.score_state[:bsz]
-                                .softmax(dim=1)
-                        ).sum(
-                            dim=1,
-                            keepdim=True,
-                        )
-                    )
-
+            end = j + ((seqlen - j) // ratio) * ratio
+            if end > j:
+                groups = kv[:, j:end].unflatten(1, (-1, ratio))
+                gates = score[:, j:end].unflatten(1, (-1, ratio))
+                pooled.append((groups * gates.softmax(dim=2)).sum(dim=2))
+                # Preserve even unused state slots for snapshot compatibility.
+                self.kv_state[:bsz] = kv[:, end - ratio:end]
+                self.score_state[:bsz] = score[:, end - ratio:end]
+            if end < seqlen:
+                tail = seqlen - end
+                self.kv_state[:bsz, :tail] = kv[:, end:]
+                self.score_state[:bsz, :tail] = score[:, end:]
             if not pooled:
                 return None
-
-            kv = torch.cat(
-                pooled,
-                dim=1,
-            )
+            kv = torch.cat(pooled, dim=1) if len(pooled) > 1 else pooled[0]
 
         return rmsnorm(
             kv.to(dtype),
@@ -642,8 +610,11 @@ class Indexer:
         #
         # Decode keeps the original path.
         # ===============================================================
-        if start_pos == 0 and seqlen > 128:
-            QUERY_CHUNK = 128
+        # Continuation prefill has the same score scratch as cold prefill.
+        # Bound it for every multi-token call, including prefix replay.
+        query_chunk = max(1, int(os.environ.get("DSV41_INDEX_QUERY_CHUNK", "128")))
+        if seqlen > query_chunk:
+            QUERY_CHUNK = query_chunk
 
             key_len = index_k.size(1)
             key_pos = torch.arange(
