@@ -1873,12 +1873,22 @@ class Engine:
                     )
                     continue
 
-                if (
-                    not torch.is_tensor(src)
-                    or tuple(src.shape)
-                       != tuple(dst.shape)
-                    or src.dtype != dst.dtype
-                ):
+                _shape_ok = (
+                    torch.is_tensor(src)
+                    and torch.is_tensor(dst)
+                    and src.dtype == dst.dtype
+                    and (
+                        tuple(src.shape) == tuple(dst.shape)
+                        or (
+                            kind == "dict"
+                            and src.ndim == dst.ndim
+                            and tuple(src.shape[:1]) == tuple(dst.shape[:1])
+                            and tuple(src.shape[2:]) == tuple(dst.shape[2:])
+                            and src.shape[1] <= dst.shape[1]
+                        )
+                    )
+                )
+                if not _shape_ok:
                     bad = True
                     break
 
