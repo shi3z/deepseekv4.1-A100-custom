@@ -836,7 +836,13 @@ class Engine:
                     and key[0] in self.model.shared.cache_max_rows
                 ):
                     owner = int(key[0])
-                    ratio = int(getattr(self.model.args, "compress_ratios", {}).get(owner, 1)) if hasattr(self.model, "args") else 1
+                    cr = getattr(self.model.args, "compress_ratios", None) if hasattr(self.model, "args") else None
+                    if isinstance(cr, dict):
+                        ratio = int(cr.get(owner, 1))
+                    elif isinstance(cr, (list, tuple)) and 0 <= owner < len(cr):
+                        ratio = int(cr[owner])
+                    else:
+                        ratio = 1
                     rows = max(1, min(src.shape[1], int(used_tokens) // max(1, ratio) + 1))
                     save_src = src[:, :rows].contiguous()
                 elif (

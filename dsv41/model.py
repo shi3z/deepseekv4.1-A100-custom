@@ -1186,6 +1186,8 @@ class Attention:
             self.shared.topk_idxs = idxs
         else:
             idxs = self.shared.topk_idxs.to(x.device, non_blocking=True)
+            if idxs.size(1) > seqlen:
+                idxs = idxs[:, -seqlen:]
         if latent is not None:
             latent = latent.contiguous()
             if start_pos == 0:
@@ -2336,7 +2338,8 @@ class Transformer:
 
         enc_last_id = int(os.environ.get("DSV41_CED_ENCODER_LAST_LAYER", "20"))
         win_size = int(self.args.cfg.get("window_size", 128))
-        use_ced = os.environ.get("DSV41_CED", "1") != "0" and S > win_size
+        min_ced_tokens = int(os.environ.get("DSV41_CED_MIN_TOKENS", "2048"))
+        use_ced = os.environ.get("DSV41_CED", "1") != "0" and S >= min_ced_tokens and S > win_size
 
         if use_ced:
             # -------------------------------------------------------------
