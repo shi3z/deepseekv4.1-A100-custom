@@ -32,7 +32,8 @@ class GenParams:
 
 
 class _BatchRequest:
-    def __init__(self, prompt_ids: list[int], params: GenParams, max_new: int, gen: torch.Generator | None):
+    def __init__(self, prompt_ids: list[int], params: GenParams, max_new: int, gen: torch.Generator | None, req_id: str = ""):
+        self.req_id = req_id or f"req_{id(self):x}"
         self.prompt_ids = prompt_ids
         self.params = params
         self.max_new = max_new
@@ -3554,7 +3555,7 @@ class Engine:
                         logits, _reused = self._prefill_with_prefix_reuse(req.prompt_ids)
                         first_tok = sample_token(logits[0], req.params.temperature, req.params.top_p, req.gen)
                         # Copy per-sequence cache state from slot 0 to target decode slot
-                        self.rt.copy_seq(0, slot_id)
+                        self.rt.copy_seq(0, slot_id, req_id=req.req_id)
                         req.pos = len(req.prompt_ids)
                         req.next_token = first_tok
                         if first_tok == self.eos:

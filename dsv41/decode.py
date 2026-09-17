@@ -25,6 +25,7 @@ FUSED2 = os.environ.get("DSV41_FUSED2", "1") == "1"
 _CPU_DEBUG = os.environ.get("DSV41_CPU_DEBUG") is not None
 FP4_TC = os.environ.get("DSV41_FP4_TC", "1") == "1"  # expert GEMM on tensor cores (cuda/fp4_tc.cu) instead of the GEMV
 HC_FORK = os.environ.get("DSV41_HC_FORK", "1") == "1"  # hyper-connection mixes + sinkhorn on a side stream (a parallel graph branch)
+_LOGGED_SLOT = False
 
 
 class DecodeRuntime:
@@ -458,20 +459,72 @@ class DecodeRuntime:
         torch.cuda.synchronize()
         self._graph_cache_signature = self._cache_signature()
 
-    def copy_seq(self, src: int, dst: int):
+    def copy_seq(self, src: int, dst: int, req_id: str = ""):
         """Copy every per-sequence state (window rings, compressed caches, index keys, compressor rings, Engram history)
         from sequence slot src to slot dst (used to prefill sequences one at a time into slot 0)."""
+        global _LOGGED_SLOT
+        first_audit = not _LOGGED_SLOT
+
         for blk in self.m.blocks:
             A = blk.attn
+            if torch.is_inference(A.window_kv_cache):
+                print(
+                    f"[tensor-audit] level=slot req_id={req_id} name=window_kv_cache[{blk.layer_id}] "
+                    f"shape={tuple(A.window_kv_cache.shape)} dev={A.window_kv_cache.device} "
+                    f"is_inference=True op=copy_seq({src}->{dst}) healing with clone",
+                    flush=True,
+                )
+                with torch.inference_mode(False):
+                    A.window_kv_cache = A.window_kv_cache.clone()
             A.window_kv_cache[dst].copy_(A.window_kv_cache[src])
+
             C = A.compressor
             if C is not None and C.ratio > 1:
-                for t in (C.kv_ring, C.score_ring, C.kv_state, C.score_state):
+                for idx, t in enumerate((C.kv_ring, C.score_ring, C.kv_state, C.score_state)):
+                    if torch.is_inference(t):
+                        print(
+                            f"[tensor-audit] level=slot req_id={req_id} name=compressor_ring[{blk.layer_id}][{idx}] "
+                            f"shape={tuple(t.shape)} dev={t.device} is_inference=True op=copy_seq({src}->{dst}) healing with clone",
+                            flush=True,
+                        )
+                        with torch.inference_mode(False):
+                            t = t.clone()
                     t[dst].copy_(t[src])
-        for cache in list(self.m.shared.compress_kv.values()) + list(self.m.shared.index_k.values()):
-            cache[dst].copy_(cache[src])
+
+        for name, table in (("compress_kv", self.m.shared.compress_kv), ("index_k", self.m.shared.index_k)):
+            for key, cache in list(table.items()):
+                is_inf = torch.is_inference(cache)
+                if is_inf or (first_audit and key == next(iter(table.keys()))):
+                    print(
+                        f"[tensor-audit] level=slot req_id={req_id} name={name}[{key}] "
+                        f"shape={tuple(cache.shape)} dev={cache.device} is_inference={is_inf} "
+                        f"op=copy_seq({src}->{dst})"
+                        + (" healing with clone" if is_inf else ""),
+                        flush=True,
+                    )
+                if is_inf:
+                    with torch.inference_mode(False):
+                        table[key] = cache.clone()
+                        cache = table[key]
+                assert not torch.is_inference(cache), (
+                    f"[tensor-audit] FAIL: {name}[{key}] shape={tuple(cache.shape)} dev={cache.device} "
+                    f"is_inference={torch.is_inference(cache)} op=copy_seq({src}->{dst})"
+                )
+                cache[dst].copy_(cache[src])
+
         if self.m.engram_hash is not None:
+            if torch.is_inference(self.m.engram_hash.cache):
+                print(
+                    f"[tensor-audit] level=slot req_id={req_id} name=engram_hash.cache "
+                    f"shape={tuple(self.m.engram_hash.cache.shape)} dev={self.m.engram_hash.cache.device} "
+                    f"is_inference=True op=copy_seq({src}->{dst}) healing with clone",
+                    flush=True,
+                )
+                with torch.inference_mode(False):
+                    self.m.engram_hash.cache = self.m.engram_hash.cache.clone()
             self.m.engram_hash.cache[dst].copy_(self.m.engram_hash.cache[src])
+
+        _LOGGED_SLOT = True
 
     def _cache_signature(self):
         return tuple((name, key, value.data_ptr(), tuple(value.shape))

@@ -319,7 +319,6 @@ class SharedAttn:
         self._topk_idxs_map.pop(chunk_idx, None)
         self._candidates_map.pop(chunk_idx, None)
 
-    @torch.inference_mode()
     def _ensure_capacity(
         self,
         table: dict,
@@ -383,28 +382,31 @@ class SharedAttn:
 
         # Grow mirrors one at a time so we do not hold all old+new
         # mirrors simultaneously.
-        for key in keys:
-            old = table[key]
+        # MUST allocate with inference_mode(False) so cache remains a mutable tensor
+        with torch.inference_mode(False):
+            for key in keys:
+                old = table[key]
 
-            if old.size(1) >= need_rows:
-                continue
+                if old.size(1) >= need_rows:
+                    continue
 
-            new = torch.empty(
-                old.size(0),
-                target,
-                old.size(2),
-                dtype=old.dtype,
-                device=old.device,
-            )
+                new = torch.empty(
+                    old.size(0),
+                    target,
+                    old.size(2),
+                    dtype=old.dtype,
+                    device=old.device,
+                )
+                assert not torch.is_inference(new), f"{kind}[{key}] allocated cache must not be an InferenceTensor"
 
-            # Only existing rows need preserving.  Future rows need not
-            # be initialized because callers never read beyond the
-            # current logical compressed length.
-            new[:, :old.size(1)].copy_(old)
+                # Only existing rows need preserving.  Future rows need not
+                # be initialized because callers never read beyond the
+                # current logical compressed length.
+                new[:, :old.size(1)].copy_(old)
 
-            table[key] = new
+                table[key] = new
 
-            del old
+                del old
 
     def write_compress_kv(
         self,

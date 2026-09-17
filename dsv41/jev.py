@@ -176,6 +176,9 @@ class JevPrefixNode:
         self.last_accessed = time.time()
 
 
+_LOGGED_LEVELS: set[str] = set()
+
+
 class JevPrefixTree:
     """Manages hierarchical persistent prefix caching on GPU:
 
@@ -199,84 +202,170 @@ class JevPrefixTree:
 
     def _ensure_batch_capacity(self, B: int):
         """Ensure model caches have sufficient batch dimension capacity for B parallel fields."""
-        # 1. Window KV caches across all blocks
-        for blk in self.model.blocks:
-            if blk.attn.window_kv_cache.shape[0] < B:
-                old = blk.attn.window_kv_cache
-                new_c = torch.zeros(B, old.shape[1], old.shape[2], dtype=old.dtype, device=old.device)
-                new_c[:old.shape[0]] = old
-                blk.attn.window_kv_cache = new_c
+        with torch.inference_mode(False):
+            # 1. Window KV caches across all blocks
+            for blk in self.model.blocks:
+                if blk.attn.window_kv_cache.shape[0] < B:
+                    old = blk.attn.window_kv_cache
+                    new_c = torch.zeros(B, old.shape[1], old.shape[2], dtype=old.dtype, device=old.device)
+                    assert not torch.is_inference(new_c), "Allocated window_kv_cache must not be an InferenceTensor"
+                    new_c[:old.shape[0]] = old
+                    blk.attn.window_kv_cache = new_c
 
-        # 2. Shared compress_kv & index_k
-        for k, cache in self.model.shared.compress_kv.items():
-            if cache.shape[0] < B:
-                new_c = torch.zeros(B, cache.shape[1], cache.shape[2], dtype=cache.dtype, device=cache.device)
-                new_c[:cache.shape[0]] = cache
-                self.model.shared.compress_kv[k] = new_c
+            # 2. Shared compress_kv & index_k
+            for k, cache in self.model.shared.compress_kv.items():
+                if cache.shape[0] < B:
+                    new_c = torch.zeros(B, cache.shape[1], cache.shape[2], dtype=cache.dtype, device=cache.device)
+                    assert not torch.is_inference(new_c), "Allocated compress_kv must not be an InferenceTensor"
+                    new_c[:cache.shape[0]] = cache
+                    self.model.shared.compress_kv[k] = new_c
 
-        for k, cache in self.model.shared.index_k.items():
-            if cache.shape[0] < B:
-                new_c = torch.zeros(B, cache.shape[1], cache.shape[2], dtype=cache.dtype, device=cache.device)
-                new_c[:cache.shape[0]] = cache
-                self.model.shared.index_k[k] = new_c
+            for k, cache in self.model.shared.index_k.items():
+                if cache.shape[0] < B:
+                    new_c = torch.zeros(B, cache.shape[1], cache.shape[2], dtype=cache.dtype, device=cache.device)
+                    assert not torch.is_inference(new_c), "Allocated index_k must not be an InferenceTensor"
+                    new_c[:cache.shape[0]] = cache
+                    self.model.shared.index_k[k] = new_c
 
-        # 3. Engram cache
-        if getattr(self.model, "engram_hash", None) is not None:
-            if self.model.engram_hash.cache.shape[0] < B:
-                old = self.model.engram_hash.cache
-                new_c = torch.empty(B, old.shape[1], dtype=old.dtype, device=old.device)
-                new_c[:old.shape[0]] = old
-                self.model.engram_hash.cache = new_c
+            # 3. Engram cache
+            if getattr(self.model, "engram_hash", None) is not None:
+                if self.model.engram_hash.cache.shape[0] < B:
+                    old = self.model.engram_hash.cache
+                    new_c = torch.empty(B, old.shape[1], dtype=old.dtype, device=old.device)
+                    assert not torch.is_inference(new_c), "Allocated engram cache must not be an InferenceTensor"
+                    new_c[:old.shape[0]] = old
+                    self.model.engram_hash.cache = new_c
 
-    def snapshot_kv(self, end_pos: int) -> dict:
-        """Capture an exact snapshot of active attention KV state up to end_pos on GPU."""
-        snap = {
-            "end_pos": end_pos,
-            "window_kv": {},
-            "compress_kv": {},
-            "index_k": {},
-            "engram": None,
-        }
-        for blk in self.model.blocks:
-            snap["window_kv"][blk.layer_id] = blk.attn.window_kv_cache[0:1].clone()
+    def snapshot_kv(self, end_pos: int, level: str = "request") -> dict:
+        """Capture an exact snapshot of active attention KV state up to end_pos on GPU.
+        Levels:
+          1. 'system': Persistent Jev system prefix KV (immutable, never modified)
+          2. 'schema': Persistent schema prefix KV (immutable, never modified)
+          3. 'request': Request shared prefix KV (immutable once built, shared by fields)
+        """
+        with torch.inference_mode(False):
+            snap = {
+                "end_pos": end_pos,
+                "level": level,
+                "window_kv": {},
+                "compress_kv": {},
+                "index_k": {},
+                "engram": None,
+            }
+            for blk in self.model.blocks:
+                snap["window_kv"][blk.layer_id] = blk.attn.window_kv_cache[0:1].clone()
 
-        for (owner, dev), cache in self.model.shared.compress_kv.items():
-            ratio = max(1, self.model.args.compress_ratios[owner])
-            rows = max(1, end_pos // ratio + 1)
-            snap["compress_kv"][(owner, dev)] = cache[0:1, :rows].clone()
+            for (owner, dev), cache in self.model.shared.compress_kv.items():
+                ratio = max(1, self.model.args.compress_ratios[owner])
+                rows = max(1, end_pos // ratio + 1)
+                snap["compress_kv"][(owner, dev)] = cache[0:1, :rows].clone()
 
-        for (owner, dev), cache in self.model.shared.index_k.items():
-            ratio = max(1, self.model.args.compress_ratios[owner])
-            rows = max(1, end_pos // ratio + 1)
-            snap["index_k"][(owner, dev)] = cache[0:1, :rows].clone()
+            for (owner, dev), cache in self.model.shared.index_k.items():
+                ratio = max(1, self.model.args.compress_ratios[owner])
+                rows = max(1, end_pos // ratio + 1)
+                snap["index_k"][(owner, dev)] = cache[0:1, :rows].clone()
 
-        if getattr(self.model, "engram_hash", None) is not None:
-            snap["engram"] = self.model.engram_hash.cache[0:1, :end_pos].clone()
+            if getattr(self.model, "engram_hash", None) is not None:
+                snap["engram"] = self.model.engram_hash.cache[0:1, :end_pos].clone()
 
-        return snap
+            return snap
 
-    def restore_kv(self, snap: dict, batch_size: int = 1):
-        """Restore a snapshot into the active KV cache, broadcasting to batch_size rows."""
+    def restore_kv(self, snap: dict, batch_size: int = 1, req_id: str = "", level: str = "request"):
+        """Restore a snapshot into the active KV cache, broadcasting to batch_size rows.
+        Audits destination tensors for inference status, heals if necessary, and ensures
+        destination buffers are mutable before inplace copy.
+        """
         self._ensure_batch_capacity(batch_size)
         end_pos = snap["end_pos"]
+        snap_level = snap.get("level", level)
+        first_audit = level not in _LOGGED_LEVELS
 
-        for blk in self.model.blocks:
-            saved = snap["window_kv"][blk.layer_id]
-            blk.attn.window_kv_cache[:batch_size].copy_(saved)
+        with torch.inference_mode(False):
+            for blk in self.model.blocks:
+                saved = snap["window_kv"][blk.layer_id]
+                target = blk.attn.window_kv_cache
+                is_inf = torch.is_inference(target)
+                op_name = f"restore_kv({snap_level}->batch_{batch_size})"
+                if is_inf or (first_audit and blk.layer_id == 0):
+                    print(
+                        f"[tensor-audit] level={level} req_id={req_id} name=window_kv_cache[{blk.layer_id}] "
+                        f"shape={tuple(target.shape)} dev={target.device} is_inference={is_inf} op={op_name}"
+                        + (" healing with clone" if is_inf else ""),
+                        flush=True,
+                    )
+                if is_inf:
+                    blk.attn.window_kv_cache = target.clone()
+                    target = blk.attn.window_kv_cache
+                assert not torch.is_inference(target), (
+                    f"[tensor-audit] FAIL: level={level} req_id={req_id} name=window_kv_cache[{blk.layer_id}] "
+                    f"shape={tuple(target.shape)} dev={target.device} is_inference=True op={op_name}"
+                )
+                target[:batch_size].copy_(saved)
 
-        for (owner, dev), cache in self.model.shared.compress_kv.items():
-            saved = snap["compress_kv"][(owner, dev)]
-            rows = saved.shape[1]
-            cache[:batch_size, :rows].copy_(saved)
+            for (owner, dev), cache in self.model.shared.compress_kv.items():
+                saved = snap["compress_kv"][(owner, dev)]
+                rows = saved.shape[1]
+                is_inf = torch.is_inference(cache)
+                op_name = f"restore_kv({snap_level}->batch_{batch_size})"
+                if is_inf or (first_audit and (owner, dev) == next(iter(self.model.shared.compress_kv))):
+                    print(
+                        f"[tensor-audit] level={level} req_id={req_id} name=compress_kv[({owner},{dev})] "
+                        f"shape={tuple(cache.shape)} dev={cache.device} is_inference={is_inf} op={op_name}"
+                        + (" healing with clone" if is_inf else ""),
+                        flush=True,
+                    )
+                if is_inf:
+                    self.model.shared.compress_kv[(owner, dev)] = cache.clone()
+                    cache = self.model.shared.compress_kv[(owner, dev)]
+                assert not torch.is_inference(cache), (
+                    f"[tensor-audit] FAIL: level={level} req_id={req_id} name=compress_kv[({owner},{dev})] "
+                    f"shape={tuple(cache.shape)} dev={cache.device} is_inference=True op={op_name}"
+                )
+                cache[:batch_size, :rows].copy_(saved)
 
-        for (owner, dev), cache in self.model.shared.index_k.items():
-            saved = snap["index_k"][(owner, dev)]
-            rows = saved.shape[1]
-            cache[:batch_size, :rows].copy_(saved)
+            for (owner, dev), cache in self.model.shared.index_k.items():
+                saved = snap["index_k"][(owner, dev)]
+                rows = saved.shape[1]
+                is_inf = torch.is_inference(cache)
+                op_name = f"restore_kv({snap_level}->batch_{batch_size})"
+                if is_inf or (first_audit and (owner, dev) == next(iter(self.model.shared.index_k))):
+                    print(
+                        f"[tensor-audit] level={level} req_id={req_id} name=index_k[({owner},{dev})] "
+                        f"shape={tuple(cache.shape)} dev={cache.device} is_inference={is_inf} op={op_name}"
+                        + (" healing with clone" if is_inf else ""),
+                        flush=True,
+                    )
+                if is_inf:
+                    self.model.shared.index_k[(owner, dev)] = cache.clone()
+                    cache = self.model.shared.index_k[(owner, dev)]
+                assert not torch.is_inference(cache), (
+                    f"[tensor-audit] FAIL: level={level} req_id={req_id} name=index_k[({owner},{dev})] "
+                    f"shape={tuple(cache.shape)} dev={cache.device} is_inference=True op={op_name}"
+                )
+                cache[:batch_size, :rows].copy_(saved)
 
-        if getattr(self.model, "engram_hash", None) is not None and snap["engram"] is not None:
-            saved = snap["engram"]
-            self.model.engram_hash.cache[:batch_size, :end_pos].copy_(saved)
+            if getattr(self.model, "engram_hash", None) is not None and snap.get("engram") is not None:
+                saved = snap["engram"]
+                target = self.model.engram_hash.cache
+                is_inf = torch.is_inference(target)
+                op_name = f"restore_kv({snap_level}->batch_{batch_size})"
+                if is_inf or first_audit:
+                    print(
+                        f"[tensor-audit] level={level} req_id={req_id} name=engram_hash.cache "
+                        f"shape={tuple(target.shape)} dev={target.device} is_inference={is_inf} op={op_name}"
+                        + (" healing with clone" if is_inf else ""),
+                        flush=True,
+                    )
+                if is_inf:
+                    self.model.engram_hash.cache = target.clone()
+                    target = self.model.engram_hash.cache
+                assert not torch.is_inference(target), (
+                    f"[tensor-audit] FAIL: level={level} req_id={req_id} name=engram_hash.cache "
+                    f"shape={tuple(target.shape)} dev={target.device} is_inference=True op={op_name}"
+                )
+                target[:batch_size, :end_pos].copy_(saved)
+
+            _LOGGED_LEVELS.add(level)
 
     def init_system_prompt(self, system_text: str | None = None) -> JevPrefixNode:
         """Prefill and permanently retain the fixed Jev system prompt on GPU at startup."""
@@ -300,7 +389,7 @@ class JevPrefixTree:
         dt = time.perf_counter() - t0
 
         self.system_node = JevPrefixNode("sys:default", sys_ids, "system", parent=self.root)
-        self.system_node.kv_snapshot = self.snapshot_kv(self.system_node.end_pos)
+        self.system_node.kv_snapshot = self.snapshot_kv(self.system_node.end_pos, level="system")
         self.root.children["sys:default"] = self.system_node
         print(f"[jev-prefix] System prompt prefilled & retained on GPU: tokens={len(sys_ids)} time={dt*1000:.2f}ms", flush=True)
         return self.system_node
@@ -321,7 +410,7 @@ class JevPrefixTree:
 
         # Cache Miss: Restore system prompt snapshot (zero cost) & prefill schema prefix
         self.stats["schema_misses"] += 1
-        self.restore_kv(self.system_node.kv_snapshot, batch_size=1)
+        self.restore_kv(self.system_node.kv_snapshot, batch_size=1, req_id=schema.signature, level="schema")
 
         schema_text = schema.format_schema_prefix()
         schema_ids = self.tok.encode(schema_text, add_special_tokens=False)
@@ -335,7 +424,7 @@ class JevPrefixTree:
         dt = time.perf_counter() - t0
 
         schema_node = JevPrefixNode(schema_key, schema_ids, "schema", parent=self.system_node)
-        schema_node.kv_snapshot = self.snapshot_kv(schema_node.end_pos)
+        schema_node.kv_snapshot = self.snapshot_kv(schema_node.end_pos, level="schema")
         self.system_node.children[schema_key] = schema_node
         self.schema_nodes[schema_key] = schema_node
         print(f"[jev-prefix] Schema prefix cached on GPU: key={schema_key} tokens={len(schema_ids)} time={dt*1000:.2f}ms", flush=True)
@@ -389,7 +478,7 @@ class JevPrefixTree:
 
         if best_cand is not None and best_lcp >= 32:
             # LCP Hit: restore candidate snapshot
-            self.restore_kv(best_cand.kv_snapshot, batch_size=1)
+            self.restore_kv(best_cand.kv_snapshot, batch_size=1, req_id=req_hash, level="request")
             reused = best_lcp
             print(f"[jev-prefix] Request LCP HIT: reused={reused}/{len(req_ids)} tokens", flush=True)
             for _s in range(reused, len(req_ids), _chunk):
@@ -401,7 +490,7 @@ class JevPrefixTree:
         else:
             # Full request prefill from schema snapshot in chunks
             reused = 0
-            self.restore_kv(schema_node.kv_snapshot, batch_size=1)
+            self.restore_kv(schema_node.kv_snapshot, batch_size=1, req_id=req_hash, level="request")
             for _s in range(0, len(req_ids), _chunk):
                 _e = min(_s + _chunk, len(req_ids))
                 chunk_t = torch.tensor([req_ids[_s:_e]], dtype=torch.long, device=dev0)
@@ -410,7 +499,7 @@ class JevPrefixTree:
             torch.cuda.synchronize(dev0)
 
         req_end_pos = schema_node.end_pos + len(req_ids)
-        snap = self.snapshot_kv(req_end_pos)
+        snap = self.snapshot_kv(req_end_pos, level="request")
 
         # LRU eviction if cache exceeds 16 entries
         if len(self.request_nodes) >= 16:
@@ -531,7 +620,7 @@ class JevEngine:
             B = len(cur_fields)
 
             # Broadcast shared request KV across B batch rows without duplicating prefix blocks
-            self.prefix_tree.restore_kv(req_snap, batch_size=B)
+            self.prefix_tree.restore_kv(req_snap, batch_size=B, req_id=req_node.key, level="field")
 
             # Field query tokens: \nField {i}: (all exactly 5 tokens!)
             field_query_ids = []
