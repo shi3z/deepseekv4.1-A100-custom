@@ -395,10 +395,17 @@ def main():
         default=None,
         help="CUDA device used exclusively for DSpark/MTP weights",
     )
+    ap.add_argument(
+        "--max-seqs",
+        type=int,
+        default=1,
+        help="concurrent sequence slots (1 = serialized single request; >1 = batched decode)",
+    )
     a = ap.parse_args()
     kw = dict(devices=[int(d) for d in a.devices.split(",")], max_seq_len=a.max_seq_len, budgets=parse_budgets(a.budgets),
               use_graphs=not a.no_graphs, offload_experts=a.offload_experts, hot_experts=a.hot_experts, route_stats=a.hot_stats,
-              ep=a.ep, ep_shards=[int(v) for v in a.ep_shards.split(",")] if a.ep_shards else None, mtp=a.mtp, mtp_device=a.mtp_device)
+              ep=a.ep, ep_shards=[int(v) for v in a.ep_shards.split(",")] if a.ep_shards else None, mtp=a.mtp, mtp_device=a.mtp_device,
+              max_seqs=a.max_seqs)
     ENGINE = Engine(a.ckpt, **kw) if a.ckpt else Engine(**kw)
     srv = ThreadingHTTPServer((a.host, a.port), Handler)
     print(f"serving OpenAI-compatible API on http://{a.host}:{a.port}/v1 (model '{ENGINE.model_name}')", flush=True)

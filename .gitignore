@@ -16,6 +16,14 @@ results/sweep*.log
 !results/README.md
 *.gguf
 *.safetensors
+*.bak*
+*.before*
+*.log
+results/.*
+results/*.pt
+results/*-2026*
+patch.sh
+compression/
 # scratch
 /tmp/
 dsv41/cpu/.*.so

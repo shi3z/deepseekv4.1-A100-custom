@@ -273,7 +273,7 @@ def _kv_write_kernel(X, W, COS, SIN, POS, SEQ, CACHE, eps, WIN: tl.constexpr, D:
     y = x * (1.0 / tl.sqrt(var + eps)) * tl.load(W + offs).to(tl.float32)
     y = y.to(tl.bfloat16).to(tl.float32)
     # rope on the last RD elements, interleaved (real, imag) pairs
-    pos = tl.load(POS + row)
+    pos = tl.maximum(tl.load(POS + row), 0)
     re, im = tl.split(tl.reshape(y, (D // 2, 2)))
     j = tl.arange(0, D // 2)
     rj = j - (D - RD) // 2
@@ -388,7 +388,7 @@ def _sattn2_combine_kernel(PM, PL, PACC, SINK, COS, SIN, POS, O, H: tl.constexpr
     den = tl.sum(l * w, axis=0) + tl.exp(tl.load(SINK + h) - mx)
     o = (num / den).to(tl.bfloat16).to(tl.float32)
     # inverse rope on the last RD elements
-    pos = tl.load(POS + b)
+    pos = tl.maximum(tl.load(POS + b), 0)
     re, im = tl.split(tl.reshape(o, (D // 2, 2)))
     j = tl.arange(0, D // 2)
     rj = j - (D - RD) // 2

@@ -9,6 +9,7 @@ import os
 import sys
 import threading
 import time
+import queue
 from dataclasses import dataclass, field
 from typing import Iterator
 
@@ -30,6 +31,21 @@ class GenParams:
     seed: int | None = None
 
 
+class _BatchRequest:
+    def __init__(self, prompt_ids: list[int], params: GenParams, max_new: int, gen: torch.Generator | None):
+        self.prompt_ids = prompt_ids
+        self.params = params
+        self.max_new = max_new
+        self.gen = gen
+        self.pos = 0
+        self.next_token = 0
+        self.out_tokens: list[int] = []
+        self.done_event = threading.Event()
+        self.result_text = ""
+        self.result_count = 0
+        self.error: Exception | None = None
+
+
 def sample_token(logits: torch.Tensor, temperature: float, top_p: float, gen: torch.Generator | None) -> int:
     if temperature <= 0:
         return int(logits.argmax(dim=-1).item())
@@ -46,7 +62,8 @@ def sample_token(logits: torch.Tensor, temperature: float, top_p: float, gen: to
 class Engine:
     def __init__(self, ckpt: str = CKPT, devices: list[int] | None = None, max_seq_len: int = 8192,
                  budgets: dict[int, float] | None = None, use_graphs: bool = True, thinking_mode: str = "chat",
-                 offload_experts=False, hot_experts: int = 0, route_stats: str = "", ep: bool = False, ep_shards: list[int] | None = None, mtp: int = 0, mtp_device: int | None = None):
+                 offload_experts=False, hot_experts: int = 0, route_stats: str = "", ep: bool = False, ep_shards: list[int] | None = None, mtp: int = 0, mtp_device: int | None = None,
+                 max_seqs: int = 1):
         from transformers import AutoTokenizer
 
         sys.path.insert(0, os.path.join(ckpt, "encoding"))
@@ -70,7 +87,16 @@ class Engine:
         self.mtp_device = mtp_device
         if self.mtp < 0 or self.mtp > 5:
             raise ValueError("--mtp must be 0..5")
-        self.model = load_model(ckpt, devices or list(range(torch.cuda.device_count())), max_seq_len=max_seq_len, max_batch=1 + self.mtp, max_seqs=1,
+        _env_seqs = os.environ.get("DSV41_MAX_SEQS")
+        self.max_seqs = int(_env_seqs) if _env_seqs else int(max_seqs)
+        if self.max_seqs > 1:
+            self.max_decode_slots = self.max_seqs - 1
+            max_batch = self.max_decode_slots * (1 + self.mtp)
+        else:
+            self.max_decode_slots = 1
+            max_batch = 1 + self.mtp
+        print(f"[engine-init] max_seqs={self.max_seqs} max_decode_slots={self.max_decode_slots} max_batch={max_batch}", flush=True)
+        self.model = load_model(ckpt, devices or list(range(torch.cuda.device_count())), max_seq_len=max_seq_len, max_batch=max_batch, max_seqs=self.max_seqs,
                                 budgets_gb=budgets, tokenizer=self.tok, offload_experts=offload_experts,
                                 hot_experts=hot_experts, route_stats=route_stats, ep=ep, ep_shards=ep_shards)
         if offload_experts:
@@ -138,6 +164,8 @@ class Engine:
         self.lock = threading.Lock()
         self.eos = self.tok.eos_token_id
         self.model_name = "deepseek-v4.1-flash"
+        if self.max_seqs > 1:
+            self._init_batch_scheduler()
 
     # ---------------------------------------------------------------- prompts
     def chat_prompt(self, messages: list[dict], thinking_mode: str | None = None) -> str:
@@ -3443,11 +3471,160 @@ class Engine:
 
     @torch.inference_mode()
     def generate_text(self, prompt_ids: list[int], p: GenParams) -> tuple[str, int]:
-        pieces, n = [], 0
-        for _, piece in self.generate(prompt_ids, p):
-            pieces.append(piece)
-            n += 1
-        return "".join(pieces), n
+        if self.max_seqs <= 1:
+            pieces, n = [], 0
+            for _, piece in self.generate(prompt_ids, p):
+                pieces.append(piece)
+                n += 1
+            return "".join(pieces), n
+
+        return self._generate_text_batched(prompt_ids, p)
+
+    def _init_batch_scheduler(self):
+        self._batch_queue: queue.Queue[_BatchRequest] = queue.Queue()
+        self._batch_stop_event = threading.Event()
+        # Decode slots are 1 .. max_seqs - 1 (slot 0 is reserved for prefill scratchpad)
+        self._free_decode_slots = list(range(1, self.max_seqs))
+        self._active_slots: dict[int, _BatchRequest] = {}
+        self._batch_thread = threading.Thread(target=self._batch_worker_loop, daemon=True)
+        self._batch_thread.start()
+        print(
+            f"[batched-engine] initialized with {self.max_decode_slots} concurrent decode slots "
+            f"(total max_seqs={self.max_seqs}, max_batch={self.rt.B})",
+            flush=True,
+        )
+
+    def _batch_worker_loop(self):
+        B = self.rt.B
+        while not self._batch_stop_event.is_set():
+            # 1. Prefill pending requests into available decode slots
+            while self._free_decode_slots and not self._batch_queue.empty():
+                try:
+                    req = self._batch_queue.get_nowait()
+                except queue.Empty:
+                    break
+                slot_id = self._free_decode_slots.pop(0)
+                try:
+                    with self.lock:
+                        # Prefill using slot 0 (fully compatible with prefix-cache / snapshots)
+                        logits, _reused = self._prefill_with_prefix_reuse(req.prompt_ids)
+                        first_tok = sample_token(logits[0], req.params.temperature, req.params.top_p, req.gen)
+                        # Copy per-sequence cache state from slot 0 to target decode slot
+                        self.rt.copy_seq(0, slot_id)
+                        req.pos = len(req.prompt_ids)
+                        req.next_token = first_tok
+                        if first_tok == self.eos:
+                            req.result_text = ""
+                            req.result_count = 0
+                            req.done_event.set()
+                            self._free_decode_slots.append(slot_id)
+                            print(f"[batched-engine] prompt immediately reached EOS for slot={slot_id}", flush=True)
+                        else:
+                            req.out_tokens.append(first_tok)
+                            self._active_slots[slot_id] = req
+                            print(f"[batched-engine] prefilled slot={slot_id} prompt_tokens={len(req.prompt_ids)}", flush=True)
+                except Exception as e:
+                    print(f"[batched-engine] prefill error on slot={slot_id}: {e}", flush=True)
+                    traceback.print_exc()
+                    req.error = e
+                    req.done_event.set()
+                    self._free_decode_slots.append(slot_id)
+
+            # 2. Decode active slots in batch
+            if not self._active_slots:
+                time.sleep(0.005)
+                continue
+
+            with self.lock:
+                active_ids = list(self._active_slots.keys())
+                n_active = len(active_ids)
+                toks, poss, seqs, pmaxs = [], [], [], []
+                for s_id in active_ids:
+                    req = self._active_slots[s_id]
+                    toks.append(req.next_token)
+                    poss.append(req.pos)
+                    seqs.append(s_id)
+                    pmaxs.append(req.pos)
+
+                # Padding to fixed batch size B with slot 0 (dummy rows)
+                for _ in range(B - n_active):
+                    toks.append(0)
+                    poss.append(0)
+                    seqs.append(0)
+                    pmaxs.append(0)
+
+                try:
+                    logits = self.rt.step(toks, poss, seq=seqs, pmax=pmaxs)
+                except Exception as exc:
+                    print(f"[batched-engine] decode step error: {exc}", flush=True)
+                    traceback.print_exc()
+                    for s_id in active_ids:
+                        req = self._active_slots[s_id]
+                        req.error = exc
+                        req.done_event.set()
+                        self._free_decode_slots.append(s_id)
+                    self._active_slots.clear()
+                    continue
+
+                finished = []
+                for idx, s_id in enumerate(active_ids):
+                    req = self._active_slots[s_id]
+                    slot_logits = logits[idx]
+                    t = sample_token(slot_logits, req.params.temperature, req.params.top_p, req.gen)
+                    req.pos += 1
+
+                    is_eos = (t == self.eos)
+                    if not is_eos:
+                        req.out_tokens.append(t)
+                    is_max = (len(req.out_tokens) >= req.max_new)
+
+                    # Stop condition check
+                    is_stopped = False
+                    if req.params.stop and not is_eos:
+                        text = self.tok.decode(req.out_tokens)
+                        for s in req.params.stop:
+                            if s in text:
+                                cut = text.find(s)
+                                req.result_text = text[:cut]
+                                req.result_count = len(req.out_tokens)
+                                is_stopped = True
+                                break
+
+                    if is_eos or is_max or is_stopped:
+                        if not is_stopped:
+                            req.result_text = self.tok.decode(req.out_tokens)
+                            req.result_count = len(req.out_tokens)
+                        req.done_event.set()
+                        finished.append(s_id)
+                        print(
+                            f"[batched-engine] finished slot={s_id} tokens={req.result_count} "
+                            f"reason={'eos' if is_eos else ('max' if is_max else 'stop')}",
+                            flush=True,
+                        )
+                    else:
+                        req.next_token = t
+
+                for s_id in finished:
+                    del self._active_slots[s_id]
+                    self._free_decode_slots.append(s_id)
+
+    @torch.inference_mode()
+    def _generate_text_batched(self, prompt_ids: list[int], p: GenParams) -> tuple[str, int]:
+        _mtp_long_limit = int(os.environ.get("DSV41_MTP_LONG_PROMPT_LIMIT", "65536"))
+        max_new = min(p.max_new_tokens, self.max_seq_len - len(prompt_ids) - 1)
+        if len(prompt_ids) > _mtp_long_limit:
+            max_new = min(max_new, int(os.environ.get("DSV41_LONG_PROMPT_MAX_NEW", "2048")))
+        gen = None
+        if p.seed is not None:
+            gen = torch.Generator(device=self.model.blocks[-1].device)
+            gen.manual_seed(p.seed)
+
+        req = _BatchRequest(prompt_ids, p, max_new, gen)
+        self._batch_queue.put(req)
+        req.done_event.wait()
+        if req.error:
+            raise req.error
+        return req.result_text, req.result_count
 
 
 def parse_budgets(spec: str) -> dict[int, float] | None:

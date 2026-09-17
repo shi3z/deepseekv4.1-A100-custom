@@ -135,7 +135,7 @@ class EPRuntime(DecodeRuntime):
         # Do not make every graph buffer 1M tokens merely because the
         # logical KV limit is 1M; that exhausts graph-capture workspace.
         # Long prefill builds candidates dynamically in the model path.
-        _cand_tokens = int(os.environ.get("DSV41_EP_CAND_TOKENS", "131072"))
+        _cand_tokens = int(os.environ.get("DSV41_EP_CAND_TOKENS", str(model.args.max_seq_len)))
         _cand_tokens = min(max(_cand_tokens, 1024), model.args.max_seq_len)
         n_cand = -((_cand_tokens + 1) // -16) * 16
         self.cand_buf = {d: torch.zeros(B, 1, n_cand, dtype=torch.bool, device=d) for d in self.devs}
@@ -512,40 +512,42 @@ class EPRuntime(DecodeRuntime):
             if attn.indexer is not None:
                 attn.indexer.cos, attn.indexer.sin = graph_cos, graph_sin
             self._graph_rope_tables.append((graph_cos, graph_sin))
-        self.dry = True
-        for d in self.devs:
-            with torch.cuda.stream(self.streams[d]):
-                self.token_graph(d)
-            torch.cuda.synchronize(d)
-        self.dry = False
-        self.m.args.max_seq_len = _logical_max_seq
-        for d in self.devs:
-            self.seqno[d].fill_(1)
-            self.flag_route[d].zero_()
-            self.flag_part[d].zero_()
-            self.flag_hop[d].zero_()
-            self.flag_relay[d].zero_()
-        for _ in range(2):
-            self._eager_token()
+        try:
+            self.dry = True
             for d in self.devs:
-                torch.cuda.synchronize(d)
-        if not self.use_graphs:
-            return
-        for d in self.devs:
-            with torch.cuda.device(d):
-                s = self.streams[d]
-                torch.cuda.synchronize(d)
-                g = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(g, stream=s, capture_error_mode="thread_local"):
+                with torch.cuda.stream(self.streams[d]):
                     self.token_graph(d)
-                self.graphs[d] = g
-        for d in self.devs:
-            torch.cuda.synchronize(d)
-        self._graph_cache_signature = self._cache_signature()
-        for attn, old_cos, old_sin in _rope_restore:
-            attn.cos, attn.sin = old_cos, old_sin
-            if attn.indexer is not None:
-                attn.indexer.cos, attn.indexer.sin = old_cos, old_sin
+                torch.cuda.synchronize(d)
+            self.dry = False
+            for d in self.devs:
+                self.seqno[d].fill_(1)
+                self.flag_route[d].zero_()
+                self.flag_part[d].zero_()
+                self.flag_hop[d].zero_()
+                self.flag_relay[d].zero_()
+            for _ in range(2):
+                self._eager_token()
+                for d in self.devs:
+                    torch.cuda.synchronize(d)
+            if self.use_graphs:
+                for d in self.devs:
+                    with torch.cuda.device(d):
+                        s = self.streams[d]
+                        torch.cuda.synchronize(d)
+                        g = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(g, stream=s, capture_error_mode="thread_local"):
+                            self.token_graph(d)
+                        self.graphs[d] = g
+                for d in self.devs:
+                    torch.cuda.synchronize(d)
+                self._graph_cache_signature = self._cache_signature()
+        finally:
+            self.dry = False
+            for attn, old_cos, old_sin in _rope_restore:
+                attn.cos, attn.sin = old_cos, old_sin
+                if attn.indexer is not None:
+                    attn.indexer.cos, attn.indexer.sin = old_cos, old_sin
+            self.m.args.max_seq_len = _logical_max_seq
 
     def _eager_token(self):
         """One token without graphs, the devices interleaved per layer on their own streams."""
