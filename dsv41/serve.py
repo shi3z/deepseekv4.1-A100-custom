@@ -31,12 +31,26 @@ def _params(body: dict) -> GenParams:
     stop = body.get("stop") or []
     if isinstance(stop, str):
         stop = [stop]
+    default_rep_pen = float(os.environ.get("DSV41_REPETITION_PENALTY", "1.08"))
+    default_pres_pen = float(os.environ.get("DSV41_PRESENCE_PENALTY", "0.0"))
+    default_freq_pen = float(os.environ.get("DSV41_FREQUENCY_PENALTY", "0.05"))
+    default_window = int(os.environ.get("DSV41_PENALTY_WINDOW", "256"))
+
+    rep_pen = float(body.get("repetition_penalty") if body.get("repetition_penalty") is not None else default_rep_pen)
+    pres_pen = float(body.get("presence_penalty") if body.get("presence_penalty") is not None else default_pres_pen)
+    freq_pen = float(body.get("frequency_penalty") if body.get("frequency_penalty") is not None else default_freq_pen)
+    window = int(body.get("penalty_window") if body.get("penalty_window") is not None else default_window)
+
     return GenParams(
         max_new_tokens=int(body.get("max_tokens") or body.get("max_completion_tokens") or 1024),
         temperature=float(body.get("temperature", 0.6)),
         top_p=float(body.get("top_p", 0.95)),
         stop=list(stop),
         seed=body.get("seed"),
+        repetition_penalty=rep_pen,
+        presence_penalty=pres_pen,
+        frequency_penalty=freq_pen,
+        penalty_window=window,
     )
 
 

@@ -30,6 +30,57 @@ class GenParams:
     top_p: float = 0.95
     stop: list[str] = field(default_factory=list)
     seed: int | None = None
+    repetition_penalty: float = 1.0
+    presence_penalty: float = 0.0
+    frequency_penalty: float = 0.0
+    penalty_window: int = 256
+
+
+def apply_penalties(
+    logits: torch.Tensor,
+    tokens: list[int],
+    repetition_penalty: float = 1.0,
+    presence_penalty: float = 0.0,
+    frequency_penalty: float = 0.0,
+    window: int = 256,
+) -> torch.Tensor:
+    """Apply repetition, presence, and frequency penalties to 1D logits."""
+    if not tokens:
+        return logits
+    if (
+        (repetition_penalty == 1.0 or repetition_penalty <= 0)
+        and presence_penalty == 0.0
+        and frequency_penalty == 0.0
+    ):
+        return logits
+
+    context_tokens = tokens[-window:] if window > 0 and len(tokens) > window else tokens
+    if not context_tokens:
+        return logits
+
+    penalized = logits.clone()
+
+    if repetition_penalty != 1.0 and repetition_penalty > 0:
+        unique_toks = list(set(context_tokens))
+        tok_idx = torch.tensor(unique_toks, dtype=torch.long, device=logits.device)
+        vals = penalized[tok_idx]
+        penalized_vals = torch.where(
+            vals > 0,
+            vals / float(repetition_penalty),
+            vals * float(repetition_penalty),
+        )
+        penalized[tok_idx] = penalized_vals
+
+    if presence_penalty != 0.0 or frequency_penalty != 0.0:
+        counts = collections.Counter(context_tokens)
+        toks = list(counts.keys())
+        cnts = [counts[t] for t in toks]
+        tok_idx = torch.tensor(toks, dtype=torch.long, device=logits.device)
+        cnt_vals = torch.tensor(cnts, dtype=logits.dtype, device=logits.device)
+        penalties = float(presence_penalty) + float(frequency_penalty) * cnt_vals
+        penalized[tok_idx] -= penalties
+
+    return penalized
 
 
 class _BatchRequest:
@@ -3551,7 +3602,21 @@ class Engine:
                     st["tok_s"] = 0.0
                     self.slot_states[0] = st
                 for step in range(max_new):
-                    t = sample_token(logits[0], p.temperature, p.top_p, gen)
+                    step_logits = logits[0]
+                    if out and (
+                        p.repetition_penalty != 1.0
+                        or p.presence_penalty != 0.0
+                        or p.frequency_penalty != 0.0
+                    ):
+                        step_logits = apply_penalties(
+                            step_logits,
+                            out,
+                            repetition_penalty=p.repetition_penalty,
+                            presence_penalty=p.presence_penalty,
+                            frequency_penalty=p.frequency_penalty,
+                            window=p.penalty_window,
+                        )
+                    t = sample_token(step_logits, p.temperature, p.top_p, gen)
                     if t == self.eos:
                         print(
                          f"[generate] STOP=eos step={step} pos={pos} "
@@ -4286,31 +4351,35 @@ class Engine:
                         self._active_slots.clear()
                         continue
 
-                # Batch sampling optimization:
-                # When all slots are greedy (temperature <= 0), execute a single batched argmax
-                # and transfer all tokens to CPU in one round trip.
-                all_greedy = all(self._active_slots[s].params.temperature <= 0 for s in active_ids)
-                if all_greedy:
-                    sampled_tokens = logits[:n_active].argmax(dim=-1).tolist()
-                else:
-                    sampled_tokens = []
-                    greedy_cached = None
-                    for idx, s_id in enumerate(active_ids):
-                        req = self._active_slots[s_id]
+                # Sample tokens per slot with optional repetition/presence/frequency penalties
+                sampled_tokens = []
+                for idx, s_id in enumerate(active_ids):
+                    req = self._active_slots[s_id]
+                    slot_logits = logits[idx]
+                    if req.out_tokens and (
+                        req.params.repetition_penalty != 1.0
+                        or req.params.presence_penalty != 0.0
+                        or req.params.frequency_penalty != 0.0
+                    ):
+                        slot_logits = apply_penalties(
+                            slot_logits,
+                            req.out_tokens,
+                            repetition_penalty=req.params.repetition_penalty,
+                            presence_penalty=req.params.presence_penalty,
+                            frequency_penalty=req.params.frequency_penalty,
+                            window=req.params.penalty_window,
+                        )
+                    try:
+                        if req.params.temperature <= 0:
+                            sampled_tokens.append(int(slot_logits.argmax(dim=-1).item()))
+                        else:
+                            sampled_tokens.append(sample_token(slot_logits, req.params.temperature, req.params.top_p, req.gen))
+                    except Exception as exc:
+                        print(f"[batched-engine] sampling fallback on slot={s_id}: {exc}", flush=True)
                         try:
-                            if req.params.temperature <= 0:
-                                if greedy_cached is None:
-                                    greedy_cached = logits[:n_active].argmax(dim=-1).tolist()
-                                sampled_tokens.append(greedy_cached[idx])
-                            else:
-                                slot_logits = logits[idx]
-                                sampled_tokens.append(sample_token(slot_logits, req.params.temperature, req.params.top_p, req.gen))
-                        except Exception as exc:
-                            print(f"[batched-engine] sampling fallback on slot={s_id}: {exc}", flush=True)
-                            try:
-                                sampled_tokens.append(int(logits[idx].argmax(dim=-1).item()))
-                            except Exception:
-                                sampled_tokens.append(self.eos)
+                            sampled_tokens.append(int(slot_logits.argmax(dim=-1).item()))
+                        except Exception:
+                            sampled_tokens.append(self.eos)
 
                 finished = []
                 now = time.perf_counter()
