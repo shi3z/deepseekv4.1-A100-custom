@@ -78,13 +78,16 @@ The server provides `/health`, `/v1/models`, `/v1/chat/completions`, `/v1/comple
 
 ### Real-Time Monitoring Web Dashboard (`/dashboard`)
 
+![Live Inference & Prefill Monitor Dashboard](assets/dashboard.jpg)
+
 Navigate to `http://127.0.0.1:8000/dashboard` in any web browser for live server telemetry:
-- **Throughput (tok/s) 24h Time-Series**: Real-time interactive chart showing generation & extraction throughput with 24-hour rolling average, min, and max benchmarks.
-- **GPU VRAM & Utilization (GPUs 0–4)**: Live VRAM allocation (GiB / 80 GiB) and core utilization (%) per active device.
-- **System Resources**: Host RAM usage (GiB) and CPU load (%).
-- **Clients & Disconnections**: Concurrent in-flight client connections, total completed requests, and client disconnects (`BrokenPipeError` telemetry).
-- **Prefix & Jev Caches**: Track active persistent prefix cache blocks, RAM usage, and Jev Level 2/3 cached nodes.
-- **100% Offline**: Self-contained HTML5 Canvas rendering with zero external scripts or CDN dependencies.
+- **Concurrent Context Streams & Typewriter Output**: Real-time generation streaming across parallel context slots with live token rate and typewriter animation.
+- **Live Prefill & Chunk Monitor**: Real-time tracking of chunk progress, token processed count, compute rate, and completion ETA during large-context prefill.
+- **Throughput Benchmarks**: Rolling 10-minute Peak (Max) and Min decode speeds alongside 24h rolling average time-series.
+- **Dynamic KV Cache & Capacity**: Live allocation breakdown of compressed KV rows and index keys across GPU devices.
+- **GPU VRAM & Utilization (GPUs 0–3)**: Live per-device VRAM allocation (GiB / 80 GiB) and core utilization (%).
+- **Host RAM Prefix Cache**: Track persistent prefix cache entries and host RAM/tmpfs memory footprint.
+- **100% Self-Contained**: Offline HTML5 Canvas rendering with zero external scripts or CDN dependencies.
 
 ## Cache and replay
 
