@@ -12,6 +12,7 @@ class SharedAttn:
         self.index_owner = 2
         self.topk_idxs = torch.ones(1, 4)
         self.candidates = torch.ones(1, 4)
+        self.cache_max_rows = {2: 128}
 
 class NgramHashState:
     def __init__(self): self.cache = torch.arange(8).reshape(1, 8)
@@ -56,6 +57,45 @@ class PrefixStateTests(unittest.TestCase):
         # Should succeed without RuntimeError: Inplace update to inference tensor outside InferenceMode
         e._restore_prefix_state(snap)
         self.assertTrue(torch.equal(e.model.shared.compress_kv[(2, 'cpu')][:, :4], torch.ones(1, 4, 2)))
+
+    def test_multi_mirror_dedup_and_broadcast(self):
+        e = Engine.__new__(Engine)
+        shared = SharedAttn()
+        shared.compress_kv[(2, 'dev2')] = torch.ones(1, 4, 2)
+        shared.index_k[(2, 'dev2')] = torch.ones(1, 4, 2) * 2
+        e.model = SimpleNamespace(shared=shared, engram_hash=NgramHashState(), args=SimpleNamespace(compress_ratios={2: 1}))
+
+        slots = e._prefix_cache_slots()
+        ckv_slots = [s for s in slots if s[0] == 'dict' and s[1] is shared.compress_kv]
+        idx_slots = [s for s in slots if s[0] == 'dict' and s[1] is shared.index_k]
+        self.assertEqual(len(ckv_slots), 1)
+        self.assertEqual(len(idx_slots), 1)
+
+        snap, _ = e._snapshot_prefix_state()
+        shared.compress_kv[(2, 'cpu')].zero_()
+        shared.compress_kv[(2, 'dev2')].zero_()
+        shared.index_k[(2, 'cpu')].zero_()
+        shared.index_k[(2, 'dev2')].zero_()
+
+        e._restore_prefix_state(snap)
+        self.assertTrue(torch.equal(shared.compress_kv[(2, 'cpu')], torch.ones(1, 4, 2)))
+        self.assertTrue(torch.equal(shared.compress_kv[(2, 'dev2')], torch.ones(1, 4, 2)))
+        self.assertTrue(torch.equal(shared.index_k[(2, 'cpu')], torch.ones(1, 4, 2) * 2))
+        self.assertTrue(torch.equal(shared.index_k[(2, 'dev2')], torch.ones(1, 4, 2) * 2))
+
+    def test_ngram_hash_and_swa_slicing(self):
+        e = Engine.__new__(Engine)
+        shared = SharedAttn()
+        engram = NgramHashState()
+        engram.cache = torch.arange(100).reshape(1, 100)
+        e.model = SimpleNamespace(shared=shared, engram_hash=engram, args=SimpleNamespace(compress_ratios={2: 1}))
+        ring = torch.ones(1, 200, 4)
+        e.ds = SimpleNamespace(blocks=[SimpleNamespace(window_kv_cache=ring)])
+
+        snap, total = e._snapshot_prefix_state(used_tokens=20)
+        snap_map = {repr(key): src for kind, holder, key, src in snap}
+        self.assertEqual(snap_map["'cache'"].shape, (1, 20))
+        self.assertEqual(snap_map["'window_kv_cache'"].shape, (1, 20, 4))
 
     def test_find_best_gpu_slot(self):
         e = Engine.__new__(Engine)

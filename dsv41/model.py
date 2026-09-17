@@ -2325,6 +2325,7 @@ class Transformer:
         """input_ids [b, s] (long) -> logits for the last position [b, vocab] (fp32)."""
         dev0 = self.blocks[0].device
         input_ids = input_ids.to(dev0)
+        B, S = input_ids.shape
         hashes = self.engram_hash(input_ids, start_pos) if self.engram_hash is not None else None
         h = F.embedding(input_ids, self.embed)
         h = h.unsqueeze(2).repeat(1, 1, self.hc, 1)
@@ -2332,13 +2333,71 @@ class Transformer:
         pre_mix[:, :, 0] = 1.0
         targets = set(getattr(self, "collect_main_hidden", ()))
         main_hiddens = []
+
+        enc_last_id = int(os.environ.get("DSV41_CED_ENCODER_LAST_LAYER", "20"))
+        win_size = int(self.args.cfg.get("window_size", 128))
+        use_ced = os.environ.get("DSV41_CED", "1") != "0" and S > win_size
+
+        if use_ced:
+            # -------------------------------------------------------------
+            # CED (Causal Encoder-Decoder / Decoder SWA Bounded Replay)
+            # Stage 1: Causal Encoder pass (layers 0 .. enc_last_id) across all tokens.
+            # Populates global compress_kv, index_k, and candidates for the whole prompt.
+            # -------------------------------------------------------------
+            enc_blocks = [blk for blk in self.blocks if blk.layer_id <= enc_last_id]
+            dec_blocks = [blk for blk in self.blocks if blk.layer_id > enc_last_id]
+
+            for blk in enc_blocks:
+                t = time.perf_counter()
+                if h.device != blk.device:
+                    h = h.to(blk.device, non_blocking=True)
+                    pre_mix = pre_mix.to(blk.device, non_blocking=True)
+                t = _tick("transfer", t)
+                if blk.engram is not None and hashes is not None:
+                    h = blk.engram(h, hashes[:, :, blk.engram.layer_hash_index, :])
+                    _tick("engram", t)
+                if blk.layer_id in targets:
+                    main_hiddens.append(h.mean(dim=2))
+                h, pre_mix = blk(h, start_pos, pre_mix)
+
+            # Stage 2: Decoder pass (layers enc_last_id + 1 .. 39) on ONLY bounded tail window.
+            tail_len = min(S, max(win_size, int(os.environ.get("DSV41_CED_TAIL_WINDOW", str(win_size)))))
+            h_dec = h[:, -tail_len:]
+            pre_mix_dec = pre_mix[:, -tail_len:]
+            start_pos_dec = start_pos + S - tail_len
+            del h, pre_mix
+
+            for blk in dec_blocks:
+                t = time.perf_counter()
+                if h_dec.device != blk.device:
+                    h_dec = h_dec.to(blk.device, non_blocking=True)
+                    pre_mix_dec = pre_mix_dec.to(blk.device, non_blocking=True)
+                t = _tick("transfer", t)
+                if blk.engram is not None and hashes is not None:
+                    chunk_hashes = hashes[:, -tail_len:, blk.engram.layer_hash_index, :]
+                    h_dec = blk.engram(h_dec, chunk_hashes)
+                    _tick("engram", t)
+                if blk.layer_id in targets:
+                    main_hiddens.append(h_dec.mean(dim=2))
+                h_dec, pre_mix_dec = blk(h_dec, start_pos_dec, pre_mix_dec)
+
+            if main_hiddens:
+                keep = int(self.args.cfg.get("window_size", 0))
+                if keep > 0:
+                    main_hiddens = [m[:, -keep:] for m in main_hiddens]
+                self.main_hidden = torch.cat([m.to(main_hiddens[-1].device) for m in main_hiddens], dim=-1)
+            h_last = self.blocks[-1].hc_pre(h_dec, pre_mix_dec)[:, -1]
+            h_last = rmsnorm(h_last, self.norm_w, self.args.norm_eps)
+            return F.linear(h_last, self.head).float()
+
+        # Legacy monolithic sequential path (used when S <= window_size or DSV41_CED=0)
         for blk in self.blocks:
             t = time.perf_counter()
             if h.device != blk.device:
                 h = h.to(blk.device, non_blocking=True)
                 pre_mix = pre_mix.to(blk.device, non_blocking=True)
             t = _tick("transfer", t)
-            if blk.engram is not None:
+            if blk.engram is not None and hashes is not None:
                 h = blk.engram(h, hashes[:, :, blk.engram.layer_hash_index, :])
                 _tick("engram", t)
             if blk.layer_id in targets:  # DSpark reads the attention input of its target layers
@@ -2346,9 +2405,6 @@ class Transformer:
             h, pre_mix = blk(h, start_pos, pre_mix)
         if main_hiddens:
             # MTP/DSpark only consumes the recent main attention window.
-            # Keeping every target-layer hidden row for a 100K+ prompt
-            # creates several GiB of avoidable GPU state and can surface
-            # as an asynchronous illegal-memory error on the next CUDA op.
             keep = int(self.args.cfg.get("window_size", 0))
             if keep > 0 and input_ids.shape[1] > keep:
                 main_hiddens = [m[:, -keep:] for m in main_hiddens]
@@ -2369,6 +2425,9 @@ class Transformer:
 
         Divides prompt into M chunks and executes a pipelined FIFO schedule across K stages.
         Each stage runs on its dedicated CUDA stream with CUDA event synchronization.
+        With CED (Causal Encoder-Decoder), intermediate chunks (m < M - 1) only execute
+        Encoder layers (0 .. 20). Decoder layers (21 .. 39) are executed exclusively
+        for the final chunk, reducing long-context prefill compute by nearly 50%.
         """
         stages = self._get_stages()
         K = len(stages)
@@ -2381,7 +2440,22 @@ class Transformer:
             self._stage_streams = [torch.cuda.Stream(device=s["device"]) for s in stages]
 
         chunk_size = max(128, int(chunk_size))
-        M = (S + chunk_size - 1) // chunk_size
+        chunk_bounds = []
+        pos = 0
+        while pos < S:
+            rem = S - pos
+            if rem <= chunk_size:
+                chunk_bounds.append((pos, S))
+                break
+            elif rem < chunk_size + 128:
+                mid = pos + rem // 2
+                chunk_bounds.append((pos, mid))
+                chunk_bounds.append((mid, S))
+                break
+            else:
+                chunk_bounds.append((pos, pos + chunk_size))
+                pos += chunk_size
+        M = len(chunk_bounds)
 
         # Pre-ensure capacity for all KV and index owners upfront so no reallocations happen mid-pipeline
         for owner in self.shared.cache_max_rows:
@@ -2414,21 +2488,41 @@ class Transformer:
         last_progress_time = t_pipe_start
         last_progress_tokens = 0
 
+        enc_last_id = int(os.environ.get("DSV41_CED_ENCODER_LAST_LAYER", "20"))
+        use_ced = os.environ.get("DSV41_CED", "1") != "0" and M > 1
+
         for t in range(T):
             for k in range(K - 1, -1, -1):
                 m = t - k
                 if not (0 <= m < M):
                     continue
 
-                c0 = m * chunk_size
-                c1 = min(c0 + chunk_size, S)
+                c0, c1 = chunk_bounds[m]
                 p_m = start_pos + c0
                 stage = stages[k]
                 dev_k = stage["device"]
                 stream_k = self._stage_streams[k]
                 stage_blocks = stage["blocks"]
 
+                # CED filtering: intermediate chunks only execute encoder layers (<= enc_last_id)
+                if use_ced and m < M - 1:
+                    active_blocks = [blk for blk in stage_blocks if blk.layer_id <= enc_last_id]
+                else:
+                    active_blocks = stage_blocks
+
+                next_stage_has_blocks = (
+                    k < K - 1
+                    and (
+                        not (use_ced and m < M - 1)
+                        or any(blk.layer_id <= enc_last_id for blk in stages[k + 1]["blocks"])
+                    )
+                )
+
                 with torch.cuda.device(dev_k), torch.cuda.stream(stream_k):
+                    if not active_blocks:
+                        ev_stage_done[k][m].record(stream_k)
+                        continue
+
                     if k == 0:
                         chunk_ids = input_ids[:, c0:c1].to(dev_k, non_blocking=True)
                         h = F.embedding(chunk_ids, self.embed)
@@ -2448,7 +2542,7 @@ class Transformer:
 
                     chunk_hashes = hashes[:, c0:c1] if hashes is not None else None
 
-                    for blk in stage_blocks:
+                    for blk in active_blocks:
                         if blk.engram is not None and chunk_hashes is not None:
                             blk_hash = chunk_hashes[:, :, blk.engram.layer_hash_index, :]
                             if blk_hash.device != dev_k:
@@ -2458,7 +2552,7 @@ class Transformer:
                             chunk_main_hiddens[blk.layer_id].append(h.mean(dim=2))
                         h, pre_mix = blk(h, p_m, pre_mix)
 
-                    if k < K - 1:
+                    if next_stage_has_blocks:
                         chunk_activations[k][m] = (h, pre_mix)
                     else:
                         if m == M - 1:
@@ -2485,8 +2579,9 @@ class Transformer:
                             f"{(torch.cuda.mem_get_info(s['device'])[1] - torch.cuda.mem_get_info(s['device'])[0])/2**30:.1f}"
                             for s in stages
                         )
+                        ced_tag = " [CED active]" if use_ced else ""
                         print(
-                            f"[1M-prefill] chunk {m + 1:3d}/{M} ({cur_tokens:8,d}/{S:,} tok, {cur_tokens/S*100:4.1f}%) | "
+                            f"[1M-prefill]{ced_tag} chunk {m + 1:3d}/{M} ({cur_tokens:8,d}/{S:,} tok, {cur_tokens/S*100:4.1f}%) | "
                             f"time: {dt_total:6.1f}s | "
                             f"speed: {inst_spd:5.1f} tok/s (avg: {avg_spd:5.1f} tok/s) | "
                             f"VRAM used: [{mem_info}] GiB",

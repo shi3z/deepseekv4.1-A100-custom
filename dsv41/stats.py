@@ -65,10 +65,14 @@ class StatsTracker:
         self.latest_prefill_effective_tok_s = 0.0
         self.latest_prefill_raw_tok_s = 0.0
         self.latest_prefill_mode = "idle"
+        self.latest_prefill_type = "idle"  # "cold", "gpu_hit", "host_replay"
         self.latest_prefill_hit_rate = 0.0
         self.latest_prefill_total_tokens = 0
         self.latest_prefill_reused_tokens = 0
         self.latest_prefill_new_tokens = 0
+        self.latest_prefill_lcp = 0
+        self.latest_prefill_base_tokens = 0
+        self.latest_prefill_suffix_tokens = 0
         self.latest_prefill_duration_s = 0.0
         self.latest_prefill_timestamp = 0.0
 
@@ -244,17 +248,35 @@ class StatsTracker:
             raw_s = stats.get("new_tok_s", 0.0)
             ts = stats.get("timestamp", time.time())
 
+            ptype = stats.get("prefill_type")
+            if not ptype:
+                if mode in ("gpu_slot_hit", "GPU_HIT") or "gpu" in str(mode).lower():
+                    ptype = "gpu_hit"
+                elif reused > 0 or mode in ("LCP-HIT", "REPLAY"):
+                    ptype = "host_replay"
+                else:
+                    ptype = "cold"
+
+            lcp_val = stats.get("lcp", reused)
+            base_val = stats.get("base_tokens", reused)
+            suffix_val = stats.get("suffix_tokens", new_tokens)
+
             self.latest_prefill_effective_tok_s = round(eff_s, 1)
             self.latest_prefill_raw_tok_s = round(raw_s, 1)
             self.latest_prefill_mode = mode
+            self.latest_prefill_type = ptype
             self.latest_prefill_hit_rate = hit_rate
             self.latest_prefill_total_tokens = total
             self.latest_prefill_reused_tokens = reused
             self.latest_prefill_new_tokens = new_tokens
+            self.latest_prefill_lcp = lcp_val
+            self.latest_prefill_base_tokens = base_val
+            self.latest_prefill_suffix_tokens = suffix_val
             self.latest_prefill_duration_s = round(dt, 3)
             self.latest_prefill_timestamp = ts
 
-            msg = f"Prefill [{mode}]: reused {reused:,} / {total:,} tokens ({hit_rate}%) in {dt:.2f}s ({eff_s:,.0f} eff tok/s, {raw_s:,.0f} raw tok/s)"
+            type_label = "GPU Hit" if ptype == "gpu_hit" else ("Host Replay" if ptype == "host_replay" else "Cold")
+            msg = f"Prefill [{mode} | {type_label}]: reused {reused:,} / {total:,} tokens (LCP {lcp_val:,}, {hit_rate}%) in {dt:.2f}s ({eff_s:,.0f} eff tok/s, {raw_s:,.0f} raw tok/s)"
             self.cache_events.append({
                 "t": time.time(),
                 "msg": msg,
@@ -430,7 +452,16 @@ class StatsTracker:
             if is_prefilling:
                 active_pf_slot = next((s for s in slots if s.get("status") == "prefilling"), None)
                 p_tokens = active_pf_slot.get("prompt_tokens", 0) if active_pf_slot else 0
-                tot_chunks = max(1, (p_tokens + 1023) // 1024)
+                reused_tokens_active = active_pf_slot.get("reused_tokens", 0) if active_pf_slot else 0
+                lcp_active = active_pf_slot.get("lcp", reused_tokens_active) if active_pf_slot else 0
+                is_replay = reused_tokens_active > 0
+                prefill_type = "gpu_hit" if is_replay else "cold"
+                if active_pf_slot and active_pf_slot.get("prefill_type"):
+                    prefill_type = active_pf_slot.get("prefill_type")
+
+                # If replaying a prefix, compute progress over the suffix tokens instead of entire prompt
+                target_tokens = max(1, p_tokens - reused_tokens_active) if is_replay else p_tokens
+                tot_chunks = max(1, (target_tokens + 1023) // 1024)
                 cur_chunks = 0
                 try:
                     import subprocess
@@ -442,29 +473,37 @@ class StatsTracker:
                     for line in reversed(lines):
                         if "compact=1" in line:
                             cur_chunks += 1
-                        elif "MISS" in line or "prefill-main" in line or "BUILD" in line or "LCP-HIT" in line:
+                        elif "MISS" in line or "prefill-main" in line or "BUILD" in line or "LCP-HIT" in line or "gpu-slot-cache" in line:
                             break
                 except Exception:
                     pass
 
                 pf_start = active_pf_slot.get("start_time", 0.0) if active_pf_slot else 0.0
                 pf_elapsed = max(0.0, time.perf_counter() - pf_start) if pf_start else 0.0
-                if cur_chunks == 0 and pf_elapsed > 0 and p_tokens > 0:
+                if cur_chunks == 0 and pf_elapsed > 0 and target_tokens > 0:
                     cur_chunks = min(tot_chunks, max(1, int(pf_elapsed * 265.0 / 1024.0)))
 
-                cur_tokens = min(p_tokens, cur_chunks * 1024) if p_tokens else 0
-                pct = round((cur_tokens / max(1, p_tokens)) * 100, 1) if p_tokens else 0.0
+                cur_tokens = min(target_tokens, cur_chunks * 1024) if target_tokens else 0
+                pct = round((cur_tokens / max(1, target_tokens)) * 100, 1) if target_tokens else 0.0
                 pf_speed = round(cur_tokens / max(pf_elapsed, 1.0), 1) if cur_tokens > 0 else 265.0
-                rem_tok = max(0, p_tokens - cur_tokens)
+                rem_tok = max(0, target_tokens - cur_tokens)
                 rem_sec = int(rem_tok / max(pf_speed, 50.0))
+
+                hit_rate = round((reused_tokens_active / max(1, p_tokens)) * 100, 1) if p_tokens else 0.0
 
                 prefill_progress = {
                     "active": True,
+                    "is_replay": is_replay,
+                    "prefill_type": prefill_type,
                     "slot_id": active_pf_slot.get("slot_id") if active_pf_slot else 1,
                     "current_chunk": cur_chunks,
                     "total_chunks": tot_chunks,
                     "current_tokens": cur_tokens,
                     "total_tokens": p_tokens,
+                    "reused_tokens": reused_tokens_active,
+                    "suffix_tokens": target_tokens,
+                    "lcp": lcp_active,
+                    "hit_rate_pct": hit_rate,
                     "percent": pct,
                     "speed_tok_s": pf_speed,
                     "elapsed_s": round(pf_elapsed, 1),
@@ -478,20 +517,28 @@ class StatsTracker:
             prefill_eff_s = self.latest_prefill_effective_tok_s
             prefill_raw_s = self.latest_prefill_raw_tok_s
             prefill_mode = self.latest_prefill_mode
+            prefill_type = self.latest_prefill_type
             prefill_hit = self.latest_prefill_hit_rate
             prefill_total = self.latest_prefill_total_tokens
             prefill_reused = self.latest_prefill_reused_tokens
             prefill_new = self.latest_prefill_new_tokens
+            prefill_lcp = self.latest_prefill_lcp
+            prefill_base = self.latest_prefill_base_tokens
+            prefill_suffix = self.latest_prefill_suffix_tokens
             prefill_dur = self.latest_prefill_duration_s
 
             if last_prefill and (not prefill_eff_s or prefill_eff_s == 0.0):
                 prefill_eff_s = round(last_prefill.get("effective_tok_s", 0.0), 1)
                 prefill_raw_s = round(last_prefill.get("new_tok_s", 0.0), 1)
                 prefill_mode = last_prefill.get("mode", "FULL")
+                prefill_type = last_prefill.get("prefill_type", "cold" if not last_prefill.get("reused_tokens") else "host_replay")
                 prefill_hit = last_prefill.get("hit_rate_pct", 0.0)
                 prefill_total = last_prefill.get("total_tokens", 0)
                 prefill_reused = last_prefill.get("reused_tokens", 0)
                 prefill_new = last_prefill.get("new_tokens", 0)
+                prefill_lcp = last_prefill.get("lcp", prefill_reused)
+                prefill_base = last_prefill.get("base_tokens", prefill_reused)
+                prefill_suffix = last_prefill.get("suffix_tokens", prefill_new)
                 prefill_dur = last_prefill.get("time_s", 0.0)
 
             return {
@@ -523,10 +570,14 @@ class StatsTracker:
                     "effective_tok_s": prefill_eff_s,
                     "raw_tok_s": prefill_raw_s,
                     "mode": prefill_mode,
+                    "prefill_type": prefill_type,
                     "hit_rate_pct": prefill_hit,
                     "total_tokens": prefill_total,
                     "reused_tokens": prefill_reused,
                     "new_tokens": prefill_new,
+                    "lcp": prefill_lcp,
+                    "base_tokens": prefill_base,
+                    "suffix_tokens": prefill_suffix,
                     "duration_s": prefill_dur,
                 },
                 "system": {
@@ -1068,14 +1119,23 @@ _DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
   </div>
 
   <div class="kpi-card">
-    <div class="kpi-title">Prefill Throughput (Separate)</div>
+    <div class="kpi-title" style="display:flex;justify-content:space-between;align-items:center;">
+      <span>Prefill Throughput</span>
+      <span id="val-prefill-type-badge" class="tag tag-info" style="font-size:10px;padding:2px 6px;text-transform:uppercase;">IDLE</span>
+    </div>
     <div class="kpi-value" style="color:var(--accent-purple)">
       <span id="val-prefill-eff-speed">--</span>
       <span style="font-size:13px;font-weight:400;color:var(--text-muted)">eff tok/s</span>
     </div>
-    <div class="kpi-sub">
-      <span>Raw: <b id="val-prefill-raw-speed" style="color:#fff">--</b> tok/s</span>
-      <span>Hit: <b id="val-prefill-hit" style="color:var(--accent-green)">--</b> (<span id="val-prefill-detail">0 tok</span>)</span>
+    <div class="kpi-sub" style="flex-direction:column;gap:3px;align-items:flex-start;">
+      <div style="display:flex;justify-content:space-between;width:100%">
+        <span>Raw: <b id="val-prefill-raw-speed" style="color:#fff">--</b> tok/s</span>
+        <span>Hit: <b id="val-prefill-hit" style="color:var(--accent-green)">--</b> (<span id="val-prefill-detail">0 tok</span>)</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;width:100%;font-size:11px;color:var(--text-muted)">
+        <span>LCP: <b id="val-prefill-lcp" style="color:var(--accent-cyan)">--</b></span>
+        <span>Replay: <b id="val-prefill-suffix" style="color:var(--accent-orange)">--</b></span>
+      </div>
     </div>
   </div>
 
@@ -1454,16 +1514,35 @@ async function updateMetrics() {
     const phaseEl = document.getElementById('engine-phase-badge');
     if (phase === 'prefill') {
       const pfProg = data.prefill_progress;
-      if (pfProg && pfProg.active && pfProg.total_chunks > 0) {
-        phaseEl.innerText = `PHASE: PREFILLING · ${pfProg.percent}% (${pfProg.current_chunk}/${pfProg.total_chunks} CHUNKS) · ETA ${pfProg.eta_str}`;
+      if (pfProg && pfProg.active) {
+        if (pfProg.is_replay) {
+          const pfxType = pfProg.prefill_type === 'gpu_hit' ? 'GPU HIT' : 'HOST REPLAY';
+          phaseEl.innerText = `PHASE: PREFIX REPLAY [${pfxType}] · ${pfProg.hit_rate_pct}% HIT (LCP ${formatNum(pfProg.lcp)}) · ${formatNum(pfProg.suffix_tokens)} SUFFIX TOK · ETA ${pfProg.eta_str}`;
+          phaseEl.style.color = 'var(--accent-green)';
+          phaseEl.style.borderColor = 'rgba(74, 222, 128, 0.4)';
+          phaseEl.style.background = 'rgba(74, 222, 128, 0.15)';
+        } else {
+          phaseEl.innerText = `PHASE: COLD PREFILL · ${pfProg.percent}% (${pfProg.current_chunk}/${pfProg.total_chunks} CHUNKS) · ETA ${pfProg.eta_str}`;
+          phaseEl.style.color = 'var(--accent-orange)';
+          phaseEl.style.borderColor = 'rgba(251, 146, 60, 0.4)';
+          phaseEl.style.background = 'rgba(251, 146, 60, 0.15)';
+        }
       } else {
         const activePrefillSlot = slots.find(s => s.status === 'prefilling');
+        const isReplay = activePrefillSlot && activePrefillSlot.reused_tokens > 0;
         const pTok = activePrefillSlot && activePrefillSlot.prompt_tokens ? (activePrefillSlot.prompt_tokens / 1000).toFixed(0) + 'k' : '';
-        phaseEl.innerText = 'PHASE: PREFILLING ' + (pTok ? '(' + pTok + ' TOK)' : '');
+        if (isReplay) {
+          phaseEl.innerText = 'PHASE: PREFIX REPLAY ' + (pTok ? '(' + pTok + ' TOK)' : '');
+          phaseEl.style.color = 'var(--accent-green)';
+          phaseEl.style.borderColor = 'rgba(74, 222, 128, 0.4)';
+          phaseEl.style.background = 'rgba(74, 222, 128, 0.15)';
+        } else {
+          phaseEl.innerText = 'PHASE: COLD PREFILL ' + (pTok ? '(' + pTok + ' TOK)' : '');
+          phaseEl.style.color = 'var(--accent-orange)';
+          phaseEl.style.borderColor = 'rgba(251, 146, 60, 0.4)';
+          phaseEl.style.background = 'rgba(251, 146, 60, 0.15)';
+        }
       }
-      phaseEl.style.color = 'var(--accent-orange)';
-      phaseEl.style.borderColor = 'rgba(251, 146, 60, 0.4)';
-      phaseEl.style.background = 'rgba(251, 146, 60, 0.15)';
     } else if (phase === 'decode') {
       phaseEl.innerText = 'PHASE: DECODE';
       phaseEl.style.color = 'var(--accent-blue)';
@@ -1543,7 +1622,10 @@ async function updateMetrics() {
     const totalTok = pf.total_tokens !== undefined ? pf.total_tokens : (prefill.total_tokens || 0);
     const newTok = pf.new_tokens !== undefined ? pf.new_tokens : (prefill.new_tokens || Math.max(0, totalTok - reusedTok));
     const prefillDt = pf.duration_s !== undefined ? pf.duration_s : (prefill.time_s || 0.0);
-    const prefillMode = pf.mode || prefill.mode || 'FULL';
+    const prefillMode = pf.mode || prefill.mode || 'IDLE';
+    const prefillType = pf.prefill_type || (reusedTok > 0 ? (String(prefillMode).toLowerCase().includes('gpu') ? 'gpu_hit' : 'host_replay') : (totalTok > 0 ? 'cold' : 'idle'));
+    const prefillLcp = pf.lcp !== undefined ? pf.lcp : (prefill.lcp || reusedTok);
+    const prefillSuffix = pf.suffix_tokens !== undefined ? pf.suffix_tokens : (prefill.suffix_tokens || newTok);
 
     const effEl = document.getElementById('val-prefill-eff-speed');
     if (effEl) effEl.innerText = effTokS > 0 ? formatNum(Math.round(effTokS)) : '--';
@@ -1553,6 +1635,40 @@ async function updateMetrics() {
     if (hitEl) hitEl.innerText = (hitPct > 0 || totalTok > 0) ? hitPct.toFixed(1) + '%' : '--';
     const detailEl = document.getElementById('val-prefill-detail');
     if (detailEl) detailEl.innerText = totalTok > 0 ? `${formatNum(reusedTok)}/${formatNum(totalTok)} tok` : '0 tok';
+
+    const typeBadge = document.getElementById('val-prefill-type-badge');
+    if (typeBadge) {
+      if (prefillType === 'gpu_hit') {
+        typeBadge.innerText = 'GPU HIT';
+        typeBadge.className = 'tag tag-hit';
+        typeBadge.style.color = 'var(--accent-green)';
+        typeBadge.style.background = 'rgba(74, 222, 128, 0.2)';
+      } else if (prefillType === 'host_replay') {
+        typeBadge.innerText = 'HOST REPLAY';
+        typeBadge.className = 'tag tag-store';
+        typeBadge.style.color = 'var(--accent-cyan)';
+        typeBadge.style.background = 'rgba(56, 189, 248, 0.2)';
+      } else if (prefillType === 'cold') {
+        typeBadge.innerText = 'COLD PREFILL';
+        typeBadge.className = 'tag tag-miss';
+        typeBadge.style.color = 'var(--accent-orange)';
+        typeBadge.style.background = 'rgba(251, 146, 60, 0.2)';
+      } else {
+        typeBadge.innerText = 'IDLE';
+        typeBadge.className = 'tag tag-info';
+        typeBadge.style.color = 'var(--text-muted)';
+        typeBadge.style.background = 'rgba(148, 163, 184, 0.1)';
+      }
+    }
+
+    const lcpEl = document.getElementById('val-prefill-lcp');
+    if (lcpEl) {
+      lcpEl.innerText = totalTok > 0 ? `${formatNum(prefillLcp)} (${hitPct.toFixed(1)}%)` : '--';
+    }
+    const suffixEl = document.getElementById('val-prefill-suffix');
+    if (suffixEl) {
+      suffixEl.innerText = totalTok > 0 ? `${formatNum(prefillSuffix)} tok (${prefillDt.toFixed(2)}s)` : '--';
+    }
 
     const c = data.cache || {};
     document.getElementById('val-prefix-entries').innerText = c.prefix_entries || 0;
@@ -1602,13 +1718,23 @@ async function updateMetrics() {
         let badgeText = 'IDLE / READY';
         if (isGen) { badgeClass = 'tag-hit'; badgeText = '● GENERATING'; }
         else if (isPrefill) {
-          badgeClass = 'tag-miss';
-          badgeText = (pfProg && pfProg.active) ? `● PREFILLING ${pfProg.percent}%` : '● PREFILLING';
+          if (pfProg && pfProg.active) {
+            if (pfProg.is_replay) {
+              badgeClass = 'tag-hit';
+              badgeText = `● REPLAY ${pfProg.percent}% (${pfProg.hit_rate_pct}% HIT)`;
+            } else {
+              badgeClass = 'tag-miss';
+              badgeText = `● COLD PREFILL ${pfProg.percent}%`;
+            }
+          } else {
+            badgeClass = 'tag-miss';
+            badgeText = s.reused_tokens > 0 ? '● PREFIX REPLAY' : '● COLD PREFILL';
+          }
         }
         else if (isComp) { badgeClass = 'tag-store'; badgeText = '✓ COMPLETED'; }
 
-        const maxTok = (isPrefill && pfProg && pfProg.total_tokens) ? pfProg.total_tokens : (s.max_tokens || 1024);
-        const genTok = (isPrefill && pfProg && pfProg.current_tokens) ? pfProg.current_tokens : (s.generated_tokens || 0);
+        const maxTok = (isPrefill && pfProg) ? (pfProg.is_replay ? pfProg.suffix_tokens : pfProg.total_tokens) : (s.max_tokens || 1024);
+        const genTok = (isPrefill && pfProg) ? pfProg.current_tokens : (s.generated_tokens || 0);
         const pct = (isPrefill && pfProg && pfProg.percent !== undefined) ? pfProg.percent : Math.min(100, maxTok > 0 ? (genTok / maxTok * 100) : 0);
         const speed = (isPrefill && pfProg && pfProg.speed_tok_s) ? pfProg.speed_tok_s.toFixed(1) : (s.tok_s || 0).toFixed(1);
         const promptTok = s.prompt_tokens ? (s.prompt_tokens >= 1000 ? (s.prompt_tokens / 1000).toFixed(1) + 'k' : s.prompt_tokens) : '--';
@@ -1619,15 +1745,27 @@ async function updateMetrics() {
           const escaped = s.recent_text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
           textContent = escaped + (isGen ? ' <span class="cursor">▋</span>' : '');
         } else if (isPrefill) {
-          if (pfProg && pfProg.active && pfProg.total_tokens > 0) {
+          if (pfProg && pfProg.active) {
             const barLen = 24;
             const filledLen = Math.min(barLen, Math.round((pfProg.percent / 100) * barLen));
             const barStr = '█'.repeat(filledLen) + '░'.repeat(barLen - filledLen);
-            textContent = `<span style="color:var(--accent-orange);font-weight:700">/* Prefilling prompt context: chunk ${pfProg.current_chunk}/${pfProg.total_chunks} (${pfProg.percent}%) */</span>\n` +
-              `<span style="color:var(--accent-blue)">[${barStr}]</span> ${formatNum(pfProg.current_tokens)} / ${formatNum(pfProg.total_tokens)} tokens\n` +
-              `<span style="color:var(--text-muted)">Compute rate: <b>${pfProg.speed_tok_s} tok/s</b> · Elapsed: <b>${pfProg.elapsed_s}s</b> · ETA: <b style="color:var(--accent-green)">~${pfProg.eta_str}</b></span>`;
+            if (pfProg.is_replay) {
+              const srcSlot = s.reused_slot !== undefined && s.reused_slot >= 0 ? ` Slot ${s.reused_slot}` : '';
+              textContent = `<span style="color:var(--accent-green);font-weight:700">/* PREFIX REPLAY: ${pfProg.hit_rate_pct}% LCP hit · Reusing ${formatNum(pfProg.reused_tokens)} tok from${srcSlot || ' cache'} */</span>\n` +
+                `<span style="color:var(--accent-cyan)">[${barStr}]</span> Replaying suffix: ${formatNum(pfProg.current_tokens)} / ${formatNum(pfProg.suffix_tokens)} tokens (${pfProg.percent}%)\n` +
+                `<span style="color:var(--text-muted)">Replay rate: <b>${pfProg.speed_tok_s} tok/s</b> · Elapsed: <b>${pfProg.elapsed_s}s</b> · ETA: <b style="color:var(--accent-green)">~${pfProg.eta_str}</b></span>`;
+            } else {
+              textContent = `<span style="color:var(--accent-orange);font-weight:700">/* COLD PREFILL (No prefix cache): chunk ${pfProg.current_chunk}/${pfProg.total_chunks} (${pfProg.percent}%) */</span>\n` +
+                `<span style="color:var(--accent-blue)">[${barStr}]</span> ${formatNum(pfProg.current_tokens)} / ${formatNum(pfProg.total_tokens)} tokens\n` +
+                `<span style="color:var(--text-muted)">Compute rate: <b>${pfProg.speed_tok_s} tok/s</b> · Elapsed: <b>${pfProg.elapsed_s}s</b> · ETA: <b style="color:var(--accent-green)">~${pfProg.eta_str}</b></span>`;
+            }
           } else {
-            textContent = '<span class="slot-placeholder">/* Prefilling prompt context (' + promptTok + ' tokens)... */</span>';
+            const isReplay = s.reused_tokens > 0;
+            if (isReplay) {
+              textContent = `<span class="slot-placeholder" style="color:var(--accent-green)">/* Prefix Replay active: reusing ${formatNum(s.reused_tokens)} cached tokens... */</span>`;
+            } else {
+              textContent = '<span class="slot-placeholder">/* Cold prefill prompt context (' + promptTok + ' tokens)... */</span>';
+            }
           }
         } else {
           textContent = '<span class="slot-placeholder">/* Slot ' + s.slot_id + ' standby · ready for inference */</span>';

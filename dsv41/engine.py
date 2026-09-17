@@ -247,12 +247,39 @@ class Engine:
         if self.max_seqs > 1:
             self._init_batch_scheduler()
 
-    def _record_prefill_stats(self, mode: str, total: int, reused: int, new_tokens: int, dt: float):
+    def _record_prefill_stats(
+        self,
+        mode: str,
+        total: int,
+        reused: int,
+        new_tokens: int,
+        dt: float,
+        prefill_type: str | None = None,
+        lcp: int | None = None,
+        base_tokens: int | None = None,
+        suffix_tokens: int | None = None,
+    ):
+        if not prefill_type:
+            if mode in ("gpu_slot_hit", "GPU_HIT") or "gpu" in str(mode).lower():
+                prefill_type = "gpu_hit"
+            elif reused > 0 or mode in ("LCP-HIT", "REPLAY"):
+                prefill_type = "host_replay"
+            else:
+                prefill_type = "cold"
+
+        lcp_val = lcp if lcp is not None else reused
+        base_val = base_tokens if base_tokens is not None else reused
+        suffix_val = suffix_tokens if suffix_tokens is not None else new_tokens
+
         self.last_prefill_stats = {
             "mode": mode,
+            "prefill_type": prefill_type,
             "total_tokens": total,
             "reused_tokens": reused,
             "new_tokens": new_tokens,
+            "lcp": lcp_val,
+            "base_tokens": base_val,
+            "suffix_tokens": suffix_val,
             "hit_rate_pct": round(reused / max(total, 1) * 100, 1),
             "time_s": round(dt, 3),
             "new_tok_s": round(new_tokens / max(dt, 1e-9), 1),
@@ -558,20 +585,44 @@ class Engine:
                     name in ("compress_kv", "index_k")
                     and isinstance(val, dict)
                 ):
-                    for key, t in val.items():
-                        if not torch.is_tensor(t):
-                            continue
+                    # Canonical single-copy per owner:
+                    # In multi-device setups, compress_kv and index_k are mirrored across all GPUs.
+                    # Snapshotting each mirror causes 4x redundant host-RAM bloat.
+                    # We pick one canonical mirror per owner to persist, and broadcast upon restore.
+                    dedup_mirrors = os.environ.get("DSV41_PREFIX_DEDUP_MIRRORS", "1") == "1"
+                    if dedup_mirrors:
+                        owner_candidates = {}
+                        for key, t in val.items():
+                            if not torch.is_tensor(t):
+                                continue
+                            owner = key[0] if isinstance(key, tuple) else key
+                            owner_candidates.setdefault(owner, []).append((key, t))
+                        for owner in sorted(owner_candidates.keys(), key=lambda x: str(x)):
+                            candidates = owner_candidates[owner]
+                            # Deterministic preference: pick primary device if matching layer's device, else sort by str(dev)
+                            layer = getattr(self.model, "layers", {}).get(owner, None) if hasattr(getattr(self.model, "layers", None), "__getitem__") else None
+                            layer_dev = getattr(layer, "device", None) if layer else None
+                            candidates.sort(key=lambda item: (0 if layer_dev is not None and isinstance(item[0], tuple) and len(item[0]) > 1 and str(item[0][1]) == str(layer_dev) else 1, str(item[0])))
+                            key, t = candidates[0]
+                            k = ("dict", id(val), repr(key))
+                            if k not in seen_slot:
+                                seen_slot.add(k)
+                                slots.append(("dict", val, key, t))
+                    else:
+                        for key, t in val.items():
+                            if not torch.is_tensor(t):
+                                continue
 
-                        k = ("dict", id(val), repr(key))
+                            k = ("dict", id(val), repr(key))
 
-                        if k in seen_slot:
-                            continue
+                            if k in seen_slot:
+                                continue
 
-                        seen_slot.add(k)
+                            seen_slot.add(k)
 
-                        slots.append(
-                            ("dict", val, key, t)
-                        )
+                            slots.append(
+                                ("dict", val, key, t)
+                            )
 
                     # Do not recursively walk tensor values.
                     continue
@@ -772,28 +823,43 @@ class Engine:
             allocated_bytes = src.numel() * src.element_size()
             allocated_total += allocated_bytes
 
-            # Dynamic compressed/index caches may be allocated well beyond
-            # the logical prefix. Persist only rows that can be read when
-            # restoring this anchor; unused capacity is recreated locally.
+            # Dynamic compressed/index caches, Engram history, and SWA window
+            # may be allocated well beyond the logical prefix. Persist only rows
+            # that can be read when restoring this anchor; unused capacity is recreated locally.
             save_src = src
-            if (
-                used_tokens is not None
-                and kind == "dict"
-                and isinstance(key, tuple)
-                and key
-                and key[0] in self.model.shared.cache_max_rows
-                and src.ndim >= 2
-            ):
-                owner = int(key[0])
-                ratio = int(self.model.args.compress_ratios[owner])
-                rows = max(1, min(src.shape[1], int(used_tokens) // max(1, ratio) + 1))
-                save_src = src[:, :rows].contiguous()
+            if used_tokens is not None and src.ndim >= 2:
+                if (
+                    kind == "dict"
+                    and isinstance(key, tuple)
+                    and key
+                    and hasattr(getattr(self.model, "shared", None), "cache_max_rows")
+                    and key[0] in self.model.shared.cache_max_rows
+                ):
+                    owner = int(key[0])
+                    ratio = int(getattr(self.model.args, "compress_ratios", {}).get(owner, 1)) if hasattr(self.model, "args") else 1
+                    rows = max(1, min(src.shape[1], int(used_tokens) // max(1, ratio) + 1))
+                    save_src = src[:, :rows].contiguous()
+                elif (
+                    kind == "attr"
+                    and key == "cache"
+                    and holder.__class__.__name__ == "NgramHashState"
+                ):
+                    rows = max(1, min(src.shape[1], int(used_tokens)))
+                    save_src = src[:, :rows].contiguous()
+                elif (
+                    (key == "window_kv_cache" or (isinstance(key, str) and "window_kv" in key))
+                    and src.shape[1] > 128
+                ):
+                    rows = max(1, min(src.shape[1], 128, int(used_tokens)))
+                    save_src = src[:, :rows].contiguous()
+            elif src.ndim >= 2 and (key == "window_kv_cache" or (isinstance(key, str) and "window_kv" in key)) and src.shape[1] > 128:
+                save_src = src[:, :128].contiguous()
 
             nbytes = save_src.numel() * save_src.element_size()
             total += nbytes
             used_rows = (
                 int(save_src.shape[1])
-                if kind == "dict" and save_src.ndim >= 2
+                if save_src.ndim >= 2
                 else None
             )
             inventory.append({
@@ -913,10 +979,21 @@ class Engine:
                     )
 
                 try:
-                    dst.view(-1)[:src.numel()].copy_(
-                        src.view(-1),
-                        non_blocking=src.is_pinned(),
-                    )
+                    if (
+                        dst.ndim >= 2
+                        and src.ndim == dst.ndim
+                        and src.shape[0] <= dst.shape[0]
+                        and src.shape[1] <= dst.shape[1]
+                    ):
+                        dst[:src.shape[0], :src.shape[1]].copy_(
+                            src,
+                            non_blocking=src.is_pinned(),
+                        )
+                    else:
+                        dst.view(-1)[:src.numel()].copy_(
+                            src.view(-1),
+                            non_blocking=src.is_pinned(),
+                        )
                 except Exception as exc:
                     print(
                         f"[prefix-snapshot] RESTORE-FAIL "
@@ -934,6 +1011,32 @@ class Engine:
 
                 if dst.is_cuda:
                     touched.add(dst.device)
+
+                # Broadcast canonical mirror to other GPU devices for shared tables
+                if (
+                    kind == "dict"
+                    and isinstance(key, tuple)
+                    and len(key) >= 1
+                    and isinstance(holder, dict)
+                    and hasattr(getattr(self.model, "shared", None), "compress_kv")
+                    and (holder is getattr(self.model.shared, "compress_kv", None)
+                         or holder is getattr(self.model.shared, "index_k", None))
+                ):
+                    owner = key[0]
+                    for (o, dev), mirror in holder.items():
+                        if o == owner and dev != dst.device:
+                            if mirror.ndim >= 2 and dst.ndim >= 2:
+                                mirror[:src.shape[0], :src.shape[1]].copy_(
+                                    dst[:src.shape[0], :src.shape[1]],
+                                    non_blocking=True,
+                                )
+                            else:
+                                mirror.view(-1)[:src.numel()].copy_(
+                                    dst.view(-1)[:src.numel()],
+                                    non_blocking=True,
+                                )
+                            if mirror.is_cuda:
+                                touched.add(mirror.device)
         finally:
             for dev in touched:
                 torch.cuda.synchronize(dev)
@@ -1641,10 +1744,13 @@ class Engine:
         kind, holder, key, tensor = slot
 
         shape = tuple(int(x) for x in tensor.shape)
-        if kind == "dict" and isinstance(key, tuple) and key:
+        if (
+            (kind == "dict" and isinstance(key, tuple) and key)
+            or (kind == "attr" and key == "cache" and holder.__class__.__name__ == "NgramHashState")
+            or (kind == "attr" and (key == "window_kv_cache" or "window_kv" in str(key)))
+        ):
             try:
-                if int(key[0]) >= 0:
-                    shape = (shape[0], -1, *shape[2:])
+                shape = (shape[0], -1, *shape[2:])
             except Exception:
                 pass
         return {
@@ -2293,7 +2399,7 @@ class Engine:
                     and (
                         tuple(src.shape) == tuple(dst.shape)
                         or (
-                            kind == "dict"
+                            kind in ("dict", "attr")
                             and src.ndim == dst.ndim
                             and tuple(src.shape[:1]) == tuple(dst.shape[:1])
                             and tuple(src.shape[2:]) == tuple(dst.shape[2:])
@@ -2686,8 +2792,14 @@ class Engine:
         # 1. If best_slot is not slot 0, copy its per-sequence state to slot 0 on GPU
         if best_slot != 0:
             self.rt.copy_seq(best_slot, 0, req_id=req_id)
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
+            devices = getattr(self.rt, "devices", None) or getattr(self, "devices", None)
+            if devices:
+                for d in devices:
+                    if isinstance(d, (int, torch.device)) or (isinstance(d, str) and "cuda" in str(d)):
+                        try:
+                            torch.cuda.synchronize(d)
+                        except Exception:
+                            pass
 
         # 2. Align reuse_pos to compression ratio boundary (multiple of 16).
         # If best_lcp matches the entire prompt, keep at least 1-16 tokens to compute logits.
@@ -2708,8 +2820,8 @@ class Engine:
         chunk_size = int(os.environ.get("DSV41_GPU_PREFIX_CHUNK_SIZE", "512"))
         logits = self._forward_prefix_continuation(prompt_ids, reuse_pos, chunk_size=chunk_size)
 
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+        if getattr(logits, "is_cuda", False):
+            torch.cuda.synchronize(logits.device)
 
         dt = time.perf_counter() - t0
         print(
@@ -2721,9 +2833,13 @@ class Engine:
 
         self._record_prefill_stats(
             mode="gpu_slot_hit",
+            prefill_type="gpu_hit",
             total=total,
             reused=reuse_pos,
             new_tokens=suffix_len,
+            lcp=best_lcp,
+            base_tokens=reuse_pos,
+            suffix_tokens=suffix_len,
             dt=dt,
         )
 
@@ -3153,7 +3269,17 @@ class Engine:
                 flush=True,
             )
 
-            self._record_prefill_stats("LCP-HIT", total, old_base, replay_n, dt)
+            self._record_prefill_stats(
+                "LCP-HIT",
+                total,
+                old_base,
+                replay_n,
+                dt,
+                prefill_type="host_replay",
+                lcp=lcp,
+                base_tokens=old_base,
+                suffix_tokens=replay_n,
+            )
             return logits, old_base
 
         # ========================================================
@@ -3201,7 +3327,17 @@ class Engine:
                 flush=True,
             )
 
-            self._record_prefill_stats("FULL", total, 0, total, dt)
+            self._record_prefill_stats(
+                "FULL",
+                total,
+                0,
+                total,
+                dt,
+                prefill_type="cold",
+                lcp=lcp,
+                base_tokens=0,
+                suffix_tokens=total,
+            )
             return logits, 0
 
         # --------------------------------------------------------
@@ -3220,14 +3356,21 @@ class Engine:
         # Avoid materialising attention activations for a 100K+ prompt in
         # one call. Continuation chunks preserve the persistent caches and
         # keep the peak temporary allocation bounded by HC_PREFILL_CHUNK.
-        _chunk = max(1, int(os.environ.get("DSV41_HC_PREFILL_CHUNK", "1024")))
-        logits = None
-        for _s in range(0, len(base_ids), _chunk):
-            _e = min(_s + _chunk, len(base_ids))
+        _force_legacy_chunk = os.environ.get("DSV41_FORCE_LEGACY_BUILD_LOOP", "0") == "1"
+        if not _force_legacy_chunk:
             logits = self.model.forward(
-                torch.tensor([base_ids[_s:_e]], dtype=torch.long),
-                _s,
+                torch.tensor([base_ids], dtype=torch.long),
+                0,
             )
+        else:
+            _chunk = max(1, int(os.environ.get("DSV41_HC_PREFILL_CHUNK", "1024")))
+            logits = None
+            for _s in range(0, len(base_ids), _chunk):
+                _e = min(_s + _chunk, len(base_ids))
+                logits = self.model.forward(
+                    torch.tensor([base_ids[_s:_e]], dtype=torch.long),
+                    _s,
+                )
 
         # CUDA work can still be asynchronous.  Synchronize only the
         # GPUs actually used by this model, not every CUDA device.
@@ -3306,7 +3449,17 @@ class Engine:
             flush=True,
         )
 
-        self._record_prefill_stats("BUILD", total, 0, total, dt)
+        self._record_prefill_stats(
+            "BUILD",
+            total,
+            0,
+            total,
+            dt,
+            prefill_type="cold",
+            lcp=lcp,
+            base_tokens=0,
+            suffix_tokens=total,
+        )
         return logits, 0
 
     @torch.inference_mode()
@@ -3974,6 +4127,9 @@ class Engine:
                     st["prompt_tokens"] = len(req.prompt_ids)
                     st["reused_tokens"] = best_gpu_lcp
                     st["reused_slot"] = best_gpu_slot
+                    st["lcp"] = best_gpu_lcp
+                    st["prefill_type"] = "gpu_hit" if best_gpu_lcp > 0 else "cold"
+                    st["suffix_tokens"] = max(0, len(req.prompt_ids) - best_gpu_lcp)
                     st["generated_tokens"] = 0
                     st["max_tokens"] = req.max_new
                     st["start_time"] = time.perf_counter()
@@ -3992,6 +4148,17 @@ class Engine:
                         with getattr(self, "_slot_tokens_lock", threading.Lock()):
                             self._slot_tokens[0] = list(req.prompt_ids)
                             self._slot_tokens[slot_id] = list(req.prompt_ids)
+                        pf_stats = getattr(self, "last_prefill_stats", None)
+                        with self._slot_lock:
+                            st = self.slot_states.get(slot_id, {})
+                            if pf_stats:
+                                st["prefill_type"] = pf_stats.get("prefill_type", st.get("prefill_type", "cold"))
+                                st["lcp"] = pf_stats.get("lcp", st.get("lcp", 0))
+                                st["reused_tokens"] = pf_stats.get("reused_tokens", st.get("reused_tokens", 0))
+                                st["suffix_tokens"] = pf_stats.get("suffix_tokens", max(0, len(req.prompt_ids) - st.get("reused_tokens", 0)))
+                                st["prefill_time_s"] = pf_stats.get("time_s", 0.0)
+                                st["prefill_eff_s"] = pf_stats.get("effective_tok_s", 0.0)
+                            self.slot_states[slot_id] = st
                         req.pos = len(req.prompt_ids)
                         req.next_token = first_tok
                         if first_tok == self.eos:
