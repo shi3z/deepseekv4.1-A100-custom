@@ -192,11 +192,12 @@ class Engram(torch.nn.Module):
 
             return self.apply(x, emb)
 
-        print(
-            f"[engram-prefill] tokens={L:,} chunk={chunk:,} "
-            f"device={x.device}",
-            flush=True,
-        )
+        if os.environ.get("DSV41_DEBUG", "0") == "1":
+            print(
+                f"[engram-prefill] tokens={L:,} chunk={chunk:,} "
+                f"device={x.device}",
+                flush=True,
+            )
 
         # Modify x chunk-by-chunk. The caller immediately replaces h with
         # this return value, so keeping a second full [B,L,hc,dim] tensor

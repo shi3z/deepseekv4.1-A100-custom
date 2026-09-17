@@ -287,8 +287,37 @@ class SharedAttn:
 
         self.kv_owner: int = -1
         self.index_owner: int = -1
-        self.topk_idxs: torch.Tensor | None = None
-        self.candidates: torch.Tensor | None = None
+        self._topk_idxs_map: dict[int, torch.Tensor] = {}
+        self._candidates_map: dict[int, torch.Tensor] = {}
+        self._current_chunk_idx: int = 0
+
+    @property
+    def topk_idxs(self) -> torch.Tensor | None:
+        return self._topk_idxs_map.get(getattr(self, "_current_chunk_idx", 0))
+
+    @topk_idxs.setter
+    def topk_idxs(self, val: torch.Tensor | None):
+        chunk_idx = getattr(self, "_current_chunk_idx", 0)
+        if val is None:
+            self._topk_idxs_map.pop(chunk_idx, None)
+        else:
+            self._topk_idxs_map[chunk_idx] = val
+
+    @property
+    def candidates(self) -> torch.Tensor | None:
+        return self._candidates_map.get(getattr(self, "_current_chunk_idx", 0))
+
+    @candidates.setter
+    def candidates(self, val: torch.Tensor | None):
+        chunk_idx = getattr(self, "_current_chunk_idx", 0)
+        if val is None:
+            self._candidates_map.pop(chunk_idx, None)
+        else:
+            self._candidates_map[chunk_idx] = val
+
+    def cleanup_chunk(self, chunk_idx: int):
+        self._topk_idxs_map.pop(chunk_idx, None)
+        self._candidates_map.pop(chunk_idx, None)
 
     @torch.inference_mode()
     def _ensure_capacity(
@@ -397,9 +426,18 @@ class SharedAttn:
 
         for (o, dev), cache in self.compress_kv.items():
             if o == owner:
-                cache[:bsz, pos:end].copy_(
-                    rows.to(dev, non_blocking=True)
-                )
+                if dev == rows.device:
+                    cache[:bsz, pos:end].copy_(rows)
+                else:
+                    with torch.cuda.device(dev):
+                        target_row = rows.to(dev, non_blocking=True)
+                        cache[:bsz, pos:end].copy_(
+                            target_row,
+                            non_blocking=True,
+                        )
+                        target_row.record_stream(
+                            torch.cuda.current_stream(dev)
+                        )
 
     def write_index_k(
         self,
@@ -421,9 +459,18 @@ class SharedAttn:
 
         for (o, dev), cache in self.index_k.items():
             if o == owner:
-                cache[:bsz, pos:end].copy_(
-                    rows.to(dev, non_blocking=True)
-                )
+                if dev == rows.device:
+                    cache[:bsz, pos:end].copy_(rows)
+                else:
+                    with torch.cuda.device(dev):
+                        target_row = rows.to(dev, non_blocking=True)
+                        cache[:bsz, pos:end].copy_(
+                            target_row,
+                            non_blocking=True,
+                        )
+                        target_row.record_stream(
+                            torch.cuda.current_stream(dev)
+                        )
 
 # --------------------------------------------------------------------------- attention
 class Compressor:
@@ -518,6 +565,7 @@ class Indexer:
         self.device = device
         self.layer_id = layer_id
         self.owns_k = layer_id in args.kv_source_layers
+        self.index_owner = max([o for o in args.kv_source_layers if o <= layer_id], default=-1)
         self.ratio = args.compress_ratios[layer_id]
         self.is_candidate_source = layer_id == args.candidate_source_layer
         self.uses_candidates = 0 <= args.candidate_source_layer < layer_id
@@ -589,7 +637,7 @@ class Indexer:
         q = fake_quant_fp4(q, 32)
 
         index_k = self.shared.index_k[
-            (self.shared.index_owner, self.device)
+            (self.index_owner, self.device)
         ][:bsz, : end_pos // ratio]
 
         weights = F.linear(x, self.weights_proj) * (
@@ -864,6 +912,7 @@ class Attention:
         self.wo_b = w["attn.wo_b.weight"]
         self.is_kv_source = layer_id in args.kv_source_layers
         self.is_index_source = layer_id in args.index_source_layers
+        self.kv_owner = max([o for o in args.kv_source_layers if o <= layer_id], default=-1)
         self.compressor = Compressor(args, layer_id, {k[5:]: v for k, v in w.items() if k.startswith("attn.compressor")}, device) if self.is_kv_source else None
         self.indexer = Indexer(args, layer_id, {k[5:]: v for k, v in w.items() if k.startswith("attn.indexer")}, device, shared) if self.is_index_source else None
         self.window_kv_cache = torch.zeros(args.max_seqs or args.max_batch_size, self.window, self.head_dim, dtype=torch.bfloat16, device=device)
@@ -1161,7 +1210,7 @@ class Attention:
                 )
             latent = fake_quant_fp4(latent, 16, scale_e4m3=True)
             self.shared.write_compress_kv(self.layer_id, bsz, start_pos // ratio, latent)
-        return self.shared.compress_kv[(self.shared.kv_owner, self.device)][:bsz, :compress_len], idxs
+        return self.shared.compress_kv[(self.kv_owner, self.device)][:bsz, :compress_len], idxs
 
     def __call__(self, x: torch.Tensor, start_pos: int) -> torch.Tensor:
         bsz, seqlen, _ = x.size()
@@ -1544,7 +1593,8 @@ class MoE:
             jobs.append(job)
 
         # Finish route tensors before remote devices consume them.
-        torch.cuda.current_stream(owner).synchronize()
+        ev_route = torch.cuda.Event()
+        ev_route.record(torch.cuda.current_stream(owner))
 
         # --------------------------------------------------------------
         # Launch expert work.
@@ -1562,6 +1612,8 @@ class MoE:
             m = job["m"]
             stream = job["stream"]
 
+            stream.wait_event(ev_route)
+
             if d == owner:
                 xs = xq
 
@@ -1572,18 +1624,16 @@ class MoE:
                     job["uniq_tok_owner"],
                 )
 
-                # Ensure gather has materialized before peer copy.
-                torch.cuda.current_stream(owner).synchronize()
+                ev_gather = torch.cuda.Event()
+                ev_gather.record(torch.cuda.current_stream(owner))
+                stream.wait_event(ev_gather)
 
                 with torch.cuda.device(d), torch.cuda.stream(stream):
                     xs = xs_src.to(
                         d,
                         non_blocking=True,
                     )
-
-                # Make source lifetime unambiguous and keep owner peak low:
-                # complete only this P2P copy, not all shard compute.
-                stream.synchronize()
+                xs_src.record_stream(stream)
                 del xs_src
 
             else:
@@ -1672,14 +1722,17 @@ class MoE:
         # --------------------------------------------------------------
         for job in jobs:
             stream = job["stream"]
-            stream.synchronize()
+            ev_done = torch.cuda.Event()
+            ev_done.record(stream)
+            torch.cuda.current_stream(owner).wait_event(ev_done)
 
             ys = job["ys_remote"]
 
             if ys.device == owner:
                 ys_owner = ys
             else:
-                ys_owner = ys.to(owner)
+                ys_owner = ys.to(owner, non_blocking=True)
+                ys.record_stream(torch.cuda.current_stream(owner))
 
             y.index_add_(
                 0,
@@ -1868,9 +1921,8 @@ class MoE:
             # final torch.cat() rebuilt the full multi-GiB pair tensor.
             # ---------------------------------------------------------------
             moe_chunk = int(
-                os.environ.get("DSV41_MOE_PREFILL_CHUNK", "256")
+                os.environ.get("DSV41_MOE_PREFILL_CHUNK", "4096")
             )
-
             moe_chunk = max(1, moe_chunk)
 
             if n_tok <= moe_chunk:
@@ -1880,6 +1932,7 @@ class MoE:
                     pair_rows,
                     ones,
                     block_m,
+                    n_experts=self.n_routed_experts if hasattr(self, "n_routed_experts") else 384,
                 )
 
                 gu = grouped_fp4_gemm(
@@ -1897,12 +1950,10 @@ class MoE:
                     self.swiglu_limit,
                 )
 
-                p2 = GroupedPairs(
-                    eid,
+                p2 = p1.make_p2(
                     pair_rows,
                     pair_rows,
                     ones,
-                    block_m,
                 )
 
                 y = grouped_fp4_gemm(
@@ -1918,11 +1969,12 @@ class MoE:
                 ).sum(dim=1)
 
             else:
-                print(
-                    f"[moe-prefill] layer={self.layer_id} "
-                    f"tokens={n_tok:,} chunk={moe_chunk:,}",
-                    flush=True,
-                )
+                if os.environ.get("DSV41_DEBUG", "0") == "1":
+                    print(
+                        f"[moe-prefill] layer={self.layer_id} "
+                        f"tokens={n_tok:,} chunk={moe_chunk:,}",
+                        flush=True,
+                    )
 
                 # Only the final reduced result persists across chunks.
                 # This is far smaller than [n_pairs, 2*inter].
@@ -1978,6 +2030,7 @@ class MoE:
                         cpair_rows,
                         cones,
                         block_m,
+                        n_experts=self.n_routed_experts if hasattr(self, "n_routed_experts") else 384,
                     )
 
                     # Temporary size now depends on nc, not total n_tok.
@@ -1996,12 +2049,10 @@ class MoE:
                         self.swiglu_limit,
                     )
 
-                    p2 = GroupedPairs(
-                        ceid,
+                    p2 = p1.make_p2(
                         cpair_rows,
                         cpair_rows,
                         cones,
-                        block_m,
                     )
 
                     yc = grouped_fp4_gemm(
@@ -2203,8 +2254,59 @@ class Transformer:
         self.engram_hash = None
         self.hc = args.hc_mult
 
+    def reset_cache(self):
+        """Zero all KV and index caches to avoid cross-request contamination."""
+        for blk in self.blocks:
+            if hasattr(blk.attn, "window_kv_cache") and blk.attn.window_kv_cache is not None:
+                blk.attn.window_kv_cache.zero_()
+            c = blk.attn.compressor
+            if c is not None and getattr(c, "ratio", 1) > 1:
+                if hasattr(c, "kv_state"):
+                    c.kv_state.zero_()
+                if hasattr(c, "score_state"):
+                    c.score_state.fill_(-torch.inf)
+                if hasattr(c, "kv_ring"):
+                    c.kv_ring.zero_()
+                if hasattr(c, "score_ring"):
+                    c.score_ring.fill_(-torch.inf)
+        if hasattr(self, "shared"):
+            for cache in self.shared.compress_kv.values():
+                cache.zero_()
+            for cache in self.shared.index_k.values():
+                cache.zero_()
+            self.shared._topk_idxs_map.clear()
+            self.shared._candidates_map.clear()
+            self.shared._current_chunk_idx = 0
+
+    def _get_stages(self) -> list[dict]:
+        """Group contiguous blocks on the same device into pipeline stages."""
+        if hasattr(self, "_stages_cache") and self._stages_cache is not None:
+            return self._stages_cache
+        stages = []
+        if not self.blocks:
+            return stages
+        current_dev = self.blocks[0].device
+        current_blocks = []
+        for blk in self.blocks:
+            if blk.device == current_dev:
+                current_blocks.append(blk)
+            else:
+                stages.append({
+                    "device": current_dev,
+                    "blocks": current_blocks,
+                })
+                current_dev = blk.device
+                current_blocks = [blk]
+        if current_blocks:
+            stages.append({
+                "device": current_dev,
+                "blocks": current_blocks,
+            })
+        self._stages_cache = stages
+        return stages
+
     @torch.inference_mode()
-    def forward(self, input_ids: torch.Tensor, start_pos: int = 0) -> torch.Tensor:
+    def _forward_sequential(self, input_ids: torch.Tensor, start_pos: int = 0) -> torch.Tensor:
         """input_ids [b, s] (long) -> logits for the last position [b, vocab] (fp32)."""
         dev0 = self.blocks[0].device
         input_ids = input_ids.to(dev0)
@@ -2239,3 +2341,140 @@ class Transformer:
         h = self.blocks[-1].hc_pre(h, pre_mix)[:, -1]
         h = rmsnorm(h, self.norm_w, self.args.norm_eps)
         return F.linear(h, self.head).float()
+
+    @torch.inference_mode()
+    def forward_pipelined(
+        self,
+        input_ids: torch.Tensor,
+        start_pos: int = 0,
+        chunk_size: int = 512,
+    ) -> torch.Tensor:
+        """Pipelined prefill across multi-GPU stages with chunked prompt tokens.
+
+        Divides prompt into M chunks and executes a pipelined FIFO schedule across K stages.
+        Each stage runs on its dedicated CUDA stream with CUDA event synchronization.
+        """
+        stages = self._get_stages()
+        K = len(stages)
+        dev0 = stages[0]["device"]
+        last_dev = stages[-1]["device"]
+        input_ids = input_ids.to(dev0)
+        B, S = input_ids.shape
+
+        if not hasattr(self, "_stage_streams") or len(self._stage_streams) != K:
+            self._stage_streams = [torch.cuda.Stream(device=s["device"]) for s in stages]
+
+        chunk_size = max(128, int(chunk_size))
+        M = (S + chunk_size - 1) // chunk_size
+
+        # Pre-ensure capacity for all KV and index owners upfront so no reallocations happen mid-pipeline
+        for owner in self.shared.cache_max_rows:
+            ratio = int(self.args.compress_ratios[owner])
+            needed = (start_pos + S + ratio - 1) // ratio
+            self.shared._ensure_capacity(self.shared.compress_kv, owner, needed, "compress_kv")
+            self.shared._ensure_capacity(self.shared.index_k, owner, needed, "index_k")
+
+        hashes = self.engram_hash(input_ids, start_pos) if self.engram_hash is not None else None
+
+        targets = set(getattr(self, "collect_main_hidden", ()))
+        chunk_main_hiddens: dict[int, list[torch.Tensor]] = {lid: [] for lid in targets}
+
+        chunk_activations: list[list[tuple[torch.Tensor, torch.Tensor] | None]] = [
+            [None for _ in range(M)] for _ in range(K)
+        ]
+        ev_stage_done: list[list[torch.cuda.Event]] = [
+            [torch.cuda.Event() for _ in range(M)] for _ in range(K)
+        ]
+
+        T = M + K - 1
+        final_logits = None
+
+        ev_start = torch.cuda.Event()
+        ev_start.record(torch.cuda.current_stream(dev0))
+        for st in self._stage_streams:
+            st.wait_event(ev_start)
+
+        for t in range(T):
+            for k in range(K - 1, -1, -1):
+                m = t - k
+                if not (0 <= m < M):
+                    continue
+
+                c0 = m * chunk_size
+                c1 = min(c0 + chunk_size, S)
+                p_m = start_pos + c0
+                stage = stages[k]
+                dev_k = stage["device"]
+                stream_k = self._stage_streams[k]
+                stage_blocks = stage["blocks"]
+
+                with torch.cuda.device(dev_k), torch.cuda.stream(stream_k):
+                    if k == 0:
+                        chunk_ids = input_ids[:, c0:c1].to(dev_k, non_blocking=True)
+                        h = F.embedding(chunk_ids, self.embed)
+                        h = h.unsqueeze(2).repeat(1, 1, self.hc, 1)
+                        pre_mix = h.new_zeros(h.size(0), h.size(1), self.hc, dtype=torch.float32)
+                        pre_mix[:, :, 0] = 1.0
+                    else:
+                        stream_k.wait_event(ev_stage_done[k - 1][m])
+                        h_prev, pre_mix_prev = chunk_activations[k - 1][m]
+                        h = h_prev.to(dev_k, non_blocking=True)
+                        pre_mix = pre_mix_prev.to(dev_k, non_blocking=True)
+                        h_prev.record_stream(stream_k)
+                        pre_mix_prev.record_stream(stream_k)
+                        chunk_activations[k - 1][m] = None
+
+                    self.shared._current_chunk_idx = m
+
+                    chunk_hashes = hashes[:, c0:c1] if hashes is not None else None
+
+                    for blk in stage_blocks:
+                        if blk.engram is not None and chunk_hashes is not None:
+                            blk_hash = chunk_hashes[:, :, blk.engram.layer_hash_index, :]
+                            if blk_hash.device != dev_k:
+                                blk_hash = blk_hash.to(dev_k, non_blocking=True)
+                            h = blk.engram(h, blk_hash)
+                        if blk.layer_id in targets:
+                            chunk_main_hiddens[blk.layer_id].append(h.mean(dim=2))
+                        h, pre_mix = blk(h, p_m, pre_mix)
+
+                    if k < K - 1:
+                        chunk_activations[k][m] = (h, pre_mix)
+                    else:
+                        if m == M - 1:
+                            h_last = self.blocks[-1].hc_pre(h, pre_mix)[:, -1]
+                            h_last = rmsnorm(h_last, self.norm_w, self.args.norm_eps)
+                            final_logits = F.linear(h_last, self.head).float()
+                        self.shared.cleanup_chunk(m)
+
+                    ev_stage_done[k][m].record(stream_k)
+
+        torch.cuda.current_stream(last_dev).wait_stream(self._stage_streams[-1])
+        self.shared._current_chunk_idx = 0
+
+        if targets:
+            keep = int(self.args.cfg.get("window_size", 0))
+            layer_hiddens = []
+            for lid in sorted(targets):
+                full_layer_h = torch.cat(chunk_main_hiddens[lid], dim=1)
+                if keep > 0 and full_layer_h.shape[1] > keep:
+                    full_layer_h = full_layer_h[:, -keep:]
+                layer_hiddens.append(full_layer_h.to(last_dev, non_blocking=True))
+            self.main_hidden = torch.cat(layer_hiddens, dim=-1)
+
+        return final_logits
+
+    @torch.inference_mode()
+    def forward(self, input_ids: torch.Tensor, start_pos: int = 0) -> torch.Tensor:
+        """input_ids [b, s] (long) -> logits for the last position [b, vocab] (fp32)."""
+        stages = self._get_stages()
+        seqlen = input_ids.shape[1]
+        chunk_size = int(os.environ.get("DSV41_PIPELINE_CHUNK_SIZE", "2048"))
+        use_pipeline = (
+            os.environ.get("DSV41_PIPELINE", "1") != "0"
+            and len(stages) > 1
+            and seqlen >= chunk_size * 2
+        )
+        if use_pipeline:
+            return self.forward_pipelined(input_ids, start_pos=start_pos, chunk_size=chunk_size)
+        return self._forward_sequential(input_ids, start_pos=start_pos)

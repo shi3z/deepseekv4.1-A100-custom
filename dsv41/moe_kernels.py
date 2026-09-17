@@ -74,46 +74,88 @@ _TILE_CACHE: dict = {}
 
 
 class GroupedPairs:
-    """Host-side bookkeeping for one MoE dispatch: pairs sorted by expert + tile table."""
+    """Bookkeeping for one MoE dispatch: pairs sorted by expert + tile table.
 
-    def __init__(self, expert_ids: torch.Tensor, row_in: torch.Tensor, row_out: torch.Tensor, weight: torch.Tensor, block_m: int):
+    Constructed fully on GPU with zero host-device synchronization.
+    """
+
+    def __init__(
+        self,
+        expert_ids: torch.Tensor,
+        row_in: torch.Tensor,
+        row_out: torch.Tensor,
+        weight: torch.Tensor,
+        block_m: int,
+        n_experts: int = 384,
+    ):
         self.n_pairs = int(expert_ids.numel())
         self.block_m = block_m
+        dev = expert_ids.device
         if self.n_pairs <= 64:
             # decode: one tile per pair, no sorting and no host<->device sync
-            self.expert = expert_ids.to(torch.int32).contiguous()
-            self.row_in = row_in.to(torch.int32).contiguous()
-            self.row_out = row_out.to(torch.int32).contiguous()
-            self.weight = weight.to(torch.float32).contiguous()
+            self.expert = expert_ids.to(device=dev, dtype=torch.int32).contiguous()
+            self.row_in = row_in.to(device=dev, dtype=torch.int32).contiguous()
+            self.row_out = row_out.to(device=dev, dtype=torch.int32).contiguous()
+            self.weight = weight.to(device=dev, dtype=torch.float32).contiguous()
             self.tile_expert = self.expert
-            key = (self.n_pairs, expert_ids.device)
+            key = (self.n_pairs, dev)
             t = _TILE_CACHE.get(key)
             if t is None:
-                t = _TILE_CACHE[key] = (torch.arange(self.n_pairs, dtype=torch.int32, device=expert_ids.device),
-                                       torch.ones(self.n_pairs, dtype=torch.int32, device=expert_ids.device))
+                t = _TILE_CACHE[key] = (
+                    torch.arange(self.n_pairs, dtype=torch.int32, device=dev),
+                    torch.ones(self.n_pairs, dtype=torch.int32, device=dev),
+                )
             self.tile_start, self.tile_count = t
             return
+
         order = torch.argsort(expert_ids, stable=True)
-        self.expert = expert_ids[order].to(torch.int32).contiguous()
-        self.row_in = row_in[order].to(torch.int32).contiguous()
-        self.row_out = row_out[order].to(torch.int32).contiguous()
-        self.weight = weight[order].to(torch.float32).contiguous()
-        # tiles: for each expert, ceil(count / block_m) tiles of consecutive pairs
-        counts = torch.bincount(self.expert.long(), minlength=int(expert_ids.max().item()) + 1 if self.n_pairs else 1)
+        self.order = order
+        self.expert = expert_ids[order].to(device=dev, dtype=torch.int32).contiguous()
+        self.row_in = row_in[order].to(device=dev, dtype=torch.int32).contiguous()
+        self.row_out = row_out[order].to(device=dev, dtype=torch.int32).contiguous()
+        self.weight = weight[order].to(device=dev, dtype=torch.float32).contiguous()
+
+        # Pure GPU vector tile calculation without any host-device synchronization!
+        counts = torch.bincount(self.expert.long(), minlength=n_experts)
         starts = torch.cumsum(counts, 0) - counts
-        te, ts = [], []
-        counts_l, starts_l = counts.tolist(), starts.tolist()
-        for e, (c, s0) in enumerate(zip(counts_l, starts_l)):
-            for t in range(0, c, block_m):
-                te.append(e)
-                ts.append(s0 + t)
-        dev = expert_ids.device
-        self.tile_expert = torch.tensor(te, dtype=torch.int32, device=dev)
-        self.tile_start = torch.tensor(ts, dtype=torch.int32, device=dev)
-        # rows past an expert's last pair must not leak into the next expert: build a per-pair mask
-        # by clamping each tile's rows to its expert's range (done in kernel via p_mask + count)
-        self.tile_count = torch.tensor([min(block_m, c - t) for c, s0 in zip(counts_l, starts_l) for t in range(0, c, block_m)],
-                                       dtype=torch.int32, device=dev)
+        n_tiles_per_exp = (counts + (block_m - 1)) // block_m
+        exp_ids = torch.arange(n_experts, dtype=torch.int32, device=dev)
+        self.tile_expert = torch.repeat_interleave(exp_ids, n_tiles_per_exp)
+        tile_starts_per_exp = torch.cumsum(n_tiles_per_exp, 0) - n_tiles_per_exp
+        global_tile_idx = torch.arange(self.tile_expert.numel(), dtype=torch.int32, device=dev)
+        local_t = global_tile_idx - tile_starts_per_exp[self.tile_expert]
+        self.tile_start = (starts[self.tile_expert].to(torch.int32) + local_t * block_m).contiguous()
+        self.tile_count = torch.clamp(
+            counts[self.tile_expert].to(torch.int32) - local_t * block_m,
+            min=0,
+            max=block_m,
+        ).contiguous()
+
+    def make_p2(
+        self,
+        row_in: torch.Tensor,
+        row_out: torch.Tensor,
+        weight: torch.Tensor | None = None,
+    ) -> "GroupedPairs":
+        """Re-use the tile structure and sorting order from p1 to construct p2 instantly with 0 sync."""
+        p2 = object.__new__(GroupedPairs)
+        p2.n_pairs = self.n_pairs
+        p2.block_m = self.block_m
+        p2.expert = self.expert
+        p2.order = getattr(self, "order", None)
+        dev = self.expert.device
+        if p2.order is not None:
+            p2.row_in = row_in[p2.order].to(device=dev, dtype=torch.int32).contiguous()
+            p2.row_out = row_out[p2.order].to(device=dev, dtype=torch.int32).contiguous()
+            p2.weight = self.weight if weight is None else weight[p2.order].to(device=dev, dtype=torch.float32).contiguous()
+        else:
+            p2.row_in = row_in.to(device=dev, dtype=torch.int32).contiguous()
+            p2.row_out = row_out.to(device=dev, dtype=torch.int32).contiguous()
+            p2.weight = self.weight if weight is None else weight.to(device=dev, dtype=torch.float32).contiguous()
+        p2.tile_expert = self.tile_expert
+        p2.tile_start = self.tile_start
+        p2.tile_count = self.tile_count
+        return p2
 
 
 def grouped_fp4_gemm(a: torch.Tensor, w: torch.Tensor, s: torch.Tensor, pairs: GroupedPairs, n_out_rows: int,
@@ -123,13 +165,6 @@ def grouped_fp4_gemm(a: torch.Tensor, w: torch.Tensor, s: torch.Tensor, pairs: G
     K = a.shape[1]
     E, N = w.shape[0], w.shape[1]
 
-    # Triton pointer arguments must all be CUDA tensors on the device
-    # on which this GEMM is launched.  Some paths (notably DSpark/MTP)
-    # can construct GroupedPairs bookkeeping on CPU even though A/W/S
-    # live on CUDA.
-    #
-    # Normalize the complete pair table here rather than relying on
-    # every caller to construct it on the correct device.
     dev = a.device
 
     _pair_fields = (
@@ -141,15 +176,9 @@ def grouped_fp4_gemm(a: torch.Tensor, w: torch.Tensor, s: torch.Tensor, pairs: G
         ("tile_count", torch.int32),
     )
 
-    moved = []
-
     for _name, _dtype in _pair_fields:
         _t = getattr(pairs, _name)
-
         if _t.device != dev or _t.dtype != _dtype or not _t.is_contiguous():
-            moved.append(
-                f"{_name}:{_t.device}->{dev}"
-            )
             setattr(
                 pairs,
                 _name,
@@ -159,64 +188,6 @@ def grouped_fp4_gemm(a: torch.Tensor, w: torch.Tensor, s: torch.Tensor, pairs: G
                     non_blocking=True,
                 ).contiguous(),
             )
-
-    if moved:
-        print(
-            "[grouped-fp4] normalized pair tensors: "
-            + ", ".join(moved),
-            flush=True,
-        )
-
-    # Give a useful error here instead of an opaque Triton pointer error.
-    if w.device != dev or s.device != dev:
-        raise RuntimeError(
-            "grouped_fp4_gemm device mismatch: "
-            f"a={a.device} w={w.device} s={s.device}"
-        )
-
-    # Triton pointer arguments must all be CUDA tensors on the device
-    # on which this GEMM is launched.  Some paths (notably DSpark/MTP)
-    # can construct GroupedPairs bookkeeping on CPU even though A/W/S
-    # live on CUDA.
-    #
-    # Normalize the complete pair table here rather than relying on
-    # every caller to construct it on the correct device.
-    dev = a.device
-
-    _pair_fields = (
-        ("row_in", torch.int32),
-        ("row_out", torch.int32),
-        ("weight", torch.float32),
-        ("tile_expert", torch.int32),
-        ("tile_start", torch.int32),
-        ("tile_count", torch.int32),
-    )
-
-    moved = []
-
-    for _name, _dtype in _pair_fields:
-        _t = getattr(pairs, _name)
-
-        if _t.device != dev or _t.dtype != _dtype or not _t.is_contiguous():
-            moved.append(
-                f"{_name}:{_t.device}->{dev}"
-            )
-            setattr(
-                pairs,
-                _name,
-                _t.to(
-                    device=dev,
-                    dtype=_dtype,
-                    non_blocking=True,
-                ).contiguous(),
-            )
-
-    if moved:
-        print(
-            "[grouped-fp4] normalized pair tensors: "
-            + ", ".join(moved),
-            flush=True,
-        )
 
     # Give a useful error here instead of an opaque Triton pointer error.
     if w.device != dev or s.device != dev:
