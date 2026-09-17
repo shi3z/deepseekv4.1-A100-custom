@@ -28,7 +28,7 @@ HC_FORK = os.environ.get("DSV41_HC_FORK", "1") == "1"  # hyper-connection mixes 
 
 
 class DecodeRuntime:
-    def __init__(self, model: Transformer, use_graphs: bool = True):
+    def __init__(self, model: Transformer, use_graphs: bool = True, max_batch: int | None = None):
         self.m = model
         args = model.args
         self.cfg = args.cfg
@@ -45,7 +45,7 @@ class DecodeRuntime:
                 self.segments.append((blk.device, [blk]))
         self.devices = [d for d, _ in self.segments]
         hc, dim = self.cfg["hc_mult"], self.cfg["dim"]
-        B = self.B = args.max_batch_size  # rows decoded together; row r is a token at position pos[r] of sequence seq[r]
+        B = self.B = int(max_batch) if max_batch is not None else args.max_batch_size  # rows decoded together; row r is a token at position pos[r] of sequence seq[r]
         self.pos = {d: torch.zeros(B, dtype=torch.int64, device=d) for d in self.devices}
         S = self.S = args.max_seqs or B  # sequence slots (the caches are sized by it)
         self.seq = {d: torch.arange(B, dtype=torch.int64, device=d) % S for d in self.devices}

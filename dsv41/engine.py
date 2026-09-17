@@ -102,13 +102,27 @@ class Engine:
         if offload_experts:
             from .decode import OffloadDecodeRuntime
             self.rt = OffloadDecodeRuntime(self.model, use_graphs=use_graphs)
+            self.rt_b1 = None
         elif ep:
             from .ep import EPRuntime
             self.rt = EPRuntime(self.model, use_graphs=use_graphs)
+            if self.max_seqs > 1 and self.rt.B > 1:
+                print(f"[engine-init] creating dedicated B=1 decode runtime for single-request speed...", flush=True)
+                self.rt_b1 = EPRuntime(self.model, use_graphs=use_graphs, max_batch=1)
+            else:
+                self.rt_b1 = None
         else:
             self.rt = DecodeRuntime(self.model, use_graphs=use_graphs)
+            if self.max_seqs > 1 and self.rt.B > 1:
+                self.rt_b1 = DecodeRuntime(self.model, use_graphs=use_graphs, max_batch=1)
+            else:
+                self.rt_b1 = None
         if use_graphs:
             self.rt.capture()
+            if self.rt_b1 is not None:
+                print(f"[engine-init] capturing dedicated B=1 CUDA graphs...", flush=True)
+                self.rt_b1.capture()
+                print(f"[engine-init] dedicated B=1 CUDA graphs captured successfully", flush=True)
         self.ds = None
 
         if self.mtp:
@@ -3538,33 +3552,51 @@ class Engine:
             with self.lock:
                 active_ids = list(self._active_slots.keys())
                 n_active = len(active_ids)
-                toks, poss, seqs, pmaxs = [], [], [], []
-                for s_id in active_ids:
+
+                # Adaptive decode dispatch:
+                # If only 1 request is active and dedicated B=1 runtime is available,
+                # execute on B=1 graph to achieve ~60+ tok/s (no MoE sorting/bucketing overhead).
+                if n_active == 1 and self.rt_b1 is not None:
+                    s_id = active_ids[0]
                     req = self._active_slots[s_id]
-                    toks.append(req.next_token)
-                    poss.append(req.pos)
-                    seqs.append(s_id)
-                    pmaxs.append(req.pos)
-
-                # Padding to fixed batch size B with slot 0 (dummy rows)
-                for _ in range(B - n_active):
-                    toks.append(0)
-                    poss.append(0)
-                    seqs.append(0)
-                    pmaxs.append(0)
-
-                try:
-                    logits = self.rt.step(toks, poss, seq=seqs, pmax=pmaxs)
-                except Exception as exc:
-                    print(f"[batched-engine] decode step error: {exc}", flush=True)
-                    traceback.print_exc()
-                    for s_id in active_ids:
-                        req = self._active_slots[s_id]
+                    try:
+                        logits = self.rt_b1.step([req.next_token], [req.pos], seq=[s_id], pmax=[req.pos])
+                    except Exception as exc:
+                        print(f"[batched-engine] single-decode step error: {exc}", flush=True)
+                        traceback.print_exc()
                         req.error = exc
                         req.done_event.set()
                         self._free_decode_slots.append(s_id)
-                    self._active_slots.clear()
-                    continue
+                        del self._active_slots[s_id]
+                        continue
+                else:
+                    toks, poss, seqs, pmaxs = [], [], [], []
+                    for s_id in active_ids:
+                        req = self._active_slots[s_id]
+                        toks.append(req.next_token)
+                        poss.append(req.pos)
+                        seqs.append(s_id)
+                        pmaxs.append(req.pos)
+
+                    # Padding to fixed batch size B with slot 0 (dummy rows)
+                    for _ in range(B - n_active):
+                        toks.append(0)
+                        poss.append(0)
+                        seqs.append(0)
+                        pmaxs.append(0)
+
+                    try:
+                        logits = self.rt.step(toks, poss, seq=seqs, pmax=pmaxs)
+                    except Exception as exc:
+                        print(f"[batched-engine] decode step error: {exc}", flush=True)
+                        traceback.print_exc()
+                        for s_id in active_ids:
+                            req = self._active_slots[s_id]
+                            req.error = exc
+                            req.done_event.set()
+                            self._free_decode_slots.append(s_id)
+                        self._active_slots.clear()
+                        continue
 
                 # Batch sampling optimization:
                 # When all slots are greedy (temperature <= 0), execute a single batched argmax

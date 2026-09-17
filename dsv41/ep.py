@@ -40,8 +40,8 @@ from .model import Block, Transformer, _hc_pre
 
 
 class EPRuntime(DecodeRuntime):
-    def __init__(self, model: Transformer, use_graphs: bool = True):
-        super().__init__(model, use_graphs=False)
+    def __init__(self, model: Transformer, use_graphs: bool = True, max_batch: int | None = None):
+        super().__init__(model, use_graphs=False, max_batch=max_batch)
         self.use_graphs = use_graphs
         self.devs = [torch.device(f"cuda:{d}") for d in dict.fromkeys(b.device.index for b in model.blocks)]
         # every device in the pipeline order; expert shards live on all of them
