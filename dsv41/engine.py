@@ -2671,6 +2671,7 @@ class Engine:
             )
         return logits
 
+    @torch.inference_mode()
     def _prefill_with_gpu_slot_reuse(
         self,
         prompt_ids: list[int],
@@ -3945,6 +3946,7 @@ class Engine:
             flush=True,
         )
 
+    @torch.inference_mode()
     def _batch_worker_loop(self):
         B = self.rt.B
         while not self._batch_stop_event.is_set():

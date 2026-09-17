@@ -173,7 +173,7 @@ class Handler(BaseHTTPRequestHandler):
         created = int(time.time())
         t0 = time.perf_counter()
         print(
-          f"[chat] prompt_tokens={len(ids)} "
+          f"[chat] START req_id={rid} prompt_tokens={len(ids)} "
           f"max_seq_len={eng.max_seq_len} "
           f"max_tokens={params.max_new_tokens} (effective) "
           f"stream={body.get('stream')}",
@@ -382,6 +382,7 @@ class Handler(BaseHTTPRequestHandler):
 
             dt_gen = time.perf_counter() - t_gen_0
             decode_tok_s = getattr(eng, "last_decode_tok_s", None) or (n / max(dt_gen, 1e-6))
+            print(f"[chat] END req_id={rid} tokens={n} time={dt_gen:.2f}s ({decode_tok_s:.1f} tok/s decode)", flush=True)
             if STATS_TRACKER and n > 0:
                 STATS_TRACKER.record_throughput(decode_tok_s, "chat-stream")
                 STATS_TRACKER.record_cache_event(
@@ -391,9 +392,19 @@ class Handler(BaseHTTPRequestHandler):
         if STATS_TRACKER:
             STATS_TRACKER.record_request_start(len(ids), stream=False)
         t_gen_0 = time.perf_counter()
-        text, n = eng.generate_text(ids, params)
+        try:
+            text, n = eng.generate_text(ids, params)
+        except Exception as e:
+            tb = traceback.format_exc()
+            print(f"\n[chat-error] non-streaming generation failed req_id={rid}: {e}\n{tb}", flush=True)
+            try:
+                Path("/tmp/dsv41-last-traceback.log").write_text(tb)
+            except Exception:
+                pass
+            return self._json(500, {"error": {"message": str(e), "type": "server_error", "traceback": tb}}, t0=t0, is_stream=False)
         dt_gen = time.perf_counter() - t_gen_0
         decode_tok_s = getattr(eng, "last_decode_tok_s", None) or (n / max(dt_gen, 1e-6))
+        print(f"[chat] END req_id={rid} tokens={n} time={dt_gen:.2f}s ({decode_tok_s:.1f} tok/s decode)", flush=True)
         if STATS_TRACKER and n > 0:
             STATS_TRACKER.record_throughput(decode_tok_s, "chat")
             STATS_TRACKER.record_cache_event(
@@ -456,7 +467,16 @@ class Handler(BaseHTTPRequestHandler):
         if STATS_TRACKER:
             STATS_TRACKER.record_request_start(len(ids), stream=False)
         t_gen_0 = time.perf_counter()
-        text, n = eng.generate_text(ids, params)
+        try:
+            text, n = eng.generate_text(ids, params)
+        except Exception as e:
+            tb = traceback.format_exc()
+            print(f"\n[completion-error] generation failed req_id={rid}: {e}\n{tb}", flush=True)
+            try:
+                Path("/tmp/dsv41-last-traceback.log").write_text(tb)
+            except Exception:
+                pass
+            return self._json(500, {"error": {"message": str(e), "type": "server_error", "traceback": tb}}, t0=t0, is_stream=False)
         dt_gen = time.perf_counter() - t_gen_0
         decode_tok_s = getattr(eng, "last_decode_tok_s", None) or (n / max(dt_gen, 1e-6))
         if STATS_TRACKER and n > 0:

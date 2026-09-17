@@ -459,6 +459,7 @@ class DecodeRuntime:
         torch.cuda.synchronize()
         self._graph_cache_signature = self._cache_signature()
 
+    @torch.inference_mode()
     def copy_seq(self, src: int, dst: int, req_id: str = ""):
         """Copy every per-sequence state (window rings, compressed caches, index keys, compressor rings, Engram history)
         from sequence slot src to slot dst (used to prefill sequences one at a time into slot 0)."""
@@ -482,15 +483,18 @@ class DecodeRuntime:
 
             C = A.compressor
             if C is not None and C.ratio > 1:
-                for idx, t in enumerate((C.kv_ring, C.score_ring, C.kv_state, C.score_state)):
+                attrs = ("kv_ring", "score_ring", "kv_state", "score_state")
+                for attr in attrs:
+                    t = getattr(C, attr)
                     if torch.is_inference(t):
                         print(
-                            f"[tensor-audit] level=slot req_id={req_id} name=compressor_ring[{blk.layer_id}][{idx}] "
+                            f"[tensor-audit] level=slot req_id={req_id} name=compressor_{attr}[{blk.layer_id}] "
                             f"shape={tuple(t.shape)} dev={t.device} is_inference=True op=copy_seq({src}->{dst}) healing with clone",
                             flush=True,
                         )
                         with torch.inference_mode(False):
                             t = t.clone()
+                        setattr(C, attr, t)
                     t[dst].copy_(t[src])
 
         for name, table in (("compress_kv", self.m.shared.compress_kv), ("index_k", self.m.shared.index_k)):
@@ -508,10 +512,6 @@ class DecodeRuntime:
                     with torch.inference_mode(False):
                         table[key] = cache.clone()
                         cache = table[key]
-                assert not torch.is_inference(cache), (
-                    f"[tensor-audit] FAIL: {name}[{key}] shape={tuple(cache.shape)} dev={cache.device} "
-                    f"is_inference={torch.is_inference(cache)} op=copy_seq({src}->{dst})"
-                )
                 cache[dst].copy_(cache[src])
 
         if self.m.engram_hash is not None:
@@ -564,7 +564,7 @@ class DecodeRuntime:
                 _ckv_backup = {k: v[:, :1].clone() for k, v in shared.compress_kv.items()}
                 _idx_backup = {k: v[:, :1].clone() for k, v in shared.index_k.items()}
                 self.capture()
-                with torch.inference_mode(False):
+                with torch.inference_mode():
                     for k, v in _ckv_backup.items():
                         shared.compress_kv[k][:, :1].copy_(v)
                     for k, v in _idx_backup.items():

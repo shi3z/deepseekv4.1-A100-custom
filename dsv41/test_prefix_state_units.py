@@ -116,4 +116,51 @@ class PrefixStateTests(unittest.TestCase):
         self.assertEqual(copied, []) # best_slot is 0, no copy needed!
         self.assertEqual(forwarded, [(prompt, 84)])
 
+    def test_copy_seq_with_inference_tensors(self):
+        from .decode import DecodeRuntime
+        rt = DecodeRuntime.__new__(DecodeRuntime)
+        with torch.inference_mode():
+            wkv = torch.ones(5, 8, 4)
+            ckv = torch.ones(5, 16, 4)
+            idx_k = torch.ones(5, 16, 2)
+            c_ring = torch.ones(5, 8, 4)
+            s_ring = torch.ones(5, 8, 4)
+            c_state = torch.ones(5, 8, 4)
+            s_state = torch.ones(5, 8, 4)
+            eng_cache = torch.ones(5, 32, dtype=torch.int64)
+
+        compressor = SimpleNamespace(
+            ratio=2,
+            kv_ring=c_ring,
+            score_ring=s_ring,
+            kv_state=c_state,
+            score_state=s_state,
+        )
+        attn = SimpleNamespace(layer_id=0, window_kv_cache=wkv, compressor=compressor)
+        block = SimpleNamespace(layer_id=0, attn=attn)
+        shared = SimpleNamespace(
+            compress_kv={(0, 'cpu'): ckv},
+            index_k={(0, 'cpu'): idx_k},
+        )
+        engram_hash = SimpleNamespace(cache=eng_cache)
+        rt.m = SimpleNamespace(blocks=[block], shared=shared, engram_hash=engram_hash)
+
+        # Set slot 0 with distinct values
+        with torch.inference_mode():
+            wkv[0].fill_(42.0)
+            ckv[0].fill_(43.0)
+            idx_k[0].fill_(44.0)
+            c_ring[0].fill_(45.0)
+            eng_cache[0].fill_(46)
+
+        # Ensure calling copy_seq OUTSIDE inference mode works seamlessly without RuntimeError
+        self.assertFalse(torch.is_inference_mode_enabled())
+        rt.copy_seq(0, 2)
+
+        self.assertTrue(torch.equal(attn.window_kv_cache[2], attn.window_kv_cache[0]))
+        self.assertTrue(torch.equal(shared.compress_kv[(0, 'cpu')][2], shared.compress_kv[(0, 'cpu')][0]))
+        self.assertTrue(torch.equal(shared.index_k[(0, 'cpu')][2], shared.index_k[(0, 'cpu')][0]))
+        self.assertTrue(torch.equal(compressor.kv_ring[2], compressor.kv_ring[0]))
+        self.assertTrue(torch.equal(engram_hash.cache[2], engram_hash.cache[0]))
+
 if __name__ == '__main__': unittest.main()

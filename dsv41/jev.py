@@ -280,7 +280,7 @@ class JevPrefixTree:
         snap_level = snap.get("level", level)
         first_audit = level not in _LOGGED_LEVELS
 
-        with torch.inference_mode(False):
+        with torch.inference_mode():
             for blk in self.model.blocks:
                 saved = snap["window_kv"][blk.layer_id]
                 target = blk.attn.window_kv_cache
@@ -289,17 +289,9 @@ class JevPrefixTree:
                 if is_inf or (first_audit and blk.layer_id == 0):
                     print(
                         f"[tensor-audit] level={level} req_id={req_id} name=window_kv_cache[{blk.layer_id}] "
-                        f"shape={tuple(target.shape)} dev={target.device} is_inference={is_inf} op={op_name}"
-                        + (" healing with clone" if is_inf else ""),
+                        f"shape={tuple(target.shape)} dev={target.device} is_inference={is_inf} op={op_name}",
                         flush=True,
                     )
-                if is_inf:
-                    blk.attn.window_kv_cache = target.clone()
-                    target = blk.attn.window_kv_cache
-                assert not torch.is_inference(target), (
-                    f"[tensor-audit] FAIL: level={level} req_id={req_id} name=window_kv_cache[{blk.layer_id}] "
-                    f"shape={tuple(target.shape)} dev={target.device} is_inference=True op={op_name}"
-                )
                 target[:batch_size].copy_(saved)
 
             for (owner, dev), cache in self.model.shared.compress_kv.items():
@@ -310,17 +302,9 @@ class JevPrefixTree:
                 if is_inf or (first_audit and (owner, dev) == next(iter(self.model.shared.compress_kv))):
                     print(
                         f"[tensor-audit] level={level} req_id={req_id} name=compress_kv[({owner},{dev})] "
-                        f"shape={tuple(cache.shape)} dev={cache.device} is_inference={is_inf} op={op_name}"
-                        + (" healing with clone" if is_inf else ""),
+                        f"shape={tuple(cache.shape)} dev={cache.device} is_inference={is_inf} op={op_name}",
                         flush=True,
                     )
-                if is_inf:
-                    self.model.shared.compress_kv[(owner, dev)] = cache.clone()
-                    cache = self.model.shared.compress_kv[(owner, dev)]
-                assert not torch.is_inference(cache), (
-                    f"[tensor-audit] FAIL: level={level} req_id={req_id} name=compress_kv[({owner},{dev})] "
-                    f"shape={tuple(cache.shape)} dev={cache.device} is_inference=True op={op_name}"
-                )
                 cache[:batch_size, :rows].copy_(saved)
 
             for (owner, dev), cache in self.model.shared.index_k.items():
@@ -331,17 +315,9 @@ class JevPrefixTree:
                 if is_inf or (first_audit and (owner, dev) == next(iter(self.model.shared.index_k))):
                     print(
                         f"[tensor-audit] level={level} req_id={req_id} name=index_k[({owner},{dev})] "
-                        f"shape={tuple(cache.shape)} dev={cache.device} is_inference={is_inf} op={op_name}"
-                        + (" healing with clone" if is_inf else ""),
+                        f"shape={tuple(cache.shape)} dev={cache.device} is_inference={is_inf} op={op_name}",
                         flush=True,
                     )
-                if is_inf:
-                    self.model.shared.index_k[(owner, dev)] = cache.clone()
-                    cache = self.model.shared.index_k[(owner, dev)]
-                assert not torch.is_inference(cache), (
-                    f"[tensor-audit] FAIL: level={level} req_id={req_id} name=index_k[({owner},{dev})] "
-                    f"shape={tuple(cache.shape)} dev={cache.device} is_inference=True op={op_name}"
-                )
                 cache[:batch_size, :rows].copy_(saved)
 
             if getattr(self.model, "engram_hash", None) is not None and snap.get("engram") is not None:
@@ -352,17 +328,9 @@ class JevPrefixTree:
                 if is_inf or first_audit:
                     print(
                         f"[tensor-audit] level={level} req_id={req_id} name=engram_hash.cache "
-                        f"shape={tuple(target.shape)} dev={target.device} is_inference={is_inf} op={op_name}"
-                        + (" healing with clone" if is_inf else ""),
+                        f"shape={tuple(target.shape)} dev={target.device} is_inference={is_inf} op={op_name}",
                         flush=True,
                     )
-                if is_inf:
-                    self.model.engram_hash.cache = target.clone()
-                    target = self.model.engram_hash.cache
-                assert not torch.is_inference(target), (
-                    f"[tensor-audit] FAIL: level={level} req_id={req_id} name=engram_hash.cache "
-                    f"shape={tuple(target.shape)} dev={target.device} is_inference=True op={op_name}"
-                )
                 target[:batch_size, :end_pos].copy_(saved)
 
             _LOGGED_LEVELS.add(level)
