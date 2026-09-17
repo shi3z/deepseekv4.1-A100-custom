@@ -323,7 +323,7 @@ def load_model(ckpt_path: str, devices: list[int], max_seq_len: int = 16384, max
     # -----------------------------------------------------------------
 
     cache_init_tokens = int(
-        os.environ.get("DSV41_CACHE_INIT_TOKENS", "32768")
+        os.environ.get("DSV41_CACHE_INIT_TOKENS", "131072")
     )
 
     cache_init_tokens = max(

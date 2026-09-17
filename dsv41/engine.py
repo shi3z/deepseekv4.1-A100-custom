@@ -46,19 +46,53 @@ class _BatchRequest:
         self.result_text = ""
         self.result_count = 0
         self.error: Exception | None = None
+        self.start_time = time.perf_counter()
+        self.first_token_time = 0.0
+        self.live_text = ""
+        self.slot_id = -1
+        self.decode_tok_s = 0.0
 
 
 def sample_token(logits: torch.Tensor, temperature: float, top_p: float, gen: torch.Generator | None) -> int:
     if temperature <= 0:
-        return int(logits.argmax(dim=-1).item())
-    probs = torch.softmax(logits.float() / temperature, dim=-1)
-    if 0 < top_p < 1:
-        sp, si = probs.sort(descending=True)
-        keep = (sp.cumsum(-1) - sp) < top_p  # keep tokens until cumulative mass passes top_p
-        sp = sp * keep
-        idx = torch.multinomial(sp / sp.sum(), 1, generator=gen)
-        return int(si.gather(-1, idx).item())
-    return int(torch.multinomial(probs, 1, generator=gen).item())
+        try:
+            return int(logits.argmax(dim=-1).item())
+        except Exception:
+            return 0
+    try:
+        # Sanitize logits against NaN/Inf
+        logits_f = torch.nan_to_num(logits.float(), nan=-1e4, posinf=1e4, neginf=-1e4)
+        scaled_logits = logits_f / max(float(temperature), 1e-4)
+        probs = torch.softmax(scaled_logits, dim=-1)
+        probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+
+        if 0 < top_p < 1:
+            sp, si = probs.sort(descending=True)
+            keep = (sp.cumsum(-1) - sp) < top_p  # keep tokens until cumulative mass passes top_p
+            keep[..., 0] = True  # Always keep at least the top-1 token
+            sp = sp * keep
+            mass = sp.sum()
+            if mass <= 0 or torch.isnan(mass) or torch.isinf(mass):
+                return int(si[0].item())
+            norm_sp = sp / mass
+            if torch.isnan(norm_sp).any() or torch.isinf(norm_sp).any() or (norm_sp < 0).any():
+                return int(si[0].item())
+            idx = torch.multinomial(norm_sp, 1, generator=gen)
+            return int(si.gather(-1, idx).item())
+
+        mass = probs.sum()
+        if mass <= 0 or torch.isnan(mass) or torch.isinf(mass):
+            return int(logits_f.argmax(dim=-1).item())
+        norm_probs = probs / mass
+        if torch.isnan(norm_probs).any() or torch.isinf(norm_probs).any() or (norm_probs < 0).any():
+            return int(logits_f.argmax(dim=-1).item())
+        return int(torch.multinomial(norm_probs, 1, generator=gen).item())
+    except Exception as exc:
+        print(f"[sample_token] fallback to argmax due to: {exc}", flush=True)
+        try:
+            return int(logits.argmax(dim=-1).item())
+        except Exception:
+            return 0
 
 
 class Engine:
@@ -186,6 +220,26 @@ class Engine:
         self.current_phase = "idle"
         self.current_context_tokens = 0
         self.prefill_history: collections.deque = collections.deque(maxlen=30)
+        self._slot_lock = threading.Lock()
+        self.slot_states: dict[int, dict] = {}
+        self._last_decode_log_time = 0.0
+        self.last_decode_tok_s: float | None = None
+        slots_to_track = list(range(1, self.max_seqs)) if self.max_seqs > 1 else [0]
+        for s in slots_to_track:
+            self.slot_states[s] = {
+                "slot_id": s,
+                "status": "idle",
+                "req_id": "",
+                "prompt_tokens": 0,
+                "generated_tokens": 0,
+                "max_tokens": 0,
+                "tok_s": 0.0,
+                "start_time": 0.0,
+                "first_tok_time": 0.0,
+                "elapsed_s": 0.0,
+                "recent_text": "",
+                "completed_at": 0.0,
+            }
         if self.max_seqs > 1:
             self._init_batch_scheduler()
 
@@ -266,15 +320,25 @@ class Engine:
                         "allocated_tokens": t.size(1) * ratio,
                     }
 
-        # Active decode slots
-        active_slots_info = []
-        for slot_id, req in list(getattr(self, "_active_slots", {}).items()):
-            active_slots_info.append({
-                "slot_id": slot_id,
-                "pos": req.pos,
-                "out_tokens": len(req.out_tokens),
-                "max_new": req.max_new,
-            })
+        # Active decode slots with live progress and text preview
+        slots_list = []
+        active_cnt = 0
+        combined_tok_s = 0.0
+        now_t = time.perf_counter()
+        with getattr(self, "_slot_lock", threading.Lock()):
+            for s_id in sorted(getattr(self, "slot_states", {}).keys()):
+                st = dict(self.slot_states[s_id])
+                # Reset stale completed slots after 60 seconds of inactivity
+                if st.get("status") == "completed" and (now_t - st.get("completed_at", 0)) > 60.0:
+                    st["status"] = "idle"
+                    st["recent_text"] = ""
+                    st["generated_tokens"] = 0
+                    st["tok_s"] = 0.0
+                    self.slot_states[s_id] = st
+                if st.get("status") in ("generating", "prefilling"):
+                    active_cnt += 1
+                    combined_tok_s += st.get("tok_s", 0.0)
+                slots_list.append(st)
 
         return {
             "prefix_entries": entries,
@@ -287,10 +351,13 @@ class Engine:
             "current_context_tokens": current_ctx,
             "max_context_tokens": max_context,
             "context_pct": round(current_ctx / max(max_context, 1) * 100, 2),
-            "active_slots": active_slots_info,
+            "active_slots": slots_list,
+            "slots": slots_list,
+            "active_decode_slots": active_cnt,
+            "combined_decode_tok_s": round(combined_tok_s, 1),
             "last_prefill": getattr(self, "last_prefill_stats", None),
             "prefill_history": list(getattr(self, "prefill_history", [])),
-            "current_phase": getattr(self, "current_phase", "idle"),
+            "current_phase": "decode" if active_cnt > 0 else getattr(self, "current_phase", "idle"),
         }
 
     # ---------------------------------------------------------------- prompts
@@ -1160,7 +1227,7 @@ class Engine:
         block_replay = (
             os.environ.get(
                 "DSV41_PREFIX_BLOCK_REPLAY",
-                "0",
+                "1",
             ) == "1"
         )
 
@@ -2193,6 +2260,28 @@ class Engine:
                     )
                     continue
 
+                if (
+                    torch.is_tensor(src)
+                    and torch.is_tensor(dst)
+                    and src.dtype == dst.dtype
+                    and kind == "dict"
+                    and src.ndim == dst.ndim
+                    and tuple(src.shape[:1]) == tuple(dst.shape[:1])
+                    and tuple(src.shape[2:]) == tuple(dst.shape[2:])
+                    and src.shape[1] > dst.shape[1]
+                ):
+                    try:
+                        owner = key[0] if isinstance(key, tuple) else None
+                        table_kind = "index_k" if "index_k" in str(key) or "index_k" in str(holder) else "compress_kv"
+                        shared = getattr(self.model, "shared", None)
+                        if shared and hasattr(shared, "grow_cache_rows") and owner is not None:
+                            shared.grow_cache_rows(table_kind, owner, src.shape[1])
+                            table = getattr(shared, table_kind, None)
+                            if table and key in table:
+                                dst = table[key]
+                    except Exception as grow_err:
+                        pass
+
                 _shape_ok = (
                     torch.is_tensor(src)
                     and torch.is_tensor(dst)
@@ -3125,6 +3214,21 @@ class Engine:
                 out: list[int] = []
                 decoded_upto = 0
                 pending = ""
+                t0_single = time.perf_counter()
+                last_single_log = t0_single
+                with getattr(self, "_slot_lock", threading.Lock()):
+                    st = self.slot_states.get(0, {})
+                    st["slot_id"] = 0
+                    st["status"] = "generating"
+                    st["req_id"] = "single"
+                    st["prompt_tokens"] = len(prompt_ids)
+                    st["generated_tokens"] = 0
+                    st["max_tokens"] = max_new
+                    st["start_time"] = t0_single
+                    st["first_tok_time"] = t0_single
+                    st["recent_text"] = ""
+                    st["tok_s"] = 0.0
+                    self.slot_states[0] = st
                 for step in range(max_new):
                     t = sample_token(logits[0], p.temperature, p.top_p, gen)
                     if t == self.eos:
@@ -3133,15 +3237,33 @@ class Engine:
                          f"max_new={max_new}",
                          flush=True,
                         )
-
                         break
                     out.append(t)
+                    if self.stats_tracker is not None:
+                        try:
+                            self.stats_tracker.record_decode_tokens(1)
+                        except Exception:
+                            pass
                     # decode incrementally; hold back a partial multi-byte character
                     text = self.tok.decode(out[decoded_upto:])
                     if "\ufffd" in text:
                         piece = ""
                     else:
                         piece, decoded_upto = text, len(out)
+                    now_single = time.perf_counter()
+                    dt_single = max(now_single - t0_single, 1e-4)
+                    tok_s_single = round(len(out) / dt_single, 1)
+                    with getattr(self, "_slot_lock", threading.Lock()):
+                        st = self.slot_states.get(0, {})
+                        st["generated_tokens"] = len(out)
+                        st["tok_s"] = tok_s_single
+                        st["elapsed_s"] = round(dt_single, 2)
+                        st["recent_text"] = self.tok.decode(out[-100:], errors="replace")
+                        self.slot_states[0] = st
+                    if now_single - last_single_log >= 1.0:
+                        last_single_log = now_single
+                        tail = self.tok.decode(out[-30:], errors="replace").replace("\n", " ").replace("\r", "")
+                        print(f"[decode] slot 0: {len(out)}/{max_new} tok ({tok_s_single:.1f} t/s) \"{tail}\"", flush=True)
                     if piece:
                         pending += piece
                         if p.stop and any(s in pending for s in p.stop):
@@ -3159,6 +3281,18 @@ class Engine:
                         yield out[-1], tail
             finally:
                 self.current_phase = "idle"
+                dt_final = max(time.perf_counter() - t0_single, 1e-4) if "t0_single" in locals() else 0.0
+                with getattr(self, "_slot_lock", threading.Lock()):
+                    if 0 in self.slot_states:
+                        st = self.slot_states[0]
+                        st["status"] = "completed"
+                        st["generated_tokens"] = len(out) if "out" in locals() else 0
+                        st["tok_s"] = round(len(out) / dt_final, 1) if ("out" in locals() and dt_final > 0) else 0.0
+                        st["elapsed_s"] = round(dt_final, 2)
+                        st["recent_text"] = self.tok.decode(out[-1500:], errors="replace") if ("out" in locals() and out) else ""
+                        st["completed_at"] = time.perf_counter()
+                if "out" in locals() and dt_final > 0:
+                    self.last_decode_tok_s = round(len(out) / dt_final, 1)
 
     def _generate_mtp_locked(
         self,
@@ -3657,6 +3791,21 @@ class Engine:
                 except queue.Empty:
                     break
                 slot_id = self._free_decode_slots.pop(0)
+                req.slot_id = slot_id
+                with self._slot_lock:
+                    st = self.slot_states.get(slot_id, {})
+                    st["slot_id"] = slot_id
+                    st["status"] = "prefilling"
+                    st["req_id"] = req.req_id
+                    st["prompt_tokens"] = len(req.prompt_ids)
+                    st["generated_tokens"] = 0
+                    st["max_tokens"] = req.max_new
+                    st["start_time"] = time.perf_counter()
+                    st["first_tok_time"] = 0.0
+                    st["elapsed_s"] = 0.0
+                    st["tok_s"] = 0.0
+                    st["recent_text"] = ""
+                    self.slot_states[slot_id] = st
                 try:
                     with self.lock:
                         # Prefill using slot 0 (fully compatible with prefix-cache / snapshots)
@@ -3671,10 +3820,27 @@ class Engine:
                             req.result_count = 0
                             req.done_event.set()
                             self._free_decode_slots.append(slot_id)
+                            with self._slot_lock:
+                                st = self.slot_states.get(slot_id, {})
+                                st["status"] = "completed"
+                                st["generated_tokens"] = 0
+                                st["recent_text"] = ""
+                                st["completed_at"] = time.perf_counter()
+                                self.slot_states[slot_id] = st
                             print(f"[batched-engine] prompt immediately reached EOS for slot={slot_id}", flush=True)
                         else:
                             req.out_tokens.append(first_tok)
+                            req.first_token_time = time.perf_counter()
+                            first_piece = self.tok.decode([first_tok], errors="replace")
+                            req.live_text = first_piece
                             self._active_slots[slot_id] = req
+                            with self._slot_lock:
+                                st = self.slot_states.get(slot_id, {})
+                                st["status"] = "generating"
+                                st["first_tok_time"] = req.first_token_time
+                                st["generated_tokens"] = 1
+                                st["recent_text"] = first_piece
+                                self.slot_states[slot_id] = st
                             print(f"[batched-engine] prefilled slot={slot_id} prompt_tokens={len(req.prompt_ids)}", flush=True)
                 except Exception as e:
                     print(f"[batched-engine] prefill error on slot={slot_id}: {e}", flush=True)
@@ -3682,6 +3848,10 @@ class Engine:
                     req.error = e
                     req.done_event.set()
                     self._free_decode_slots.append(slot_id)
+                    with self._slot_lock:
+                        st = self.slot_states.get(slot_id, {})
+                        st["status"] = "idle"
+                        self.slot_states[slot_id] = st
 
             # 2. Decode active slots in batch
             if not self._active_slots:
@@ -3707,6 +3877,10 @@ class Engine:
                         req.done_event.set()
                         self._free_decode_slots.append(s_id)
                         del self._active_slots[s_id]
+                        with self._slot_lock:
+                            st = self.slot_states.get(s_id, {})
+                            st["status"] = "idle"
+                            self.slot_states[s_id] = st
                         continue
                 else:
                     toks, poss, seqs, pmaxs = [], [], [], []
@@ -3734,6 +3908,10 @@ class Engine:
                             req.error = exc
                             req.done_event.set()
                             self._free_decode_slots.append(s_id)
+                            with self._slot_lock:
+                                st = self.slot_states.get(s_id, {})
+                                st["status"] = "idle"
+                                self.slot_states[s_id] = st
                         self._active_slots.clear()
                         continue
 
@@ -3748,15 +3926,28 @@ class Engine:
                     greedy_cached = None
                     for idx, s_id in enumerate(active_ids):
                         req = self._active_slots[s_id]
-                        if req.params.temperature <= 0:
-                            if greedy_cached is None:
-                                greedy_cached = logits[:n_active].argmax(dim=-1).tolist()
-                            sampled_tokens.append(greedy_cached[idx])
-                        else:
-                            slot_logits = logits[idx]
-                            sampled_tokens.append(sample_token(slot_logits, req.params.temperature, req.params.top_p, req.gen))
+                        try:
+                            if req.params.temperature <= 0:
+                                if greedy_cached is None:
+                                    greedy_cached = logits[:n_active].argmax(dim=-1).tolist()
+                                sampled_tokens.append(greedy_cached[idx])
+                            else:
+                                slot_logits = logits[idx]
+                                sampled_tokens.append(sample_token(slot_logits, req.params.temperature, req.params.top_p, req.gen))
+                        except Exception as exc:
+                            print(f"[batched-engine] sampling fallback on slot={s_id}: {exc}", flush=True)
+                            try:
+                                sampled_tokens.append(int(logits[idx].argmax(dim=-1).item()))
+                            except Exception:
+                                sampled_tokens.append(self.eos)
 
                 finished = []
+                now = time.perf_counter()
+                if self.stats_tracker is not None and n_active > 0:
+                    try:
+                        self.stats_tracker.record_decode_tokens(n_active)
+                    except Exception:
+                        pass
                 for idx, s_id in enumerate(active_ids):
                     req = self._active_slots[s_id]
                     t = sampled_tokens[idx]
@@ -3770,10 +3961,10 @@ class Engine:
                     # Fast stop condition check: inspect small trailing window to avoid O(N^2) decodes
                     is_stopped = False
                     if req.params.stop and not is_eos:
-                        tail_text = self.tok.decode(req.out_tokens[-32:])
+                        tail_text = self.tok.decode(req.out_tokens[-32:], errors="replace")
                         for s in req.params.stop:
                             if s in tail_text:
-                                full_text = self.tok.decode(req.out_tokens)
+                                full_text = self.tok.decode(req.out_tokens, errors="replace")
                                 cut = full_text.find(s)
                                 if cut != -1:
                                     req.result_text = full_text[:cut]
@@ -3783,17 +3974,61 @@ class Engine:
 
                     if is_eos or is_max or is_stopped:
                         if not is_stopped:
-                            req.result_text = self.tok.decode(req.out_tokens)
+                            req.result_text = self.tok.decode(req.out_tokens, errors="replace")
                             req.result_count = len(req.out_tokens)
                         req.done_event.set()
                         finished.append(s_id)
+                        dt_gen = max(now - (req.first_token_time or req.start_time), 1e-4)
+                        tok_s = round(req.result_count / dt_gen, 1)
+                        req.decode_tok_s = tok_s
+                        self.last_decode_tok_s = tok_s
+                        with self._slot_lock:
+                            st = self.slot_states.get(s_id, {})
+                            st["status"] = "completed"
+                            st["generated_tokens"] = req.result_count
+                            st["tok_s"] = tok_s
+                            st["elapsed_s"] = round(now - req.start_time, 2)
+                            st["recent_text"] = req.result_text[-1500:] if len(req.result_text) > 1500 else req.result_text
+                            st["completed_at"] = now
+                            self.slot_states[s_id] = st
                         print(
                             f"[batched-engine] finished slot={s_id} tokens={req.result_count} "
+                            f"in {dt_gen:.2f}s ({tok_s} tok/s) "
                             f"reason={'eos' if is_eos else ('max' if is_max else 'stop')}",
                             flush=True,
                         )
                     else:
                         req.next_token = t
+                        piece = self.tok.decode([t], errors="replace")
+                        req.live_text += piece
+                        if len(req.live_text) > 2000:
+                            req.live_text = req.live_text[-1500:]
+                        n_tok = len(req.out_tokens)
+                        dt_gen = max(now - (req.first_token_time or req.start_time), 1e-4)
+                        tok_s = round(n_tok / dt_gen, 1)
+                        with self._slot_lock:
+                            st = self.slot_states.get(s_id, {})
+                            st["status"] = "generating"
+                            st["generated_tokens"] = n_tok
+                            st["tok_s"] = tok_s
+                            st["elapsed_s"] = round(now - req.start_time, 2)
+                            st["recent_text"] = req.live_text
+                            self.slot_states[s_id] = st
+
+                # Periodic console decode log across active slots in batch (approx every 1s)
+                if now - getattr(self, "_last_decode_log_time", 0.0) >= 1.0:
+                    self._last_decode_log_time = now
+                    parts = []
+                    for sid in active_ids:
+                        if sid not in finished:
+                            r = self._active_slots[sid]
+                            n = len(r.out_tokens)
+                            dt = max(now - (r.first_token_time or r.start_time), 1e-4)
+                            ts = n / dt
+                            tail = (r.live_text[-35:] if len(r.live_text) > 35 else r.live_text).replace("\n", " ").replace("\r", "")
+                            parts.append(f"slot {sid}: {n}/{r.max_new} tok ({ts:.1f} t/s) \"{tail}\"")
+                    if parts:
+                        print(f"[decode] {' | '.join(parts)}", flush=True)
 
                 for s_id in finished:
                     del self._active_slots[s_id]
@@ -3815,6 +4050,7 @@ class Engine:
         req.done_event.wait()
         if req.error:
             raise req.error
+        self.last_decode_tok_s = getattr(req, "decode_tok_s", None)
         return req.result_text, req.result_count
 
 

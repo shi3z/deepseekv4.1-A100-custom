@@ -43,6 +43,8 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):  # quieter log
+        if getattr(self, "path", "") in ("/api/metrics", "/api/stats", "/health", "/favicon.ico"):
+            return
         print(f"[{time.strftime('%H:%M:%S')}] {self.address_string()} {fmt % args}", flush=True)
 
     def _json(self, code: int, obj: dict, t0: float | None = None, is_stream: bool = False):
@@ -77,7 +79,14 @@ class Handler(BaseHTTPRequestHandler):
     def _dashboard(self):
         if not STATS_TRACKER:
             return self._json(500, {"error": "stats tracker not initialized"})
-        html = STATS_TRACKER.render_dashboard_html(ENGINE.model_name if ENGINE else "deepseek-v4.1-flash").encode("utf-8")
+        try:
+            import dsv41.stats as _st_mod
+            import importlib
+            importlib.reload(_st_mod)
+            model_name = ENGINE.model_name if ENGINE else "deepseek-v4.1-flash"
+            html = _st_mod._DASHBOARD_HTML_TEMPLATE.replace("__MODEL_NAME__", model_name).encode("utf-8")
+        except Exception:
+            html = STATS_TRACKER.render_dashboard_html(ENGINE.model_name if ENGINE else "deepseek-v4.1-flash").encode("utf-8")
         try:
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -372,10 +381,11 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             dt_gen = time.perf_counter() - t_gen_0
+            decode_tok_s = getattr(eng, "last_decode_tok_s", None) or (n / max(dt_gen, 1e-6))
             if STATS_TRACKER and n > 0:
-                STATS_TRACKER.record_throughput(n / max(dt_gen, 1e-6), "chat-stream")
+                STATS_TRACKER.record_throughput(decode_tok_s, "chat-stream")
                 STATS_TRACKER.record_cache_event(
-                    f"Chat stream completed: {n} tokens in {dt_gen:.2f}s ({n / max(dt_gen, 1e-6):.1f} tok/s)"
+                    f"Chat stream completed: {n} tokens in {dt_gen:.2f}s ({decode_tok_s:.1f} tok/s decode)"
                 )
             return
         if STATS_TRACKER:
@@ -383,10 +393,11 @@ class Handler(BaseHTTPRequestHandler):
         t_gen_0 = time.perf_counter()
         text, n = eng.generate_text(ids, params)
         dt_gen = time.perf_counter() - t_gen_0
+        decode_tok_s = getattr(eng, "last_decode_tok_s", None) or (n / max(dt_gen, 1e-6))
         if STATS_TRACKER and n > 0:
-            STATS_TRACKER.record_throughput(n / max(dt_gen, 1e-6), "chat")
+            STATS_TRACKER.record_throughput(decode_tok_s, "chat")
             STATS_TRACKER.record_cache_event(
-                f"Chat completed: {n} tokens in {dt_gen:.2f}s ({n / max(dt_gen, 1e-6):.1f} tok/s)"
+                f"Chat completed: {n} tokens in {dt_gen:.2f}s ({decode_tok_s:.1f} tok/s decode)"
             )
         msg = eng.parse_completion(text, thinking)
         content = msg.get("content") if isinstance(msg, dict) else text
@@ -400,7 +411,7 @@ class Handler(BaseHTTPRequestHandler):
             out["choices"][0]["message"]["tool_calls"] = msg["tool_calls"]
         self._json(200, out, t0=t0, is_stream=False)
 
-    # ---------------------------------------------------------------- raw completions
+    # ------------------------------------------------ raw completions
     def _completion(self, body: dict):
         eng = ENGINE
         t0 = time.perf_counter()
@@ -430,10 +441,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
                 dt_gen = time.perf_counter() - t_gen_0
+                decode_tok_s = getattr(eng, "last_decode_tok_s", None) or (n / max(dt_gen, 1e-6))
                 if STATS_TRACKER and n > 0:
-                    STATS_TRACKER.record_throughput(n / max(dt_gen, 1e-6), "completion-stream")
+                    STATS_TRACKER.record_throughput(decode_tok_s, "completion-stream")
                     STATS_TRACKER.record_cache_event(
-                        f"Completion stream: {n} tokens in {dt_gen:.2f}s ({n / max(dt_gen, 1e-6):.1f} tok/s)"
+                        f"Completion stream: {n} tokens in {dt_gen:.2f}s ({decode_tok_s:.1f} tok/s decode)"
                     )
             except (BrokenPipeError, ConnectionResetError):
                 elapsed = time.perf_counter() - t0
@@ -446,10 +458,11 @@ class Handler(BaseHTTPRequestHandler):
         t_gen_0 = time.perf_counter()
         text, n = eng.generate_text(ids, params)
         dt_gen = time.perf_counter() - t_gen_0
+        decode_tok_s = getattr(eng, "last_decode_tok_s", None) or (n / max(dt_gen, 1e-6))
         if STATS_TRACKER and n > 0:
-            STATS_TRACKER.record_throughput(n / max(dt_gen, 1e-6), "completion")
+            STATS_TRACKER.record_throughput(decode_tok_s, "completion")
             STATS_TRACKER.record_cache_event(
-                f"Completion: {n} tokens in {dt_gen:.2f}s ({n / max(dt_gen, 1e-6):.1f} tok/s)"
+                f"Completion: {n} tokens in {dt_gen:.2f}s ({decode_tok_s:.1f} tok/s decode)"
             )
         self._json(200, {"id": rid, "object": "text_completion", "created": created, "model": eng.model_name,
                           "choices": [{"index": 0, "text": text, "finish_reason": "length" if n >= params.max_new_tokens else "stop"}],

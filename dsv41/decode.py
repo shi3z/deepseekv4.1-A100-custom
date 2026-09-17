@@ -553,12 +553,27 @@ class DecodeRuntime:
                 shared._ensure_capacity(table, owner, needed, name)
         if self.graphs and self._cache_signature() != getattr(self, "_graph_cache_signature", None):
             # Replaying a graph after reallocation reads stale pointers.
-            # Recapture performs warm-up writes into model state; use eager
-            # execution until an explicit safe recapture instead.
+            # Safely recapture CUDA graphs so decode stays on the fast graph path (~60 tok/s).
             for device in self.devices:
                 torch.cuda.synchronize(device)
-            self.graphs.clear()
-            print("[decode-cache] cache storage changed; using eager decode", flush=True)
+            try:
+                print(f"[decode-cache] cache storage changed; recapturing CUDA graphs for {self.__class__.__name__} (B={self.B})...", flush=True)
+                # Preserve row 0 across all slots so warm-up writes do not clobber existing prompt/decode KV state
+                _ckv_backup = {k: v[:, :1].clone() for k, v in shared.compress_kv.items()}
+                _idx_backup = {k: v[:, :1].clone() for k, v in shared.index_k.items()}
+                self.capture()
+                with torch.inference_mode(False):
+                    for k, v in _ckv_backup.items():
+                        shared.compress_kv[k][:, :1].copy_(v)
+                    for k, v in _idx_backup.items():
+                        shared.index_k[k][:, :1].copy_(v)
+                for device in self.devices:
+                    torch.cuda.synchronize(device)
+                self._graph_cache_signature = self._cache_signature()
+                print(f"[decode-cache] CUDA graphs successfully recaptured for {self.__class__.__name__}", flush=True)
+            except Exception as _recap_exc:
+                print(f"[decode-cache] CUDA graph recapture failed ({_recap_exc}); falling back to eager decode", flush=True)
+                self.graphs.clear()
 
     def set_rows(self, token, pos, seq=None, pmax=None):
         """Fill the row tables: token(s), position(s), sequence id per row (default 0..B-1) and the newest position
