@@ -365,10 +365,10 @@ class SharedAttn:
         # Long cold-prefill can run close to the VRAM limit. In exact mode
         # avoid doubling a 64K allocation to 128K when only a few more
         # rows are needed; the temporary attention buffers need that headroom.
-        if os.environ.get("DSV41_EXACT_CACHE_GROW", "0") == "1":
-            # In exact mode, allocate at least a small headroom chunk (e.g. 1024 rows, ~5MB)
-            # so that decoding does not reallocate and synchronize GPUs on every single token.
-            grow_chunk = int(os.environ.get("DSV41_CACHE_GROW_CHUNK", "1024"))
+        if os.environ.get("DSV41_EXACT_CACHE_GROW", "0") == "1" or current >= 65536:
+            # In exact mode or when table is already large (>=64K), allocate a bounded chunk
+            # instead of doubling an already massive buffer and causing OOM.
+            grow_chunk = int(os.environ.get("DSV41_CACHE_GROW_CHUNK", "4096"))
             target = max(need_rows, current + grow_chunk)
         else:
             target = max(need_rows, max(current * 2, 1))

@@ -462,6 +462,8 @@ class DecodeRuntime:
     def copy_seq(self, src: int, dst: int, req_id: str = ""):
         """Copy every per-sequence state (window rings, compressed caches, index keys, compressor rings, Engram history)
         from sequence slot src to slot dst (used to prefill sequences one at a time into slot 0)."""
+        if src == dst:
+            return
         global _LOGGED_SLOT
         first_audit = not _LOGGED_SLOT
 

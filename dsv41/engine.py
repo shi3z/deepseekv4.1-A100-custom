@@ -222,6 +222,8 @@ class Engine:
         self.prefill_history: collections.deque = collections.deque(maxlen=30)
         self._slot_lock = threading.Lock()
         self.slot_states: dict[int, dict] = {}
+        self._slot_tokens: dict[int, list[int]] = {}
+        self._slot_tokens_lock = threading.Lock()
         self._last_decode_log_time = 0.0
         self.last_decode_tok_s: float | None = None
         slots_to_track = list(range(1, self.max_seqs)) if self.max_seqs > 1 else [0]
@@ -231,6 +233,8 @@ class Engine:
                 "status": "idle",
                 "req_id": "",
                 "prompt_tokens": 0,
+                "reused_tokens": 0,
+                "reused_slot": -1,
                 "generated_tokens": 0,
                 "max_tokens": 0,
                 "tok_s": 0.0,
@@ -2067,7 +2071,7 @@ class Engine:
             int(
                 os.environ.get(
                     "DSV41_PREFIX_CACHE_ENTRIES",
-                    "512",
+                    "16",
                 )
             ),
         )
@@ -2075,7 +2079,7 @@ class Engine:
         max_gb = float(
             os.environ.get(
                 "DSV41_PREFIX_CACHE_GB",
-                "256",
+                "64",
             )
         )
 
@@ -2600,6 +2604,130 @@ class Engine:
 
         return len(entries), total
 
+    def _find_best_gpu_slot(self, prompt_ids: list[int]) -> tuple[int, int]:
+        """Find the GPU sequence slot with the longest common prefix against prompt_ids.
+        Returns (best_slot, best_lcp_length). If no slot matches, returns (-1, 0)."""
+        best_slot = -1
+        best_lcp = 0
+        with getattr(self, "_slot_tokens_lock", threading.Lock()):
+            items = list(self._slot_tokens.items())
+
+        for slot_id, tokens in items:
+            if not tokens:
+                continue
+            lcp = self._prompt_lcp(tokens, prompt_ids)
+            # Prefer slot 0 on tie because slot 0 is already the prefill scratchpad
+            if lcp > best_lcp or (lcp == best_lcp and slot_id == 0 and best_slot != 0):
+                best_lcp = lcp
+                best_slot = slot_id
+        return best_slot, best_lcp
+
+    @torch.inference_mode()
+    def _forward_prefix_continuation(
+        self,
+        prompt_ids: list[int],
+        start_pos: int,
+        chunk_size: int = 512,
+    ) -> torch.Tensor:
+        """Prefill only the tail tokens [start_pos : len(prompt_ids)] using model.forward.
+        Slot 0 must already contain the valid KV cache up to start_pos."""
+        total = len(prompt_ids)
+        if start_pos >= total:
+            raise ValueError(f"start_pos {start_pos} >= total {total}")
+
+        chunk_size = max(
+            16,
+            int(os.environ.get("DSV41_GPU_PREFIX_CHUNK_SIZE", str(chunk_size))),
+        )
+
+        use_mtp_tail = bool(
+            getattr(self, "mtp", 0)
+            and getattr(self, "ds", None) is not None
+        )
+
+        model = self.model
+        old_collect = getattr(model, "collect_main_hidden", None)
+        if old_collect is not None and use_mtp_tail:
+            model.collect_main_hidden = tuple(self.ds.targets)
+
+        self._set_prefix_replay_mode(True)
+        pos = start_pos
+        logits = None
+        try:
+            while pos < total:
+                end_pos = min(total, pos + chunk_size)
+                chunk_ids = prompt_ids[pos:end_pos]
+                input_tensor = torch.tensor([chunk_ids], dtype=torch.long)
+                logits = model.forward(input_tensor, pos)
+                if use_mtp_tail and hasattr(model, "main_hidden") and model.main_hidden is not None:
+                    self._write_prefix_draft_hidden(model.main_hidden, end_pos)
+                pos = end_pos
+        finally:
+            self._set_prefix_replay_mode(False)
+
+        if logits is None:
+            raise RuntimeError(
+                f"No logits produced in _forward_prefix_continuation (start_pos={start_pos}, total={total})"
+            )
+        return logits
+
+    def _prefill_with_gpu_slot_reuse(
+        self,
+        prompt_ids: list[int],
+        best_slot: int,
+        best_lcp: int,
+        req_id: str = "",
+    ) -> tuple[torch.Tensor, int]:
+        """Reuse existing GPU KV cache from best_slot, forward only the suffix delta on slot 0."""
+        t0 = time.perf_counter()
+        total = len(prompt_ids)
+
+        # 1. If best_slot is not slot 0, copy its per-sequence state to slot 0 on GPU
+        if best_slot != 0:
+            self.rt.copy_seq(best_slot, 0, req_id=req_id)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+
+        # 2. Align reuse_pos to compression ratio boundary (multiple of 16).
+        # If best_lcp matches the entire prompt, keep at least 1-16 tokens to compute logits.
+        if best_lcp >= total:
+            reuse_pos = max(0, total - 16)
+        else:
+            reuse_pos = (best_lcp // 16) * 16
+
+        suffix_len = total - reuse_pos
+        print(
+            f"[gpu-slot-cache] HIT best_slot={best_slot} "
+            f"lcp={best_lcp:,}/{total:,} ({best_lcp/total*100:.1f}%) "
+            f"reuse_pos={reuse_pos:,} suffix={suffix_len:,}",
+            flush=True,
+        )
+
+        # 3. Forward suffix tokens on slot 0
+        chunk_size = int(os.environ.get("DSV41_GPU_PREFIX_CHUNK_SIZE", "512"))
+        logits = self._forward_prefix_continuation(prompt_ids, reuse_pos, chunk_size=chunk_size)
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        dt = time.perf_counter() - t0
+        print(
+            f"[gpu-slot-cache] COMPLETED suffix={suffix_len:,} in {dt:.3f}s "
+            f"({suffix_len / max(dt, 1e-4):.1f} tok/s) "
+            f"effective_speed={total / max(dt, 1e-4):,.1f} tok/s",
+            flush=True,
+        )
+
+        self._record_prefill_stats(
+            mode="gpu_slot_hit",
+            total=total,
+            reused=reuse_pos,
+            new_tokens=suffix_len,
+            dt=dt,
+        )
+
+        return logits, reuse_pos
+
     @torch.inference_mode()
     def _prefill_with_prefix_reuse(
         self,
@@ -2683,6 +2811,37 @@ class Engine:
         )
 
         total = len(prompt_ids)
+
+        # ------------------------------------------------------------
+        # Level 1 Cache: In-GPU Sequence Slot Cache.
+        #
+        # If any GPU decode slot or prefill slot 0 already retains a
+        # prefix of prompt_ids in VRAM, avoid all host RAM restore, PCIe
+        # traffic, and slow rollback.
+        # ------------------------------------------------------------
+        use_gpu_cache = (
+            os.environ.get("DSV41_GPU_PREFIX_CACHE", "1") != "0"
+        )
+        min_gpu_prefix = int(
+            os.environ.get("DSV41_GPU_PREFIX_MIN", "64")
+        )
+        best_gpu_slot, best_gpu_lcp = self._find_best_gpu_slot(prompt_ids)
+
+        if use_gpu_cache and best_gpu_slot >= 0 and best_gpu_lcp >= min_gpu_prefix:
+            try:
+                logits, reused_pos = self._prefill_with_gpu_slot_reuse(
+                    prompt_ids,
+                    best_gpu_slot,
+                    best_gpu_lcp,
+                )
+                return logits, reused_pos
+            except Exception as exc:
+                print(
+                    f"[gpu-slot-cache] GPU continuation failed ({exc}), "
+                    f"falling back to host snapshots...",
+                    flush=True,
+                )
+                traceback.print_exc()
 
         # Search ALL retained host-RAM snapshots.
         entry = self._find_prefix_cache_entry(
@@ -3209,6 +3368,8 @@ class Engine:
                 logits, _prefix_reused = self._prefill_with_prefix_reuse(
                     prompt_ids
                 )
+                with getattr(self, "_slot_tokens_lock", threading.Lock()):
+                    self._slot_tokens[0] = list(prompt_ids)
                 self.current_phase = "decode"
                 pos = len(prompt_ids)
                 out: list[int] = []
@@ -3239,6 +3400,9 @@ class Engine:
                         )
                         break
                     out.append(t)
+                    with getattr(self, "_slot_tokens_lock", threading.Lock()):
+                        if 0 in self._slot_tokens:
+                            self._slot_tokens[0].append(t)
                     if self.stats_tracker is not None:
                         try:
                             self.stats_tracker.record_decode_tokens(1)
@@ -3790,7 +3954,15 @@ class Engine:
                     req = self._batch_queue.get_nowait()
                 except queue.Empty:
                     break
-                slot_id = self._free_decode_slots.pop(0)
+
+                # Smart slot assignment: if a GPU slot retains the best prefix and is currently free, reuse it!
+                best_gpu_slot, best_gpu_lcp = self._find_best_gpu_slot(req.prompt_ids)
+                if best_gpu_slot in self._free_decode_slots and best_gpu_slot != 0:
+                    self._free_decode_slots.remove(best_gpu_slot)
+                    slot_id = best_gpu_slot
+                else:
+                    slot_id = self._free_decode_slots.pop(0)
+
                 req.slot_id = slot_id
                 with self._slot_lock:
                     st = self.slot_states.get(slot_id, {})
@@ -3798,6 +3970,8 @@ class Engine:
                     st["status"] = "prefilling"
                     st["req_id"] = req.req_id
                     st["prompt_tokens"] = len(req.prompt_ids)
+                    st["reused_tokens"] = best_gpu_lcp
+                    st["reused_slot"] = best_gpu_slot
                     st["generated_tokens"] = 0
                     st["max_tokens"] = req.max_new
                     st["start_time"] = time.perf_counter()
@@ -3808,11 +3982,14 @@ class Engine:
                     self.slot_states[slot_id] = st
                 try:
                     with self.lock:
-                        # Prefill using slot 0 (fully compatible with prefix-cache / snapshots)
+                        # Prefill using slot 0 (fully compatible with prefix-cache / snapshots / GPU cache)
                         logits, _reused = self._prefill_with_prefix_reuse(req.prompt_ids)
                         first_tok = sample_token(logits[0], req.params.temperature, req.params.top_p, req.gen)
                         # Copy per-sequence cache state from slot 0 to target decode slot
                         self.rt.copy_seq(0, slot_id, req_id=req.req_id)
+                        with getattr(self, "_slot_tokens_lock", threading.Lock()):
+                            self._slot_tokens[0] = list(req.prompt_ids)
+                            self._slot_tokens[slot_id] = list(req.prompt_ids)
                         req.pos = len(req.prompt_ids)
                         req.next_token = first_tok
                         if first_tok == self.eos:
@@ -3830,6 +4007,9 @@ class Engine:
                             print(f"[batched-engine] prompt immediately reached EOS for slot={slot_id}", flush=True)
                         else:
                             req.out_tokens.append(first_tok)
+                            with getattr(self, "_slot_tokens_lock", threading.Lock()):
+                                if slot_id in self._slot_tokens:
+                                    self._slot_tokens[slot_id].append(first_tok)
                             req.first_token_time = time.perf_counter()
                             first_piece = self.tok.decode([first_tok], errors="replace")
                             req.live_text = first_piece
@@ -3848,6 +4028,9 @@ class Engine:
                     req.error = e
                     req.done_event.set()
                     self._free_decode_slots.append(slot_id)
+                    with getattr(self, "_slot_tokens_lock", threading.Lock()):
+                        if slot_id in self._slot_tokens:
+                            del self._slot_tokens[slot_id]
                     with self._slot_lock:
                         st = self.slot_states.get(slot_id, {})
                         st["status"] = "idle"
@@ -3877,6 +4060,9 @@ class Engine:
                         req.done_event.set()
                         self._free_decode_slots.append(s_id)
                         del self._active_slots[s_id]
+                        with getattr(self, "_slot_tokens_lock", threading.Lock()):
+                            if s_id in self._slot_tokens:
+                                del self._slot_tokens[s_id]
                         with self._slot_lock:
                             st = self.slot_states.get(s_id, {})
                             st["status"] = "idle"
@@ -3908,6 +4094,9 @@ class Engine:
                             req.error = exc
                             req.done_event.set()
                             self._free_decode_slots.append(s_id)
+                            with getattr(self, "_slot_tokens_lock", threading.Lock()):
+                                if s_id in self._slot_tokens:
+                                    del self._slot_tokens[s_id]
                             with self._slot_lock:
                                 st = self.slot_states.get(s_id, {})
                                 st["status"] = "idle"
@@ -3956,6 +4145,9 @@ class Engine:
                     is_eos = (t == self.eos)
                     if not is_eos:
                         req.out_tokens.append(t)
+                        with getattr(self, "_slot_tokens_lock", threading.Lock()):
+                            if s_id in self._slot_tokens:
+                                self._slot_tokens[s_id].append(t)
                     is_max = (len(req.out_tokens) >= req.max_new)
 
                     # Fast stop condition check: inspect small trailing window to avoid O(N^2) decodes

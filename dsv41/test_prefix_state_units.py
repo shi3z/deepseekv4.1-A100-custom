@@ -57,4 +57,63 @@ class PrefixStateTests(unittest.TestCase):
         e._restore_prefix_state(snap)
         self.assertTrue(torch.equal(e.model.shared.compress_kv[(2, 'cpu')][:, :4], torch.ones(1, 4, 2)))
 
+    def test_find_best_gpu_slot(self):
+        e = Engine.__new__(Engine)
+        e._slot_tokens = {}
+        # Empty slots
+        slot, lcp = e._find_best_gpu_slot([1, 2, 3])
+        self.assertEqual(slot, -1)
+        self.assertEqual(lcp, 0)
+
+        # Slot 1 has partial match, Slot 2 has longer match
+        e._slot_tokens = {
+            1: [10, 20, 30, 40],
+            2: [10, 20, 30, 40, 50, 60],
+            3: [99, 99],
+        }
+        slot, lcp = e._find_best_gpu_slot([10, 20, 30, 40, 50, 60, 70, 80])
+        self.assertEqual(slot, 2)
+        self.assertEqual(lcp, 6)
+
+        # Tie: prefer slot 0
+        e._slot_tokens = {
+            0: [1, 2, 3, 4],
+            1: [1, 2, 3, 4],
+        }
+        slot, lcp = e._find_best_gpu_slot([1, 2, 3, 4, 5])
+        self.assertEqual(slot, 0)
+        self.assertEqual(lcp, 4)
+
+    def test_gpu_slot_prefill_reuse(self):
+        e = Engine.__new__(Engine)
+        copied = []
+        forwarded = []
+        e.rt = SimpleNamespace(copy_seq=lambda src, dst, req_id="": copied.append((src, dst)))
+        e._forward_prefix_continuation = lambda prompt_ids, start_pos, chunk_size=512: (
+            forwarded.append((prompt_ids, start_pos)) or torch.tensor([[1.0, 2.0]])
+        )
+        e.last_prefill_stats = None
+        e.current_context_tokens = 0
+        import collections
+        e.prefill_history = collections.deque(maxlen=10)
+        e.stats_tracker = None
+
+        prompt = list(range(100)) # 100 tokens
+        logits, reused = e._prefill_with_gpu_slot_reuse(prompt, best_slot=2, best_lcp=85)
+        # best_lcp 85 -> aligned to 16: 80
+        self.assertEqual(reused, 80)
+        self.assertEqual(copied, [(2, 0)])
+        self.assertEqual(forwarded, [(prompt, 80)])
+        self.assertEqual(e.last_prefill_stats["mode"], "gpu_slot_hit")
+        self.assertEqual(e.last_prefill_stats["reused_tokens"], 80)
+        self.assertEqual(e.last_prefill_stats["new_tokens"], 20)
+
+        # Exact match (best_lcp == 100) -> reuse_pos max(0, 100 - 16) = 84
+        copied.clear()
+        forwarded.clear()
+        logits, reused = e._prefill_with_gpu_slot_reuse(prompt, best_slot=0, best_lcp=100)
+        self.assertEqual(reused, 84)
+        self.assertEqual(copied, []) # best_slot is 0, no copy needed!
+        self.assertEqual(forwarded, [(prompt, 84)])
+
 if __name__ == '__main__': unittest.main()
