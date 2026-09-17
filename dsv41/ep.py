@@ -492,26 +492,26 @@ class EPRuntime(DecodeRuntime):
         # capture-time shape metadata so a 1M-context model does not make
         # temporary graph workspaces explode.
         _logical_max_seq = self.m.args.max_seq_len
-        _graph_limit = min(_logical_max_seq, int(os.environ.get("DSV41_EP_GRAPH_TOKENS", "131072")))
+        _graph_limit = min(_logical_max_seq, int(os.environ.get("DSV41_EP_GRAPH_TOKENS", str(_logical_max_seq))))
         self.graph_token_limit = _graph_limit
         self.m.args.max_seq_len = _graph_limit
 
-        # Capture against compact, dedicated RoPE storage. Capturing pointers
-        # into the full 256K-1M tables triggers an illegal access in the
-        # Triton decode RoPE kernel on sm80 even though position zero is used.
-        # Keep these clones alive because the graph owns their pointers.
         self._graph_rope_tables = []
         _rope_restore = []
-        for blk in self.m.blocks:
-            attn = blk.attn
-            old_cos, old_sin = attn.cos, attn.sin
-            graph_cos = old_cos[:_graph_limit].clone()
-            graph_sin = old_sin[:_graph_limit].clone()
-            _rope_restore.append((attn, old_cos, old_sin))
-            attn.cos, attn.sin = graph_cos, graph_sin
-            if attn.indexer is not None:
-                attn.indexer.cos, attn.indexer.sin = graph_cos, graph_sin
-            self._graph_rope_tables.append((graph_cos, graph_sin))
+        # When graph_limit is explicitly clamped smaller than logical max_seq_len,
+        # slice and clone RoPE tables. For the full context (default), reuse the model's
+        # preallocated static tables directly to save VRAM and avoid eager drop.
+        if _graph_limit < _logical_max_seq:
+            for blk in self.m.blocks:
+                attn = blk.attn
+                old_cos, old_sin = attn.cos, attn.sin
+                graph_cos = old_cos[:_graph_limit].clone()
+                graph_sin = old_sin[:_graph_limit].clone()
+                _rope_restore.append((attn, old_cos, old_sin))
+                attn.cos, attn.sin = graph_cos, graph_sin
+                if attn.indexer is not None:
+                    attn.indexer.cos, attn.indexer.sin = graph_cos, graph_sin
+                self._graph_rope_tables.append((graph_cos, graph_sin))
         try:
             self.dry = True
             for d in self.devs:
@@ -567,9 +567,7 @@ class EPRuntime(DecodeRuntime):
         tok, p, sq = self.set_rows(token, pos, seq, pmax)
         self._engram_rows(tok, p, sq)
 
-        # Debug dynamic-cache growth vs captured CUDA Graph pointers.
-        # Switch to eager execution only around/after the 32K boundary.
-        _debug_eager = False
+        _force_eager = False
 
         if torch.is_tensor(p):
             _decode_pos = int(p.max().item())
@@ -578,7 +576,7 @@ class EPRuntime(DecodeRuntime):
         else:
             _decode_pos = int(p)
         if _decode_pos >= getattr(self, "graph_token_limit", self.m.args.max_seq_len):
-            _debug_eager = True
+            _force_eager = True
 
         if os.environ.get(
             "DSV41_DEBUG_EP_EAGER_BOUNDARY",
@@ -591,9 +589,9 @@ class EPRuntime(DecodeRuntime):
             else:
                 _debug_pos = int(p)
 
-            _debug_eager = _debug_pos >= 32760
+            _force_eager = _debug_pos >= 32760
 
-            if _debug_eager and (
+            if _force_eager and (
                 _debug_pos <= 32780
                 or _debug_pos % 256 == 0
             ):
@@ -606,7 +604,7 @@ class EPRuntime(DecodeRuntime):
         if (
             self.use_graphs
             and self.graphs
-            and not _debug_eager
+            and not _force_eager
         ):
             for d in self.devs:
                 self.graphs[d].replay()
