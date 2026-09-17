@@ -661,8 +661,8 @@ class Indexer:
         # ===============================================================
         # Continuation prefill has the same score scratch as cold prefill.
         # Bound it for every multi-token call, including prefix replay.
-        query_chunk = max(1, int(os.environ.get("DSV41_INDEX_QUERY_CHUNK", "128")))
-        if seqlen > query_chunk:
+        query_chunk = max(1, int(os.environ.get("DSV41_INDEX_QUERY_CHUNK", "64")))
+        if seqlen > 1:
             QUERY_CHUNK = query_chunk
 
             key_len = index_k.size(1)
@@ -673,6 +673,7 @@ class Indexer:
 
             # One conversion per layer instead of per query chunk.
             index_k_f = index_k.float()
+            kT = index_k_f.transpose(1, 2)
 
             idx_chunks = []
             candidate_chunks = [] if self.is_candidate_source else None
@@ -685,20 +686,20 @@ class Indexer:
                 qc = q[:, q0:q1].float()
                 wc = weights[:, q0:q1].float()
 
-                # [B,C,H,D] x [B,T,D] => [B,C,H,T]
-                score = torch.einsum(
-                    "bshd,btd->bsht",
-                    qc,
-                    index_k_f,
+                # Memory-efficient head accumulation: [B, C, T] instead of [B, C, H, T]
+                # Completely eliminates multi-GiB scratch tensors for long contexts (1M tokens).
+                score = torch.zeros(
+                    bsz,
+                    q1 - q0,
+                    key_len,
+                    dtype=torch.float32,
+                    device=x.device,
                 )
-
-                # Avoid another full [B,C,H,T] temporary.
-                score.relu_()
-                score.mul_(wc.unsqueeze(-1))
-
-                # Reduce heads immediately.
-                # [B,C,H,T] -> [B,C,T]
-                score = score.sum(dim=2)
+                for h_idx in range(self.n_heads):
+                    sh = torch.bmm(qc[:, :, h_idx], kT)
+                    sh.relu_()
+                    sh.mul_(wc[:, :, h_idx].unsqueeze(-1))
+                    score.add_(sh)
 
                 # Preserve original causal/compression visibility.
                 compress_lens = (
@@ -2347,7 +2348,8 @@ class Transformer:
         self,
         input_ids: torch.Tensor,
         start_pos: int = 0,
-        chunk_size: int = 512,
+        chunk_size: int = 2048,
+        progress_interval: int = 0,
     ) -> torch.Tensor:
         """Pipelined prefill across multi-GPU stages with chunked prompt tokens.
 
@@ -2393,6 +2395,10 @@ class Transformer:
         ev_start.record(torch.cuda.current_stream(dev0))
         for st in self._stage_streams:
             st.wait_event(ev_start)
+
+        t_pipe_start = time.perf_counter()
+        last_progress_time = t_pipe_start
+        last_progress_tokens = 0
 
         for t in range(T):
             for k in range(K - 1, -1, -1):
@@ -2448,6 +2454,30 @@ class Transformer:
                         self.shared.cleanup_chunk(m)
 
                     ev_stage_done[k][m].record(stream_k)
+
+                    # Periodic progress logging for long contexts
+                    if progress_interval > 0 and k == K - 1 and ((m + 1) % progress_interval == 0 or m == M - 1):
+                        ev_stage_done[k][m].synchronize()
+                        now = time.perf_counter()
+                        cur_tokens = c1
+                        dt_total = now - t_pipe_start
+                        dt_chunk = now - last_progress_time
+                        tok_chunk = cur_tokens - last_progress_tokens
+                        inst_spd = tok_chunk / max(dt_chunk, 1e-6)
+                        avg_spd = cur_tokens / max(dt_total, 1e-6)
+                        last_progress_time = now
+                        last_progress_tokens = cur_tokens
+                        mem_info = " / ".join(
+                            f"{(torch.cuda.mem_get_info(s['device'])[1] - torch.cuda.mem_get_info(s['device'])[0])/2**30:.1f}"
+                            for s in stages
+                        )
+                        print(
+                            f"[1M-prefill] chunk {m + 1:3d}/{M} ({cur_tokens:8,d}/{S:,} tok, {cur_tokens/S*100:4.1f}%) | "
+                            f"time: {dt_total:6.1f}s | "
+                            f"speed: {inst_spd:5.1f} tok/s (avg: {avg_spd:5.1f} tok/s) | "
+                            f"VRAM used: [{mem_info}] GiB",
+                            flush=True,
+                        )
 
         torch.cuda.current_stream(last_dev).wait_stream(self._stage_streams[-1])
         self.shared._current_chunk_idx = 0
