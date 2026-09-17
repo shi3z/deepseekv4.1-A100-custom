@@ -46,6 +46,9 @@ def main():
     ap.add_argument("--route-stats", default="", help="write per-layer expert hit counts (decode only) to this .pt file")
     ap.add_argument("--hot-experts", type=int, default=0, help="cpu offload mode: experts per layer kept on the GPU (by usage stats)")
     ap.add_argument("--hot-stats", default="", help="route stats .pt used to pick the hot experts (default: results/route_stats.pt)")
+    ap.add_argument("--jev", action="store_true", help="enable Jev mode parallel non-autoregressive structured extraction")
+    ap.add_argument("--mode", default="", help="inference mode: 'jev' or standard autoregressive")
+    ap.add_argument("--schema", default="", help="schema JSON string or path to schema JSON file")
     a = ap.parse_args()
 
     from transformers import AutoTokenizer
@@ -55,6 +58,30 @@ def main():
     model = load_model(a.ckpt, devices, max_seq_len=a.max_seq_len, max_batch=a.batch, budgets_gb=budgets, n_layers=a.n_layers,
                        engram=not a.no_engram, tokenizer=tok, offload_experts=a.offload_experts, hot_experts=a.hot_experts, route_stats=a.hot_stats, ep=a.ep,
                        ep_shards=[int(v) for v in a.ep_shards.split(",")] if a.ep_shards else None)
+
+    if a.jev or a.mode == "jev":
+        import json
+        from dsv41.jev import JevEngine
+        if not a.schema:
+            raw_schema = {
+                "sentiment": ["positive", "neutral", "negative"],
+                "churn_risk": ["low", "medium", "high"],
+                "urgency": ["low", "medium", "high"],
+                "needs_human": [True, False],
+            }
+        elif os.path.exists(a.schema):
+            raw_schema = json.load(open(a.schema))
+        else:
+            raw_schema = json.loads(a.schema)
+
+        jev_eng = JevEngine(model, tok)
+        assembled, metrics = jev_eng.process_request(a.prompt, raw_schema)
+        print("\n=== Jev Mode Structured Output ===", flush=True)
+        print(json.dumps(assembled, indent=2, ensure_ascii=False), flush=True)
+        print("\n=== Jev Performance Metrics ===", flush=True)
+        for k, v in metrics.items():
+            print(f"  {k}: {v}", flush=True)
+        return
 
     if a.chat:
         sys.path.insert(0, os.path.join(a.ckpt, "encoding"))

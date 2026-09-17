@@ -26,4 +26,6 @@ patch.sh
 compression/
 # scratch
 /tmp/
+scratch/
 dsv41/cpu/.*.so
+

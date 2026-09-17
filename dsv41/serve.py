@@ -65,6 +65,9 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(n) or b"{}")
         except json.JSONDecodeError:
             return self._json(400, {"error": "invalid JSON"})
+        if self.path in ("/v1/chat/completions", "/v1/completions"):
+            if body.get("jev") or body.get("mode") == "jev":
+                return self._jev(body)
         if self.path == "/v1/chat/completions":
             return self._chat(body)
         if self.path == "/v1/completions":
@@ -364,8 +367,66 @@ class Handler(BaseHTTPRequestHandler):
             return
         text, n = eng.generate_text(ids, params)
         self._json(200, {"id": rid, "object": "text_completion", "created": created, "model": eng.model_name,
-                         "choices": [{"index": 0, "text": text, "finish_reason": "length" if n >= params.max_new_tokens else "stop"}],
-                         "usage": {"prompt_tokens": len(ids), "completion_tokens": n, "total_tokens": len(ids) + n}})
+                          "choices": [{"index": 0, "text": text, "finish_reason": "length" if n >= params.max_new_tokens else "stop"}],
+                          "usage": {"prompt_tokens": len(ids), "completion_tokens": n, "total_tokens": len(ids) + n}})
+
+    # ---------------------------------------------------------------- Jev mode structured output
+    def _jev(self, body: dict):
+        eng = ENGINE
+        raw_schema = body.get("schema") or {}
+        if not raw_schema:
+            return self._json(400, {"error": "schema is required for Jev mode"})
+
+        prompt = body.get("prompt")
+        if not prompt and body.get("messages"):
+            for m in reversed(body["messages"]):
+                if m.get("role") == "user":
+                    prompt = m.get("content")
+                    break
+            if not prompt:
+                prompt = body["messages"][-1].get("content", "")
+
+        if not prompt:
+            return self._json(400, {"error": "prompt or user message is required"})
+
+        max_batch = int(body.get("max_batch") or os.environ.get("DSV41_JEV_MAX_BATCH", "32"))
+
+        try:
+            assembled, metrics = eng.jev_inference(prompt, raw_schema, max_batch=max_batch)
+        except Exception as e:
+            tb = traceback.format_exc()
+            print(f"[jev-error] {e}\n{tb}", flush=True)
+            return self._json(500, {"error": str(e), "traceback": tb})
+
+        rid = f"jevcmpl-{uuid.uuid4().hex[:24]}"
+        created = int(time.time())
+        json_content = json.dumps(assembled, ensure_ascii=False)
+
+        resp = {
+            "id": rid,
+            "object": "chat.completion" if self.path == "/v1/chat/completions" else "text_completion",
+            "created": created,
+            "model": eng.model_name,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": json_content,
+                    },
+                    "text": json_content,
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": metrics["prompt_tokens"],
+                "completion_tokens": 0,
+                "total_tokens": metrics["prompt_tokens"],
+            },
+            "jev_result": assembled,
+            "jev_metrics": metrics,
+        }
+        return self._json(200, resp)
 
 
 def main():
@@ -407,6 +468,10 @@ def main():
               ep=a.ep, ep_shards=[int(v) for v in a.ep_shards.split(",")] if a.ep_shards else None, mtp=a.mtp, mtp_device=a.mtp_device,
               max_seqs=a.max_seqs)
     ENGINE = Engine(a.ckpt, **kw) if a.ckpt else Engine(**kw)
+    try:
+        ENGINE.jev_engine.prefix_tree.init_system_prompt()
+    except Exception as e:
+        print(f"[jev-init] Note: Jev system prompt prefill deferred ({e})", flush=True)
     srv = ThreadingHTTPServer((a.host, a.port), Handler)
     print(f"serving OpenAI-compatible API on http://{a.host}:{a.port}/v1 (model '{ENGINE.model_name}')", flush=True)
     try:

@@ -178,8 +178,20 @@ class Engine:
         self.lock = threading.Lock()
         self.eos = self.tok.eos_token_id
         self.model_name = "deepseek-v4.1-flash"
+        self._jev_engine = None
         if self.max_seqs > 1:
             self._init_batch_scheduler()
+
+    @property
+    def jev_engine(self):
+        if self._jev_engine is None:
+            from .jev import JevEngine
+            self._jev_engine = JevEngine(self.model, self.tok)
+        return self._jev_engine
+
+    def jev_inference(self, prompt: str, schema: dict, max_batch: int = 32) -> tuple[dict, dict]:
+        with self.lock:
+            return self.jev_engine.process_request(prompt, schema, max_batch=max_batch)
 
     # ---------------------------------------------------------------- prompts
     def chat_prompt(self, messages: list[dict], thinking_mode: str | None = None) -> str:
