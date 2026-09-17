@@ -4194,6 +4194,13 @@ class Engine:
                 except Exception as e:
                     print(f"[batched-engine] prefill error on slot={slot_id}: {e}", flush=True)
                     traceback.print_exc()
+                    if "out of memory" in str(e).lower() and torch.cuda.is_available():
+                        for d in range(torch.cuda.device_count()):
+                            try:
+                                with torch.cuda.device(d):
+                                    torch.cuda.empty_cache()
+                            except Exception:
+                                pass
                     req.error = e
                     req.done_event.set()
                     self._free_decode_slots.append(slot_id)

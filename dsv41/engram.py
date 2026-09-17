@@ -115,19 +115,35 @@ class NgramHashState:
         tokens = torch.stack(tokens, dim=-1)  # [B, 1, max_ngram]
         return self._hash(tokens)
 
-    def __call__(self, input_ids: torch.Tensor, start_pos: int) -> torch.Tensor:
+    def __call__(self, input_ids: torch.Tensor, start_pos: int, chunk_size: int = 2048) -> torch.Tensor:
         """input_ids [B, L] -> hash ids [B, L, n_engram_layers, n_hash_cols] (int64, on device)."""
         batch, seqlen = input_ids.shape
         compressed = self.token_map[input_ids]
         self.cache[:batch, start_pos : start_pos + seqlen] = compressed
-        positions = torch.arange(start_pos, start_pos + seqlen, device=input_ids.device).expand(batch, seqlen)
-        tokens, blocked = [], torch.zeros_like(positions, dtype=torch.bool)
-        for shift in range(self.layout.max_ngram_size):
-            source = self.cache[:batch].gather(1, (positions - shift).clamp_min(0))
-            blocked = blocked | (positions < shift) | (source == self.DEAD)
-            tokens.append(torch.where(blocked, self.pad_id, source))
-        tokens = torch.stack(tokens, dim=-1)  # [B, L, max_ngram]
-        return self._hash(tokens)
+
+        if seqlen <= chunk_size:
+            positions = torch.arange(start_pos, start_pos + seqlen, device=input_ids.device).expand(batch, seqlen)
+            tokens, blocked = [], torch.zeros_like(positions, dtype=torch.bool)
+            for shift in range(self.layout.max_ngram_size):
+                source = self.cache[:batch].gather(1, (positions - shift).clamp_min(0))
+                blocked = blocked | (positions < shift) | (source == self.DEAD)
+                tokens.append(torch.where(blocked, self.pad_id, source))
+            tokens = torch.stack(tokens, dim=-1)  # [B, L, max_ngram]
+            return self._hash(tokens)
+
+        # For long sequences, compute in micro-chunks to prevent peak activation spikes
+        chunk_outs = []
+        for c0 in range(0, seqlen, chunk_size):
+            c1 = min(seqlen, c0 + chunk_size)
+            pos = torch.arange(start_pos + c0, start_pos + c1, device=input_ids.device).expand(batch, c1 - c0)
+            tokens, blocked = [], torch.zeros_like(pos, dtype=torch.bool)
+            for shift in range(self.layout.max_ngram_size):
+                source = self.cache[:batch].gather(1, (pos - shift).clamp_min(0))
+                blocked = blocked | (pos < shift) | (source == self.DEAD)
+                tokens.append(torch.where(blocked, self.pad_id, source))
+            tokens = torch.stack(tokens, dim=-1)
+            chunk_outs.append(self._hash(tokens))
+        return torch.cat(chunk_outs, dim=1)
 
     def _hash(self, tokens: torch.Tensor) -> torch.Tensor:
         products = tokens.unsqueeze(2) * self.multipliers  # [B, L, n_layers, max_ngram]

@@ -19,6 +19,7 @@ import os as _os
 import traceback
 import threading
 _os.environ.setdefault("OMP_WAIT_POLICY", "active")  # CPU expert threads keep spinning between layers (libgomp reads this once)
+_os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 from .engine import Engine, GenParams, parse_budgets
 from .stats import StatsTracker
 

@@ -2464,7 +2464,14 @@ class Transformer:
             self.shared._ensure_capacity(self.shared.compress_kv, owner, needed, "compress_kv")
             self.shared._ensure_capacity(self.shared.index_k, owner, needed, "index_k")
 
-        hashes = self.engram_hash(input_ids, start_pos) if self.engram_hash is not None else None
+        # Free stale reserved allocator blocks after capacity expansion
+        for dev in getattr(self, "devices", []):
+            if isinstance(dev, (int, torch.device)) or (isinstance(dev, str) and "cuda" in str(dev)):
+                with torch.cuda.device(dev):
+                    torch.cuda.empty_cache()
+
+        # Chunk-level engram hashes computed on demand to avoid allocating hundreds of MBs on GPU 0
+        chunk_hashes_map: dict[int, torch.Tensor] = {}
 
         targets = set(getattr(self, "collect_main_hidden", ()))
         chunk_main_hiddens: dict[int, list[torch.Tensor]] = {lid: [] for lid in targets}
@@ -2529,6 +2536,8 @@ class Transformer:
                         h = h.unsqueeze(2).repeat(1, 1, self.hc, 1)
                         pre_mix = h.new_zeros(h.size(0), h.size(1), self.hc, dtype=torch.float32)
                         pre_mix[:, :, 0] = 1.0
+                        if self.engram_hash is not None:
+                            chunk_hashes_map[m] = self.engram_hash(chunk_ids, p_m)
                     else:
                         stream_k.wait_event(ev_stage_done[k - 1][m])
                         h_prev, pre_mix_prev = chunk_activations[k - 1][m]
@@ -2540,7 +2549,7 @@ class Transformer:
 
                     self.shared._current_chunk_idx = m
 
-                    chunk_hashes = hashes[:, c0:c1] if hashes is not None else None
+                    chunk_hashes = chunk_hashes_map.get(m)
 
                     for blk in active_blocks:
                         if blk.engram is not None and chunk_hashes is not None:
@@ -2551,6 +2560,10 @@ class Transformer:
                         if blk.layer_id in targets:
                             chunk_main_hiddens[blk.layer_id].append(h.mean(dim=2))
                         h, pre_mix = blk(h, p_m, pre_mix)
+
+                    # Free chunk hashes as soon as all stages with engram (stages 0 and 1) have processed chunk m
+                    if k >= min(1, K - 1):
+                        chunk_hashes_map.pop(m, None)
 
                     if next_stage_has_blocks:
                         chunk_activations[k][m] = (h, pre_mix)

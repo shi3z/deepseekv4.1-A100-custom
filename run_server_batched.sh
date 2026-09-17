@@ -3,6 +3,8 @@ set -e
 
 cd /mnt/ssdraid/git/deepseekv4.1
 
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 export DSV41_MOE_PREFILL_CHUNK=2048
 export DSV41_ENGRAM_PREFILL_CHUNK=2048
 export DSV41_HC_PREFILL_CHUNK=2048
