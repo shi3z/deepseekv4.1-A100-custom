@@ -40,11 +40,12 @@ unset CUDA_LAUNCH_BLOCKING
 
 python -m dsv41.serve \
   --ckpt /mnt/ssd/models/DeepSeek-V4.1-Flash \
-  --devices 2,0,1,3,4 \
-  --ep --ep-shards 77,77,77,77,76 \
+  --devices 2,3,0,1 \
+  --ep --ep-shards 96,96,96,96 \
   --max-seq-len 1048576 \
-  --host 127.0.0.1 --port 8000 \
-  --mtp 5 --mtp-device 4
+  --max-seqs 5 \
+  --host 0.0.0.0 --port 8000 \
+  --mtp 0
 ```
 
 Check `df -h /dev/shm` and `free -h` before enabling snapshots. Engram tables alone use about 189 GiB of host RAM.
@@ -73,7 +74,17 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   }'
 ```
 
-The server provides `/health`, `/v1/models`, `/v1/chat/completions`, and `/v1/completions`. When `"jev": true` is passed with `"schema": {...}`, the engine runs in Jev Mode, extracting all fields concurrently via candidate log-probability scoring over the hierarchical persistent prefix cache. Chat accepts system/user/assistant/tool messages, `max_tokens`, `temperature`, `top_p`, `stop`, `seed`, and `thinking`/`reasoning_effort`. Chat SSE is sent after generation and completion parsing; it is not token-by-token streaming. Requests are serialized by one engine lock.
+The server provides `/health`, `/v1/models`, `/v1/chat/completions`, `/v1/completions`, and `/dashboard` (plus `/api/metrics`). When `"jev": true` is passed with `"schema": {...}`, the engine runs in Jev Mode, extracting all fields concurrently via candidate log-probability scoring over the hierarchical persistent prefix cache. If `"stream": true` is set, Jev mode emits keep-alive heartbeat SSE comments (`: keep-alive\n\n`) during prefill to prevent client gateway timeouts, followed by OpenAI-compatible SSE chunks and `data: [DONE]`.
+
+### Real-Time Monitoring Web Dashboard (`/dashboard`)
+
+Navigate to `http://127.0.0.1:8000/dashboard` in any web browser for live server telemetry:
+- **Throughput (tok/s) 24h Time-Series**: Real-time interactive chart showing generation & extraction throughput with 24-hour rolling average, min, and max benchmarks.
+- **GPU VRAM & Utilization (GPUs 0–4)**: Live VRAM allocation (GiB / 80 GiB) and core utilization (%) per active device.
+- **System Resources**: Host RAM usage (GiB) and CPU load (%).
+- **Clients & Disconnections**: Concurrent in-flight client connections, total completed requests, and client disconnects (`BrokenPipeError` telemetry).
+- **Prefix & Jev Caches**: Track active persistent prefix cache blocks, RAM usage, and Jev Level 2/3 cached nodes.
+- **100% Offline**: Self-contained HTML5 Canvas rendering with zero external scripts or CDN dependencies.
 
 ## Cache and replay
 
@@ -305,6 +316,7 @@ These older measurements use different GPU counts, cache lengths, and batch size
 | `dsv41/bench_jev.py` | benchmark suite comparing normal autoregressive JSON vs. Jev mode |
 | `dsv41/dspark.py` | DSpark draft and verification runtime |
 | `dsv41/serve.py` | OpenAI-compatible HTTP server |
+| `dsv41/stats.py` | real-time metrics collector, GPU/system monitor, and web dashboard |
 | `dsv41/engram.py` | n-gram hash and host-resident Engram tables |
 | `results/` | benchmark and profiling logs |
 

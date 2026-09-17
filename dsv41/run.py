@@ -1,5 +1,5 @@
 """Generate text with DeepSeek-V4.1-Flash on A100s.
-usage: .venv-lc/bin/python -m dsv41.run --devices 0,1,2,3,4,5,6,7 --prompt "..." [--max-new-tokens 64]"""
+usage: .venv-lc/bin/python -m dsv41.run --devices 0,1,2,3,4 --prompt "..." [--max-new-tokens 64]"""
 import argparse
 import os
 import sys
@@ -25,7 +25,7 @@ def sample(logits: torch.Tensor, temperature: float) -> torch.Tensor:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default=CKPT)
-    ap.add_argument("--devices", default="0,1,2,3,4,5,6,7")
+    ap.add_argument("--devices", default="2,3,0,1")
     ap.add_argument("--budgets", default="", help="per-device GB overrides, e.g. 0:60,1:35")
     ap.add_argument("--prompt", default="The capital of France is")
     ap.add_argument("--chat", action="store_true", help="wrap the prompt with the chat template")

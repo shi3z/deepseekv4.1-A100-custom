@@ -163,6 +163,7 @@ class JevPrefixNode:
 
     def __init__(self, key: str, token_ids: list[int], node_type: str, parent: JevPrefixNode | None = None):
         self.key = key
+        self.node_id = key
         self.node_type = node_type  # "system", "schema", "request"
         self.token_ids = list(token_ids)
         self.parent = parent
@@ -187,6 +188,7 @@ class JevPrefixTree:
         self.root = JevPrefixNode("root", [], "root")
         self.system_node: JevPrefixNode | None = None
         self.schema_nodes: dict[str, JevPrefixNode] = {}
+        self.request_nodes: dict[str, JevPrefixNode] = {}
         self.stats = {
             "system_hits": 0,
             "schema_hits": 0,
@@ -339,6 +341,89 @@ class JevPrefixTree:
         print(f"[jev-prefix] Schema prefix cached on GPU: key={schema_key} tokens={len(schema_ids)} time={dt*1000:.2f}ms", flush=True)
         return schema_node, False
 
+    @staticmethod
+    def _prompt_lcp(a: list[int], b: list[int]) -> int:
+        if not a or not b:
+            return 0
+        n = min(len(a), len(b))
+        i = 0
+        while i < n and a[i] == b[i]:
+            i += 1
+        return i
+
+    def get_or_create_request_node(
+        self,
+        schema_node: JevPrefixNode,
+        req_ids: list[int],
+    ) -> tuple[JevPrefixNode, int, dict]:
+        """Looks up or creates Level 3 request KV snapshot.
+        Returns:
+            (node, reused_tokens, kv_snapshot)
+        """
+        import hashlib
+        # Hash first 4096 tokens + length to form key
+        h_bytes = bytes(str(req_ids[:4096]), "ascii") + len(req_ids).to_bytes(4, "little")
+        req_hash = hashlib.sha256(h_bytes).hexdigest()[:16]
+        req_key = f"{schema_node.node_id}:{req_hash}"
+
+        # 1. Exact match hit
+        if req_key in self.request_nodes:
+            node = self.request_nodes[req_key]
+            node.last_accessed = time.time()
+            node.hit_count += 1
+            print(f"[jev-prefix] Request exact HIT: key={req_key} tokens={len(req_ids)}", flush=True)
+            return node, len(req_ids), node.kv_snapshot
+
+        # 2. Check candidates under this schema for LCP prefix reuse
+        best_cand = None
+        best_lcp = 0
+        for cand_key, cand_node in self.request_nodes.items():
+            if cand_node.parent == schema_node and cand_node.token_ids:
+                lcp = self._prompt_lcp(cand_node.token_ids, req_ids)
+                if lcp > best_lcp:
+                    best_lcp = lcp
+                    best_cand = cand_node
+
+        dev0 = self.model.blocks[0].device
+        _chunk = max(1, int(os.environ.get("DSV41_HC_PREFILL_CHUNK", "1024")))
+
+        if best_cand is not None and best_lcp >= 32:
+            # LCP Hit: restore candidate snapshot
+            self.restore_kv(best_cand.kv_snapshot, batch_size=1)
+            reused = best_lcp
+            print(f"[jev-prefix] Request LCP HIT: reused={reused}/{len(req_ids)} tokens", flush=True)
+            for _s in range(reused, len(req_ids), _chunk):
+                _e = min(_s + _chunk, len(req_ids))
+                chunk_t = torch.tensor([req_ids[_s:_e]], dtype=torch.long, device=dev0)
+                with torch.inference_mode():
+                    _ = self.model.forward(chunk_t, start_pos=schema_node.end_pos + _s)
+            torch.cuda.synchronize(dev0)
+        else:
+            # Full request prefill from schema snapshot in chunks
+            reused = 0
+            self.restore_kv(schema_node.kv_snapshot, batch_size=1)
+            for _s in range(0, len(req_ids), _chunk):
+                _e = min(_s + _chunk, len(req_ids))
+                chunk_t = torch.tensor([req_ids[_s:_e]], dtype=torch.long, device=dev0)
+                with torch.inference_mode():
+                    _ = self.model.forward(chunk_t, start_pos=schema_node.end_pos + _s)
+            torch.cuda.synchronize(dev0)
+
+        req_end_pos = schema_node.end_pos + len(req_ids)
+        snap = self.snapshot_kv(req_end_pos)
+
+        # LRU eviction if cache exceeds 16 entries
+        if len(self.request_nodes) >= 16:
+            oldest_k = min(self.request_nodes.keys(), key=lambda k: self.request_nodes[k].last_accessed)
+            del self.request_nodes[oldest_k]
+
+        node = JevPrefixNode(req_key, req_ids, "request", parent=schema_node)
+        node.kv_snapshot = snap
+        self.request_nodes[req_key] = node
+        schema_node.children[req_key] = node
+
+        return node, reused, snap
+
 
 # ---------------------------------------------------------------------------
 # Jev Inference Engine
@@ -406,35 +491,37 @@ class JevEngine:
         t_start = time.perf_counter()
         schema = JevSchema(raw_schema)
         dev0 = self.model.blocks[0].device
+        K = len(schema.fields)
 
         # 1. Schema Node Lookup (Prefix Cache Level 1 & Level 2)
         t_cache_0 = time.perf_counter()
         schema_node, schema_hit = self.prefix_tree.get_or_create_schema_node(schema)
         t_cache_hit = time.perf_counter() - t_cache_0
 
-        # 2. Append request-specific input tokens (Prefix Cache Level 3: Shared Request KV)
-        t_restore_0 = time.perf_counter()
-        self.prefix_tree.restore_kv(schema_node.kv_snapshot, batch_size=1)
-        t_restore = time.perf_counter() - t_restore_0
-
         req_text = f"Input: {input_text}\n<｜Assistant｜></think>"
         req_ids = self.tok.encode(req_text, add_special_tokens=False)
-        input_t = torch.tensor([req_ids], dtype=torch.long, device=dev0)
 
+        print(
+            f"[jev] request start prompt_tokens={len(req_ids)} fields={K} schema_hit={schema_hit}",
+            flush=True,
+        )
+
+        # 2. Level 3: Request Input Prefill with persistent prefix caching & LCP reuse
         t_prefill_0 = time.perf_counter()
-        with torch.inference_mode():
-            _ = self.model.forward(input_t, start_pos=schema_node.end_pos)
-        torch.cuda.synchronize(dev0)
+        req_node, reused_tokens, req_snap = self.prefix_tree.get_or_create_request_node(schema_node, req_ids)
         t_prefill = time.perf_counter() - t_prefill_0
-
         req_end_pos = schema_node.end_pos + len(req_ids)
+        prefilled_tokens = len(req_ids) - reused_tokens
 
-        # 3. Snapshot Shared Request KV on GPU (costs ~0.05ms)
-        req_snap = self.prefix_tree.snapshot_kv(req_end_pos)
+        print(
+            f"[jev] prefill done {time.perf_counter() - t_start:.3f}s "
+            f"(prefilled={prefilled_tokens} reused={reused_tokens}/{len(req_ids)} tokens "
+            f"time={t_prefill*1000:.1f}ms)",
+            flush=True,
+        )
 
-        # 4. Branch Field-Specific Suffixes & Parallel Candidate Scoring (Level 4 & 5)
+        # 3. Branch Field-Specific Suffixes & Parallel Candidate Scoring (Level 4 & 5)
         fields = schema.fields
-        K = len(fields)
         field_results = {}
         t_scoring = 0.0
 
@@ -466,18 +553,31 @@ class JevEngine:
                 field_results[f.name] = val
 
         t_total = time.perf_counter() - t_start
+        print(
+            f"[jev] inference done {t_total:.3f}s (scoring={t_scoring*1000:.1f}ms fields={K})",
+            flush=True,
+        )
+
         assembled = schema.assemble(field_results)
+
+        total_saved = (
+            (len(self.prefix_tree.system_node.token_ids) if self.prefix_tree.system_node else 0)
+            + (len(schema_node.token_ids) if schema_hit else 0)
+            + reused_tokens
+        )
 
         metrics = {
             "cache_hit": schema_hit,
             "cache_hit_latency_ms": t_cache_hit * 1000.0,
-            "restore_latency_ms": t_restore * 1000.0,
+            "reused_tokens": reused_tokens,
+            "prefilled_tokens": prefilled_tokens,
             "prefill_ms": t_prefill * 1000.0,
             "scoring_ms": t_scoring * 1000.0,
             "total_ms": t_total * 1000.0,
             "num_fields": K,
             "prompt_tokens": req_end_pos,
-            "tokens_saved": (len(self.prefix_tree.system_node.token_ids) + len(schema_node.token_ids)) if schema_hit else len(self.prefix_tree.system_node.token_ids),
+            "tokens_saved": total_saved,
         }
 
         return assembled, metrics
+

@@ -193,6 +193,24 @@ class Engine:
         with self.lock:
             return self.jev_engine.process_request(prompt, schema, max_batch=max_batch)
 
+    def get_cache_stats(self) -> dict:
+        try:
+            entries, total_bytes = self._prefix_cache_stats()
+        except Exception:
+            entries, total_bytes = 0, 0
+        jev_schemas = 0
+        jev_requests = 0
+        if self._jev_engine is not None and getattr(self._jev_engine, "prefix_tree", None) is not None:
+            pt = self._jev_engine.prefix_tree
+            jev_schemas = len(pt.schema_nodes)
+            jev_requests = len(getattr(pt, "request_nodes", {}))
+        return {
+            "prefix_entries": entries,
+            "prefix_bytes": total_bytes,
+            "jev_schemas": jev_schemas,
+            "jev_requests": jev_requests,
+        }
+
     # ---------------------------------------------------------------- prompts
     def chat_prompt(self, messages: list[dict], thinking_mode: str | None = None) -> str:
         return self._encode(messages, thinking_mode=thinking_mode or self.thinking_mode)

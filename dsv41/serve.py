@@ -1,11 +1,11 @@
 from pathlib import Path
 """OpenAI-compatible HTTP server (no web framework needed: stdlib http.server, threaded).
 
-  python -m dsv41.serve --devices 2,0,1,4,5,6,7,3 --port 8000
+  python -m dsv41.serve --devices 0,1,2,3,4 --port 8000
   curl http://localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
        -d '{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"hello"}],"stream":true}'
 
-Endpoints: GET /v1/models, POST /v1/chat/completions (stream or not), POST /v1/completions, GET /health.
+Endpoints: GET /v1/models, POST /v1/chat/completions (stream or not), POST /v1/completions, GET /health, GET /dashboard.
 One request is generated at a time; others wait on the engine lock."""
 import torch
 import argparse
@@ -20,8 +20,10 @@ import traceback
 import threading
 _os.environ.setdefault("OMP_WAIT_POLICY", "active")  # CPU expert threads keep spinning between layers (libgomp reads this once)
 from .engine import Engine, GenParams, parse_budgets
+from .stats import StatsTracker
 
 ENGINE: Engine | None = None
+STATS_TRACKER: StatsTracker | None = None
 
 
 def _params(body: dict) -> GenParams:
@@ -43,36 +45,72 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # quieter log
         print(f"[{time.strftime('%H:%M:%S')}] {self.address_string()} {fmt % args}", flush=True)
 
-    def _json(self, code: int, obj: dict):
-        data = json.dumps(obj, ensure_ascii=False).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+    def _json(self, code: int, obj: dict, t0: float | None = None, is_stream: bool = False):
+        data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            elapsed_str = f" elapsed={time.perf_counter()-t0:.3f}s" if t0 is not None else ""
+            print(f"[http] client disconnected before response completed{elapsed_str} bytes={len(data)} stream={is_stream}", flush=True)
+            if STATS_TRACKER:
+                STATS_TRACKER.record_disconnect()
+        except Exception as e:
+            print(f"[http] response write error: {e}", flush=True)
 
     def do_GET(self):
         if self.path == "/v1/models":
-            self._json(200, {"object": "list", "data": [{"id": ENGINE.model_name, "object": "model", "owned_by": "local"}]})
+            self._json(200, {"object": "list", "data": [{"id": ENGINE.model_name if ENGINE else "deepseek-v4.1-flash", "object": "model", "owned_by": "local"}]})
         elif self.path == "/health":
             self._json(200, {"status": "ok"})
+        elif self.path in ("/dashboard", "/"):
+            self._dashboard()
+        elif self.path in ("/api/metrics", "/api/stats"):
+            self._json(200, STATS_TRACKER.get_metrics(ENGINE) if STATS_TRACKER else {})
         else:
             self._json(404, {"error": "not found"})
 
-    def do_POST(self):
-        n = int(self.headers.get("Content-Length", 0))
+    def _dashboard(self):
+        if not STATS_TRACKER:
+            return self._json(500, {"error": "stats tracker not initialized"})
+        html = STATS_TRACKER.render_dashboard_html(ENGINE.model_name if ENGINE else "deepseek-v4.1-flash").encode("utf-8")
         try:
-            body = json.loads(self.rfile.read(n) or b"{}")
-        except json.JSONDecodeError:
-            return self._json(400, {"error": "invalid JSON"})
-        if self.path in ("/v1/chat/completions", "/v1/completions"):
-            if body.get("jev") or body.get("mode") == "jev":
-                return self._jev(body)
-        if self.path == "/v1/chat/completions":
-            return self._chat(body)
-        if self.path == "/v1/completions":
-            return self._completion(body)
-        self._json(404, {"error": "not found"})
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(html)))
+            self.end_headers()
+            self.wfile.write(html)
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def do_POST(self):
+        if STATS_TRACKER:
+            STATS_TRACKER.client_connected()
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+            try:
+                body = json.loads(self.rfile.read(n) or b"{}")
+            except json.JSONDecodeError:
+                return self._json(400, {"error": "invalid JSON"})
+            if self.path in ("/v1/chat/completions", "/v1/completions"):
+                rf_type = body.get("response_format", {}).get("type")
+                has_rf_schema = rf_type == "json_schema" and "schema" in body.get("response_format", {}).get("json_schema", {})
+                if body.get("jev") or body.get("mode") == "jev" or has_rf_schema:
+                    return self._jev(body)
+            if self.path == "/v1/chat/completions":
+                return self._chat(body)
+            if self.path == "/v1/completions":
+                return self._completion(body)
+            self._json(404, {"error": "not found"})
+        finally:
+            if STATS_TRACKER:
+                STATS_TRACKER.client_disconnected()
+
 
     # ---------------------------------------------------------------- chat
     def _chat(self, body: dict):
@@ -118,15 +156,17 @@ class Handler(BaseHTTPRequestHandler):
         # response reaches the client and the request can complete.  Hosts
         # that need longer answers can raise this explicitly.
         _interactive_cap = int(os.environ.get("DSV41_INTERACTIVE_MAX_NEW", "2048"))
+        requested_max_tokens = body.get("max_tokens") or body.get("max_completion_tokens")
         if _interactive_cap > 0 and params.max_new_tokens > _interactive_cap:
             params.max_new_tokens = _interactive_cap
-            print(f"[chat] max_tokens capped={_interactive_cap}", flush=True)
+            print(f"[chat] max_tokens capped={_interactive_cap} (requested={requested_max_tokens})", flush=True)
         rid = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created = int(time.time())
+        t0 = time.perf_counter()
         print(
           f"[chat] prompt_tokens={len(ids)} "
           f"max_seq_len={eng.max_seq_len} "
-          f"max_tokens={body.get('max_tokens')} "
+          f"max_tokens={params.max_new_tokens} (effective) "
           f"stream={body.get('stream')}",
           flush=True,
         )
@@ -327,7 +367,11 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             return
+        t_gen_0 = time.perf_counter()
         text, n = eng.generate_text(ids, params)
+        dt_gen = time.perf_counter() - t_gen_0
+        if STATS_TRACKER and n > 0:
+            STATS_TRACKER.record_throughput(n / max(dt_gen, 1e-6), "chat")
         msg = eng.parse_completion(text, thinking)
         content = msg.get("content") if isinstance(msg, dict) else text
         out = {"id": rid, "object": "chat.completion", "created": created, "model": eng.model_name,
@@ -338,11 +382,12 @@ class Handler(BaseHTTPRequestHandler):
             out["choices"][0]["message"]["reasoning_content"] = msg["reasoning_content"]
         if isinstance(msg, dict) and msg.get("tool_calls"):
             out["choices"][0]["message"]["tool_calls"] = msg["tool_calls"]
-        self._json(200, out)
+        self._json(200, out, t0=t0, is_stream=False)
 
     # ---------------------------------------------------------------- raw completions
     def _completion(self, body: dict):
         eng = ENGINE
+        t0 = time.perf_counter()
         prompt = body.get("prompt") or ""
         if isinstance(prompt, list):
             prompt = prompt[0]
@@ -356,26 +401,47 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
             n = 0
-            for _, piece in eng.generate(ids, params):
-                obj = {"id": rid, "object": "text_completion", "created": created, "model": eng.model_name,
-                       "choices": [{"index": 0, "text": piece, "finish_reason": None}]}
-                self.wfile.write(f"data: {json.dumps(obj, ensure_ascii=False)}\n\n".encode())
+            t_gen_0 = time.perf_counter()
+            try:
+                for _, piece in eng.generate(ids, params):
+                    obj = {"id": rid, "object": "text_completion", "created": created, "model": eng.model_name,
+                           "choices": [{"index": 0, "text": piece, "finish_reason": None}]}
+                    self.wfile.write(f"data: {json.dumps(obj, ensure_ascii=False)}\n\n".encode())
+                    self.wfile.flush()
+                    n += 1
+                self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
-                n += 1
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
+                dt_gen = time.perf_counter() - t_gen_0
+                if STATS_TRACKER and n > 0:
+                    STATS_TRACKER.record_throughput(n / max(dt_gen, 1e-6), "completion-stream")
+            except (BrokenPipeError, ConnectionResetError):
+                elapsed = time.perf_counter() - t0
+                print(f"[http] client disconnected during completion stream elapsed={elapsed:.3f}s tokens={n}", flush=True)
+                if STATS_TRACKER:
+                    STATS_TRACKER.record_disconnect()
             return
+        t_gen_0 = time.perf_counter()
         text, n = eng.generate_text(ids, params)
+        dt_gen = time.perf_counter() - t_gen_0
+        if STATS_TRACKER and n > 0:
+            STATS_TRACKER.record_throughput(n / max(dt_gen, 1e-6), "completion")
         self._json(200, {"id": rid, "object": "text_completion", "created": created, "model": eng.model_name,
                           "choices": [{"index": 0, "text": text, "finish_reason": "length" if n >= params.max_new_tokens else "stop"}],
-                          "usage": {"prompt_tokens": len(ids), "completion_tokens": n, "total_tokens": len(ids) + n}})
+                          "usage": {"prompt_tokens": len(ids), "completion_tokens": n, "total_tokens": len(ids) + n}}, t0=t0, is_stream=False)
 
     # ---------------------------------------------------------------- Jev mode structured output
     def _jev(self, body: dict):
         eng = ENGINE
-        raw_schema = body.get("schema") or {}
+        t0 = time.perf_counter()
+        stream = bool(body.get("stream"))
+
+        raw_schema = body.get("schema")
+        if not raw_schema and isinstance(body.get("response_format"), dict):
+            rf = body["response_format"]
+            if rf.get("type") == "json_schema" and isinstance(rf.get("json_schema"), dict):
+                raw_schema = rf["json_schema"].get("schema")
         if not raw_schema:
-            return self._json(400, {"error": "schema is required for Jev mode"})
+            return self._json(400, {"error": "schema is required for Jev mode"}, t0=t0, is_stream=stream)
 
         prompt = body.get("prompt")
         if not prompt and body.get("messages"):
@@ -387,20 +453,140 @@ class Handler(BaseHTTPRequestHandler):
                 prompt = body["messages"][-1].get("content", "")
 
         if not prompt:
-            return self._json(400, {"error": "prompt or user message is required"})
+            return self._json(400, {"error": "prompt or user message is required"}, t0=t0, is_stream=stream)
 
         max_batch = int(body.get("max_batch") or os.environ.get("DSV41_JEV_MAX_BATCH", "32"))
+        rid = f"jevcmpl-{uuid.uuid4().hex[:24]}"
+        created = int(time.time())
 
+        print(
+            f"[jev] request start prompt_len={len(prompt)} schema_fields={len(raw_schema)} stream={stream}",
+            flush=True,
+        )
+
+        if stream:
+            # SSE streaming response with heartbeat to prevent client / proxy timeouts
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+
+            heartbeat_stop = threading.Event()
+            sse_lock = threading.Lock()
+
+            def _sse_write(data: bytes):
+                with sse_lock:
+                    self.wfile.write(data)
+                    self.wfile.flush()
+
+            def _heartbeat():
+                while not heartbeat_stop.wait(5.0):
+                    try:
+                        _sse_write(b": keep-alive\n\n")
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        break
+
+            heartbeat_thread = threading.Thread(target=_heartbeat, daemon=True)
+            heartbeat_thread.start()
+
+            try:
+                assembled, metrics = eng.jev_inference(prompt, raw_schema, max_batch=max_batch)
+            except Exception as e:
+                heartbeat_stop.set()
+                heartbeat_thread.join(timeout=1.0)
+                tb = traceback.format_exc()
+                print(f"[jev-error] {e}\n{tb}", flush=True)
+                try:
+                    err_payload = json.dumps({"error": {"message": str(e), "type": "jev_error"}}, ensure_ascii=False)
+                    _sse_write(f"data: {err_payload}\n\ndata: [DONE]\n\n".encode("utf-8"))
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+                return
+
+            heartbeat_stop.set()
+            heartbeat_thread.join(timeout=1.0)
+
+            json_content = json.dumps(assembled, ensure_ascii=False)
+            dt_total = time.perf_counter() - t0
+
+            if STATS_TRACKER:
+                eff_tokens = metrics.get("prompt_tokens", 0) + metrics.get("num_fields", 0) * 5
+                STATS_TRACKER.record_throughput(eff_tokens / max(dt_total, 1e-6), "jev-stream")
+
+            try:
+                role_chunk = {
+                    "id": rid,
+                    "object": "chat.completion.chunk" if self.path == "/v1/chat/completions" else "text_completion",
+                    "created": created,
+                    "model": eng.model_name,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"role": "assistant"},
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+                _sse_write(f"data: {json.dumps(role_chunk, ensure_ascii=False)}\n\n".encode("utf-8"))
+
+                for i in range(0, len(json_content), 128):
+                    content_chunk = {
+                        "id": rid,
+                        "object": "chat.completion.chunk" if self.path == "/v1/chat/completions" else "text_completion",
+                        "created": created,
+                        "model": eng.model_name,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": json_content[i:i + 128]},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    _sse_write(f"data: {json.dumps(content_chunk, ensure_ascii=False)}\n\n".encode("utf-8"))
+
+                finish_chunk = {
+                    "id": rid,
+                    "object": "chat.completion.chunk" if self.path == "/v1/chat/completions" else "text_completion",
+                    "created": created,
+                    "model": eng.model_name,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "jev_result": assembled,
+                    "jev_metrics": metrics,
+                }
+                _sse_write(f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n".encode("utf-8"))
+                _sse_write(b"data: [DONE]\n\n")
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                elapsed = time.perf_counter() - t0
+                print(
+                    f"[http] broken pipe elapsed={elapsed:.3f}s bytes={len(json_content)} stream=True",
+                    flush=True,
+                )
+                if STATS_TRACKER:
+                    STATS_TRACKER.record_disconnect()
+            return
+
+        # Non-streaming response
         try:
             assembled, metrics = eng.jev_inference(prompt, raw_schema, max_batch=max_batch)
         except Exception as e:
             tb = traceback.format_exc()
             print(f"[jev-error] {e}\n{tb}", flush=True)
-            return self._json(500, {"error": str(e), "traceback": tb})
+            return self._json(500, {"error": str(e), "traceback": tb}, t0=t0, is_stream=False)
 
-        rid = f"jevcmpl-{uuid.uuid4().hex[:24]}"
-        created = int(time.time())
         json_content = json.dumps(assembled, ensure_ascii=False)
+        dt_total = time.perf_counter() - t0
+
+        if STATS_TRACKER:
+            eff_tokens = metrics.get("prompt_tokens", 0) + metrics.get("num_fields", 0) * 5
+            STATS_TRACKER.record_throughput(eff_tokens / max(dt_total, 1e-6), "jev")
 
         resp = {
             "id": rid,
@@ -426,14 +612,14 @@ class Handler(BaseHTTPRequestHandler):
             "jev_result": assembled,
             "jev_metrics": metrics,
         }
-        return self._json(200, resp)
+        return self._json(200, resp, t0=t0, is_stream=False)
 
 
 def main():
-    global ENGINE
+    global ENGINE, STATS_TRACKER
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default=None)
-    ap.add_argument("--devices", default="2,0,1,4,5,6,7,3")
+    ap.add_argument("--devices", default="2,3,0,1")
     ap.add_argument("--budgets", default="")
     ap.add_argument("--max-seq-len", type=int, default=8192)
     ap.add_argument("--host", default="0.0.0.0")
@@ -463,21 +649,29 @@ def main():
         help="concurrent sequence slots (1 = serialized single request; >1 = batched decode)",
     )
     a = ap.parse_args()
-    kw = dict(devices=[int(d) for d in a.devices.split(",")], max_seq_len=a.max_seq_len, budgets=parse_budgets(a.budgets),
+    dev_list = [int(d) for d in a.devices.split(",") if int(d) in (0, 1, 2, 3)]
+    kw = dict(devices=dev_list, max_seq_len=a.max_seq_len, budgets=parse_budgets(a.budgets),
               use_graphs=not a.no_graphs, offload_experts=a.offload_experts, hot_experts=a.hot_experts, route_stats=a.hot_stats,
               ep=a.ep, ep_shards=[int(v) for v in a.ep_shards.split(",")] if a.ep_shards else None, mtp=a.mtp, mtp_device=a.mtp_device,
               max_seqs=a.max_seqs)
     ENGINE = Engine(a.ckpt, **kw) if a.ckpt else Engine(**kw)
+    ENGINE.devices = dev_list
+    STATS_TRACKER = StatsTracker(active_devices=dev_list)
     try:
         ENGINE.jev_engine.prefix_tree.init_system_prompt()
     except Exception as e:
         print(f"[jev-init] Note: Jev system prompt prefill deferred ({e})", flush=True)
     srv = ThreadingHTTPServer((a.host, a.port), Handler)
     print(f"serving OpenAI-compatible API on http://{a.host}:{a.port}/v1 (model '{ENGINE.model_name}')", flush=True)
+    print(f"monitoring dashboard active at http://{a.host}:{a.port}/dashboard", flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
+    except Exception as e:
+        print(f"[server-fatal] serve_forever error: {e}", flush=True)
+        traceback.print_exc()
+
 
 
 if __name__ == "__main__":
