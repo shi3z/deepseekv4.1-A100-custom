@@ -3532,7 +3532,7 @@ class Engine:
 
             # 2. Decode active slots in batch
             if not self._active_slots:
-                time.sleep(0.005)
+                time.sleep(0.001)
                 continue
 
             with self.lock:
@@ -3566,11 +3566,29 @@ class Engine:
                     self._active_slots.clear()
                     continue
 
+                # Batch sampling optimization:
+                # When all slots are greedy (temperature <= 0), execute a single batched argmax
+                # and transfer all tokens to CPU in one round trip.
+                all_greedy = all(self._active_slots[s].params.temperature <= 0 for s in active_ids)
+                if all_greedy:
+                    sampled_tokens = logits[:n_active].argmax(dim=-1).tolist()
+                else:
+                    sampled_tokens = []
+                    greedy_cached = None
+                    for idx, s_id in enumerate(active_ids):
+                        req = self._active_slots[s_id]
+                        if req.params.temperature <= 0:
+                            if greedy_cached is None:
+                                greedy_cached = logits[:n_active].argmax(dim=-1).tolist()
+                            sampled_tokens.append(greedy_cached[idx])
+                        else:
+                            slot_logits = logits[idx]
+                            sampled_tokens.append(sample_token(slot_logits, req.params.temperature, req.params.top_p, req.gen))
+
                 finished = []
                 for idx, s_id in enumerate(active_ids):
                     req = self._active_slots[s_id]
-                    slot_logits = logits[idx]
-                    t = sample_token(slot_logits, req.params.temperature, req.params.top_p, req.gen)
+                    t = sampled_tokens[idx]
                     req.pos += 1
 
                     is_eos = (t == self.eos)
@@ -3578,17 +3596,19 @@ class Engine:
                         req.out_tokens.append(t)
                     is_max = (len(req.out_tokens) >= req.max_new)
 
-                    # Stop condition check
+                    # Fast stop condition check: inspect small trailing window to avoid O(N^2) decodes
                     is_stopped = False
                     if req.params.stop and not is_eos:
-                        text = self.tok.decode(req.out_tokens)
+                        tail_text = self.tok.decode(req.out_tokens[-32:])
                         for s in req.params.stop:
-                            if s in text:
-                                cut = text.find(s)
-                                req.result_text = text[:cut]
-                                req.result_count = len(req.out_tokens)
-                                is_stopped = True
-                                break
+                            if s in tail_text:
+                                full_text = self.tok.decode(req.out_tokens)
+                                cut = full_text.find(s)
+                                if cut != -1:
+                                    req.result_text = full_text[:cut]
+                                    req.result_count = len(req.out_tokens)
+                                    is_stopped = True
+                                    break
 
                     if is_eos or is_max or is_stopped:
                         if not is_stopped:

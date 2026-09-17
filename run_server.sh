@@ -12,7 +12,7 @@ export DSV41_EP_CAND_TOKENS=1048576
 export DSV41_CACHE_INIT_TOKENS=1048576
 export DSV41_EP_PREALLOC_TOKENS=1048576
 export DSV41_EXACT_CACHE_GROW=1
-export DSV41_MAX_SEQS=5
+export DSV41_MAX_SEQS=9
 
 export DSV41_PREFIX_CACHE_DIR=/dev/shm/dsv41-prefix-cache
 export DSV41_PREFIX_CACHE_ENTRIES=16
@@ -31,7 +31,7 @@ exec /home/shi3z/.local/bin/python -u -m dsv41.serve \
     --ep \
     --ep-shards 48,48,48,48,48,48,48,48 \
     --max-seq-len 1048576 \
-    --max-seqs 5 \
+    --max-seqs 9 \
     --host 127.0.0.1 \
     --port 8000 \
     --mtp 0
