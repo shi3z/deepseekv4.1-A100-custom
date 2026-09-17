@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 import queue
+import collections
 from dataclasses import dataclass, field
 from typing import Iterator
 
@@ -180,8 +181,33 @@ class Engine:
         self.eos = self.tok.eos_token_id
         self.model_name = "deepseek-v4.1-flash"
         self._jev_engine = None
+        self.stats_tracker = None
+        self.last_prefill_stats: dict | None = None
+        self.current_phase = "idle"
+        self.current_context_tokens = 0
+        self.prefill_history: collections.deque = collections.deque(maxlen=30)
         if self.max_seqs > 1:
             self._init_batch_scheduler()
+
+    def _record_prefill_stats(self, mode: str, total: int, reused: int, new_tokens: int, dt: float):
+        self.last_prefill_stats = {
+            "mode": mode,
+            "total_tokens": total,
+            "reused_tokens": reused,
+            "new_tokens": new_tokens,
+            "hit_rate_pct": round(reused / max(total, 1) * 100, 1),
+            "time_s": round(dt, 3),
+            "new_tok_s": round(new_tokens / max(dt, 1e-9), 1),
+            "effective_tok_s": round(total / max(dt, 1e-9), 1),
+            "timestamp": time.time(),
+        }
+        self.current_context_tokens = total
+        self.prefill_history.append(self.last_prefill_stats)
+        if self.stats_tracker is not None:
+            try:
+                self.stats_tracker.record_prefill(self.last_prefill_stats)
+            except Exception:
+                pass
 
     @property
     def jev_engine(self):
@@ -192,7 +218,23 @@ class Engine:
 
     def jev_inference(self, prompt: str, schema: dict, max_batch: int = 32) -> tuple[dict, dict]:
         with self.lock:
-            return self.jev_engine.process_request(prompt, schema, max_batch=max_batch)
+            self.current_phase = "jev"
+            try:
+                assembled, metrics = self.jev_engine.process_request(prompt, schema, max_batch=max_batch)
+                tot_tokens = metrics.get("prompt_tokens", 0)
+                reused = metrics.get("prefix_saved_tokens", 0)
+                new_tok = max(0, tot_tokens - reused)
+                dt_prefill = metrics.get("prefill_time_s", 0.0)
+                self._record_prefill_stats("JEV", tot_tokens, reused, new_tok, dt_prefill)
+                if self.stats_tracker is not None:
+                    hit_str = "HIT" if metrics.get("cache_hit") else "MISS"
+                    self.stats_tracker.record_cache_event(
+                        f"Jev structured output: {metrics.get('num_fields', 0)} fields, schema {hit_str}, saved {reused}/{tot_tokens} tokens ({metrics.get('cache_hit_latency_ms', 0):.1f}ms cache hit, total {metrics.get('total_latency_ms', 0):.1f}ms)",
+                        event_type="hit" if metrics.get("cache_hit") else "info"
+                    )
+                return assembled, metrics
+            finally:
+                self.current_phase = "idle"
 
     def get_cache_stats(self) -> dict:
         try:
@@ -201,15 +243,54 @@ class Engine:
             entries, total_bytes = 0, 0
         jev_schemas = 0
         jev_requests = 0
+        jev_stats = {}
         if self._jev_engine is not None and getattr(self._jev_engine, "prefix_tree", None) is not None:
             pt = self._jev_engine.prefix_tree
             jev_schemas = len(pt.schema_nodes)
             jev_requests = len(getattr(pt, "request_nodes", {}))
+            jev_stats = getattr(pt, "stats", {})
+
+        # Dynamic KV cache allocation
+        shared = getattr(self.model, "shared", None)
+        kv_stats = {}
+        max_context = getattr(self, "max_seq_len", 1048576)
+        current_ctx = getattr(self, "current_context_tokens", 0)
+        if shared is not None and hasattr(shared, "compress_kv"):
+            for (owner, dev), t in shared.compress_kv.items():
+                if dev == self.model.blocks[0].device:
+                    ratio = self.model.args.compress_ratios[owner]
+                    kv_stats[f"owner_{owner}"] = {
+                        "allocated_rows": t.size(1),
+                        "max_rows": shared.cache_max_rows.get(owner, 0),
+                        "ratio": ratio,
+                        "allocated_tokens": t.size(1) * ratio,
+                    }
+
+        # Active decode slots
+        active_slots_info = []
+        for slot_id, req in list(getattr(self, "_active_slots", {}).items()):
+            active_slots_info.append({
+                "slot_id": slot_id,
+                "pos": req.pos,
+                "out_tokens": len(req.out_tokens),
+                "max_new": req.max_new,
+            })
+
         return {
             "prefix_entries": entries,
             "prefix_bytes": total_bytes,
+            "prefix_gb": round(total_bytes / (1024 ** 3), 2),
             "jev_schemas": jev_schemas,
             "jev_requests": jev_requests,
+            "jev_stats": jev_stats,
+            "kv_cache": kv_stats,
+            "current_context_tokens": current_ctx,
+            "max_context_tokens": max_context,
+            "context_pct": round(current_ctx / max(max_context, 1) * 100, 2),
+            "active_slots": active_slots_info,
+            "last_prefill": getattr(self, "last_prefill_stats", None),
+            "prefill_history": list(getattr(self, "prefill_history", [])),
+            "current_phase": getattr(self, "current_phase", "idle"),
         }
 
     # ---------------------------------------------------------------- prompts
@@ -2387,6 +2468,14 @@ class Engine:
                 f"size={victim['bytes']/2**20:,.1f}MiB",
                 flush=True,
             )
+            if self.stats_tracker is not None:
+                try:
+                    self.stats_tracker.record_cache_event(
+                        f"Prefix cache evict: base={len(victim['base_ids']):,} tokens ({victim['bytes']/2**20:.1f} MiB)",
+                        event_type="evict",
+                    )
+                except Exception:
+                    pass
 
         print(
             f"[prefix-cache] STORE "
@@ -2400,6 +2489,15 @@ class Engine:
             ent,
             previous=previous,
         )
+
+        if self.stats_tracker is not None:
+            try:
+                self.stats_tracker.record_cache_event(
+                    f"Prefix cache saved: base={len(base_ids):,} tokens, snapshot={snapshot_bytes / (1024**2):.1f} MiB, RAM total={total_bytes / (1024**3):.2f} GiB",
+                    event_type="store",
+                )
+            except Exception:
+                pass
 
         return ent
 
@@ -2806,6 +2904,7 @@ class Engine:
                 flush=True,
             )
 
+            self._record_prefill_stats("LCP-HIT", total, old_base, replay_n, dt)
             return logits, old_base
 
         # ========================================================
@@ -2853,6 +2952,7 @@ class Engine:
                 flush=True,
             )
 
+            self._record_prefill_stats("FULL", total, 0, total, dt)
             return logits, 0
 
         # --------------------------------------------------------
@@ -2957,6 +3057,7 @@ class Engine:
             flush=True,
         )
 
+        self._record_prefill_stats("BUILD", total, 0, total, dt)
         return logits, 0
 
     @torch.inference_mode()
@@ -3004,54 +3105,60 @@ class Engine:
             gen = torch.Generator(device=self.model.blocks[-1].device)
             gen.manual_seed(p.seed)
         with self.lock:
-            if self.mtp:
-                yield from self._generate_mtp_locked(
-                    prompt_ids,
-                    p,
-                    max_new,
-                    gen,
-                )
-                return
-
-            logits, _prefix_reused = self._prefill_with_prefix_reuse(
-                prompt_ids
-            )
-            pos = len(prompt_ids)
-            out: list[int] = []
-            decoded_upto = 0
-            pending = ""
-            for step in range(max_new):
-                t = sample_token(logits[0], p.temperature, p.top_p, gen)
-                if t == self.eos:
-                    print(
-                     f"[generate] STOP=eos step={step} pos={pos} "
-                     f"max_new={max_new}",
-                     flush=True,
+            self.current_phase = "prefill"
+            self.current_context_tokens = len(prompt_ids)
+            try:
+                if self.mtp:
+                    yield from self._generate_mtp_locked(
+                        prompt_ids,
+                        p,
+                        max_new,
+                        gen,
                     )
+                    return
 
-                    break
-                out.append(t)
-                # decode incrementally; hold back a partial multi-byte character
-                text = self.tok.decode(out[decoded_upto:])
-                if "�" in text:
-                    piece = ""
-                else:
-                    piece, decoded_upto = text, len(out)
-                if piece:
-                    pending += piece
-                    if p.stop and any(s in pending for s in p.stop):
-                        cut = min(pending.find(s) for s in p.stop if s in pending)
-                        if cut > 0:
-                            yield t, pending[:cut]
-                        return
-                    yield t, pending
-                    pending = ""
-                logits = self.rt.step(t, pos)
-                pos += 1
-            if out[decoded_upto:]:
-                tail = self.tok.decode(out[decoded_upto:])
-                if tail:
-                    yield out[-1], tail
+                logits, _prefix_reused = self._prefill_with_prefix_reuse(
+                    prompt_ids
+                )
+                self.current_phase = "decode"
+                pos = len(prompt_ids)
+                out: list[int] = []
+                decoded_upto = 0
+                pending = ""
+                for step in range(max_new):
+                    t = sample_token(logits[0], p.temperature, p.top_p, gen)
+                    if t == self.eos:
+                        print(
+                         f"[generate] STOP=eos step={step} pos={pos} "
+                         f"max_new={max_new}",
+                         flush=True,
+                        )
+
+                        break
+                    out.append(t)
+                    # decode incrementally; hold back a partial multi-byte character
+                    text = self.tok.decode(out[decoded_upto:])
+                    if "\ufffd" in text:
+                        piece = ""
+                    else:
+                        piece, decoded_upto = text, len(out)
+                    if piece:
+                        pending += piece
+                        if p.stop and any(s in pending for s in p.stop):
+                            cut = min(pending.find(s) for s in p.stop if s in pending)
+                            if cut > 0:
+                                yield t, pending[:cut]
+                            return
+                        yield t, pending
+                        pending = ""
+                    logits = self.rt.step(t, pos)
+                    pos += 1
+                if out[decoded_upto:]:
+                    tail = self.tok.decode(out[decoded_upto:])
+                    if tail:
+                        yield out[-1], tail
+            finally:
+                self.current_phase = "idle"
 
     def _generate_mtp_locked(
         self,
@@ -3186,6 +3293,7 @@ class Engine:
         # Streaming decoder state
         # ------------------------------------------------------------
 
+        self.current_phase = "decode"
         out: list[int] = []
         decoded_upto = 0
         pending = ""

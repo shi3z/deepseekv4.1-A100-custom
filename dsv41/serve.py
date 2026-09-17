@@ -100,7 +100,7 @@ class Handler(BaseHTTPRequestHandler):
             if self.path in ("/v1/chat/completions", "/v1/completions"):
                 rf_type = body.get("response_format", {}).get("type")
                 has_rf_schema = rf_type == "json_schema" and "schema" in body.get("response_format", {}).get("json_schema", {})
-                if body.get("jev") or body.get("mode") == "jev" or has_rf_schema:
+                if body.get("jev") or body.get("mode") == "jev" or has_rf_schema or body.get("schema"):
                     return self._jev(body)
             if self.path == "/v1/chat/completions":
                 return self._chat(body)
@@ -195,8 +195,9 @@ class Handler(BaseHTTPRequestHandler):
                         break
             heartbeat_thread = threading.Thread(target=_heartbeat, daemon=True)
             heartbeat_thread.start()
-            # Generate while the heartbeat keeps the gateway connection alive.
-            # still be returned as proper HTTP errors.
+            if STATS_TRACKER:
+                STATS_TRACKER.record_request_start(len(ids), stream=True)
+            t_gen_0 = time.perf_counter()
             try:
                 text, n = eng.generate_text(ids, params)
 
@@ -364,14 +365,29 @@ class Handler(BaseHTTPRequestHandler):
                 _sse_write(b"data: [DONE]\n\n")
 
             except (BrokenPipeError, ConnectionResetError):
+                elapsed = time.perf_counter() - t0
+                print(f"[http] client disconnected during chat stream elapsed={elapsed:.3f}s tokens={n}", flush=True)
+                if STATS_TRACKER:
+                    STATS_TRACKER.record_disconnect()
                 return
 
+            dt_gen = time.perf_counter() - t_gen_0
+            if STATS_TRACKER and n > 0:
+                STATS_TRACKER.record_throughput(n / max(dt_gen, 1e-6), "chat-stream")
+                STATS_TRACKER.record_cache_event(
+                    f"Chat stream completed: {n} tokens in {dt_gen:.2f}s ({n / max(dt_gen, 1e-6):.1f} tok/s)"
+                )
             return
+        if STATS_TRACKER:
+            STATS_TRACKER.record_request_start(len(ids), stream=False)
         t_gen_0 = time.perf_counter()
         text, n = eng.generate_text(ids, params)
         dt_gen = time.perf_counter() - t_gen_0
         if STATS_TRACKER and n > 0:
             STATS_TRACKER.record_throughput(n / max(dt_gen, 1e-6), "chat")
+            STATS_TRACKER.record_cache_event(
+                f"Chat completed: {n} tokens in {dt_gen:.2f}s ({n / max(dt_gen, 1e-6):.1f} tok/s)"
+            )
         msg = eng.parse_completion(text, thinking)
         content = msg.get("content") if isinstance(msg, dict) else text
         out = {"id": rid, "object": "chat.completion", "created": created, "model": eng.model_name,
@@ -396,6 +412,8 @@ class Handler(BaseHTTPRequestHandler):
         rid = f"cmpl-{uuid.uuid4().hex[:24]}"
         created = int(time.time())
         if body.get("stream"):
+            if STATS_TRACKER:
+                STATS_TRACKER.record_request_start(len(ids), stream=True)
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
@@ -414,17 +432,25 @@ class Handler(BaseHTTPRequestHandler):
                 dt_gen = time.perf_counter() - t_gen_0
                 if STATS_TRACKER and n > 0:
                     STATS_TRACKER.record_throughput(n / max(dt_gen, 1e-6), "completion-stream")
+                    STATS_TRACKER.record_cache_event(
+                        f"Completion stream: {n} tokens in {dt_gen:.2f}s ({n / max(dt_gen, 1e-6):.1f} tok/s)"
+                    )
             except (BrokenPipeError, ConnectionResetError):
                 elapsed = time.perf_counter() - t0
                 print(f"[http] client disconnected during completion stream elapsed={elapsed:.3f}s tokens={n}", flush=True)
                 if STATS_TRACKER:
                     STATS_TRACKER.record_disconnect()
             return
+        if STATS_TRACKER:
+            STATS_TRACKER.record_request_start(len(ids), stream=False)
         t_gen_0 = time.perf_counter()
         text, n = eng.generate_text(ids, params)
         dt_gen = time.perf_counter() - t_gen_0
         if STATS_TRACKER and n > 0:
             STATS_TRACKER.record_throughput(n / max(dt_gen, 1e-6), "completion")
+            STATS_TRACKER.record_cache_event(
+                f"Completion: {n} tokens in {dt_gen:.2f}s ({n / max(dt_gen, 1e-6):.1f} tok/s)"
+            )
         self._json(200, {"id": rid, "object": "text_completion", "created": created, "model": eng.model_name,
                           "choices": [{"index": 0, "text": text, "finish_reason": "length" if n >= params.max_new_tokens else "stop"}],
                           "usage": {"prompt_tokens": len(ids), "completion_tokens": n, "total_tokens": len(ids) + n}}, t0=t0, is_stream=False)
@@ -463,6 +489,8 @@ class Handler(BaseHTTPRequestHandler):
             f"[jev] request start prompt_len={len(prompt)} schema_fields={len(raw_schema)} stream={stream}",
             flush=True,
         )
+        if STATS_TRACKER:
+            STATS_TRACKER.record_request_start(len(prompt), stream=stream)
 
         if stream:
             # SSE streaming response with heartbeat to prevent client / proxy timeouts
@@ -513,6 +541,13 @@ class Handler(BaseHTTPRequestHandler):
             if STATS_TRACKER:
                 eff_tokens = metrics.get("prompt_tokens", 0) + metrics.get("num_fields", 0) * 5
                 STATS_TRACKER.record_throughput(eff_tokens / max(dt_total, 1e-6), "jev-stream")
+                reused = metrics.get("prefix_saved_tokens", 0)
+                tot = metrics.get("prompt_tokens", 0)
+                hit_str = "HIT" if metrics.get("cache_hit") else "MISS"
+                STATS_TRACKER.record_cache_event(
+                    f"Jev stream [schema {hit_str}]: {metrics.get('num_fields', 0)} fields, saved {reused}/{tot} tokens ({dt_total*1000:.1f}ms)",
+                    event_type="hit" if metrics.get("cache_hit") else "info"
+                )
 
             try:
                 role_chunk = {
@@ -587,6 +622,13 @@ class Handler(BaseHTTPRequestHandler):
         if STATS_TRACKER:
             eff_tokens = metrics.get("prompt_tokens", 0) + metrics.get("num_fields", 0) * 5
             STATS_TRACKER.record_throughput(eff_tokens / max(dt_total, 1e-6), "jev")
+            reused = metrics.get("prefix_saved_tokens", 0)
+            tot = metrics.get("prompt_tokens", 0)
+            hit_str = "HIT" if metrics.get("cache_hit") else "MISS"
+            STATS_TRACKER.record_cache_event(
+                f"Jev [schema {hit_str}]: {metrics.get('num_fields', 0)} fields, saved {reused}/{tot} tokens ({dt_total*1000:.1f}ms)",
+                event_type="hit" if metrics.get("cache_hit") else "info"
+            )
 
         resp = {
             "id": rid,
@@ -657,6 +699,7 @@ def main():
     ENGINE = Engine(a.ckpt, **kw) if a.ckpt else Engine(**kw)
     ENGINE.devices = dev_list
     STATS_TRACKER = StatsTracker(active_devices=dev_list)
+    ENGINE.stats_tracker = STATS_TRACKER
     try:
         ENGINE.jev_engine.prefix_tree.init_system_prompt()
     except Exception as e:
