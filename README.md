@@ -16,42 +16,107 @@ Updated 2026-09-16. The numbers below are from the live five-GPU server logs in 
 - DSpark/MTP draft and verification are implemented and verified with `--mtp 5 --mtp-device 4`.
 - For prompts over `DSV41_MTP_LONG_PROMPT_LIMIT`, the server can unload DSpark and fall back to ordinary decode. This reduces MTP memory pressure but does not remove the full-context cache limit.
 
-## Recommended five-GPU launch
+## Deployment Profiles & Usage Recipes (用途別運用設定例)
+
+DeepSeek-V4.1 は、用途（日常の高速対話・ツール呼び出しループ vs. 100万トークン超長文解析）に応じて最適な起動プロファイルを切り替えて運用できます。
+
+### プロファイル一覧 & トレードオフ対照表
+
+| 運用プロファイル | 想定用途 | コンテキスト長 (`max_seq_len`) | 同時デコードスロット (`max_seqs`) | 単一デコード速度 | 並行合算スループット | 各GPU空きVRAM | 特徴・トレードオフ |
+|:---|:---|:---:|:---:|:---:|:---:|:---:|:---|
+| **⚡ 高速対話・エージェント型** | Claude Code, 対話, 並行ツール実行 | **64K** (65,536) | **4 スロット** (`5`) | **50〜55 tok/s** | **80〜120 tok/s** | **12〜16 GiB** | コンテキストを64Kに絞り、VRAM余裕を並行スロットに全振り |
+| **🛡️ 100万コンテキスト耐久型** | リポジトリ全量解析, 論文群一括分析 | **1M** (1,048,576) | **1 スロット** (`2`) | **45〜50 tok/s** | 45〜50 tok/s | **2〜4 GiB** | スロット数を絞り、CED+厳密伸長で100万語をOOMなく完走 |
+| **⚖️ バランス推奨型 (デフォルト)** | 日常コーディング, 2並行開発 | **1M** (1,048,576) | **2 スロット** (`3`) | **50〜51 tok/s** | **75〜80 tok/s** | **7〜10 GiB** | 2並行でリクエストを処理しつつ、長文にも即応できる安定設定 |
+
+---
+
+### ① 高速対話 & エージェント並行コーディング設定 (速度・並行数最優先)
+
+**「日常のコーディングや Claude Code のツール実行ループで、とにかくレスポンス速度と並行処理数を最大化したい」** 場合の設定です。コンテキスト長を実用十分な 64K に制限することで各 GPU の VRAM を 10GB 以上解放し、同時デコードスロットを 4 本（`max_seqs 5`）に拡張します。
 
 ```bash
-export DSV41_MOE_PREFILL_CHUNK=256
-export DSV41_ENGRAM_PREFILL_CHUNK=256
-export DSV41_HC_PREFILL_CHUNK=2048
-export DSV41_EP_COMPACT_XQ=1
+#!/usr/bin/env bash
+# run_speed_agent.sh: 速度最優先・4並行デコード設定
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+# コンテキスト長を64Kに抑え、KVキャッシュメモリを節約
 export DSV41_CACHE_INIT_TOKENS=32768
-export DSV41_EP_PREALLOC_TOKENS=65536
+export DSV41_EP_PREALLOC_TOKENS=32768
 export DSV41_EXACT_CACHE_GROW=1
 
-export DSV41_PREFIX_CACHE_DIR=/dev/shm/dsv41-prefix-cache
-export DSV41_PREFIX_CACHE_ENTRIES=16
-export DSV41_PREFIX_CACHE_GB=32
-export DSV41_PREFIX_TMPFS_ENTRIES=16
-export DSV41_PREFIX_TMPFS_GB=32
-export DSV41_PREFIX_BLOCK_REPLAY=1
-export DSV41_PREFIX_BLOCK_SIZE=512
-export DSV41_PREFIX_BLOCK_MIN=16
-export DSV41_PREFIX_ANCHOR_STRIDE=1024
-export DSV41_PREFIX_ANCHOR_MAX=2
-export DSV41_MTP_LONG_PROMPT_LIMIT=65536
-export DSV41_MTP_UNLOAD_ON_LONG=1
-unset CUDA_LAUNCH_BLOCKING
+# 並行スロット数: 5 (スロット0: プレフィル専用 + スロット1..4: 4並行デコード)
+export DSV41_MAX_SEQS=5
+
+# 通信・キャッシュ高速化
+export DSV41_EP_COMPACT_XQ=1        # P2P通信圧縮
+export DSV41_GPU_SLOT_CACHE=1       # GPU内スロット間LCP再利用 (同一セッションのプレフィル 0ms)
+export DSV41_CED=1                  # Causal Encoder-Decoder
+export DSV41_LOOP_DETECT=1          # 縮退ループ自動検知・停止
 
 python -m dsv41.serve \
-  --ckpt /mnt/ssd/models/DeepSeek-V4.1-Flash \
+  --ckpt /mnt/ssd/models/DeepSeek-V4.1-Flash-Abliterated \
   --devices 2,3,0,1 \
-  --ep --ep-shards 96,96,96,96 \
-  --max-seq-len 1048576 \
+  --ep --ep-shards 92,95,99,98 \
+  --max-seq-len 65536 \
   --max-seqs 5 \
   --host 0.0.0.0 --port 8000 \
   --mtp 0
 ```
+- **効果**: 4つのクライアント（またはツール呼び出し）が同時に進行しても待たされず、合算 **80〜120 tok/s** で高速生成されます。
 
-Check `df -h /dev/shm` and `free -h` before enabling snapshots. Engram tables alone use about 189 GiB of host RAM.
+---
+
+### ② 1,000,000 トークン超長文耐久設定 (ロバスト性・完全耐OOM)
+
+**「リポジトリ全体（数十万行）や数千ページの学術論文を一括で読み込ませ、100万トークンを絶対に OOM させずに完走させたい」** 場合の設定です。KV キャッシュのバッチ次元を最小の 2 行（プレフィル専用スロット0 + デコード1スロット）に抑え、CED と厳密キャッシュ伸長によって 80GB A100 の物理限界（98% 使用率）まで安全に使い切ります。
+
+```bash
+#!/usr/bin/env bash
+# run_1m_robust.sh: 1,000,000トークン完全完走設定
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+# 超長文向けチャンクパイプライン設定
+export DSV41_HC_PREFILL_CHUNK=2048
+export DSV41_MOE_PREFILL_CHUNK=2048
+export DSV41_ENGRAM_PREFILL_CHUNK=512
+export DSV41_SPARSE_ATTN_CHUNK=128
+
+# Causal Encoder-Decoder (CED): デコーダー層 21..39 を最終128トークンのみに限定 (計算量 47% 削減)
+export DSV41_CED=1
+export DSV41_CED_TAIL_WINDOW=128
+
+# メモリ安全化ガード
+export DSV41_EXACT_CACHE_GROW=1     # 必要な行数のみ厳密に伸長し、余分なVRAM確保を阻止
+export DSV41_PREFIX_DEDUP_MIRRORS=1 # ホストRAMスナップショットの多重ミラーを1コピーに重複排除
+export DSV41_GPU_SLOT_CACHE=1       # 過去ターンのプレフィックス再利用
+
+# スロット数を最小の2に設定 (スロット0: プレフィルスクラッチパッド + スロット1: デコード)
+export DSV41_MAX_SEQS=2
+
+python -m dsv41.serve \
+  --ckpt /mnt/ssd/models/DeepSeek-V4.1-Flash-Abliterated \
+  --devices 2,3,0,1 \
+  --ep --ep-shards 92,95,99,98 \
+  --max-seq-len 1048576 \
+  --max-seqs 2 \
+  --host 0.0.0.0 --port 8000 \
+  --mtp 0
+```
+- **効果**: 488個のマイクロチャンク（計 1,000,000 トークン）を約 95 分かけて 1 度もクラッシュ・OOM することなく 100% 安定して完走します。
+
+---
+
+### ③ バランス推奨設定 (日常運用デフォルト)
+
+**「日常的な開発で 2 本のコンテキストを同時に回しつつ、急な長文プロンプトにも耐えられる余裕を持たせたい」** 場合の標準設定です（リポジトリ同梱の [`run_server_batched.sh`](file:///mnt/ssdraid/git/deepseekv4.1/run_server_batched.sh)）。
+
+```bash
+# 同梱スクリプトでワンコマンド起動 (max-seqs=3, 2デコードスロット, 1M対応)
+./run_server_batched.sh
+```
+- **効果**: 単一デコード速度 **51.1 tok/s**、並行 2 リクエスト同時デコード対応、各 GPU に 7〜10 GiB の空き VRAM を維持。
+
+---
 
 ## API
 
