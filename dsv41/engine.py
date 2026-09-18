@@ -478,10 +478,21 @@ class Engine:
         """Structured assistant message (content / reasoning_content / tool_calls). The official parser
         wants the completion to end with the EOS string; we generate without it, so append it."""
         eos = self.tok.eos_token or ""
+        clean_text = text
+        if "<｜DSML｜ calls>" in clean_text:
+            if "<｜DSML｜ parameter" in clean_text and "</｜DSML｜ parameter>" not in clean_text:
+                clean_text += "</｜DSML｜ parameter>"
+            if "<｜DSML｜ invoke" in clean_text and "</｜DSML｜ invoke>" not in clean_text:
+                clean_text += "\n</｜DSML｜ invoke>"
+            if "</｜DSML｜ calls>" not in clean_text:
+                clean_text += "\n</｜DSML｜ calls>"
         try:
-            return self._parse(text + eos, thinking_mode=thinking_mode or self.thinking_mode)
+            return self._parse(clean_text + eos, thinking_mode=thinking_mode or self.thinking_mode)
         except Exception:
-            return {"role": "assistant", "content": text, "reasoning_content": None, "tool_calls": []}
+            try:
+                return self._parse(text + eos, thinking_mode=thinking_mode or self.thinking_mode)
+            except Exception:
+                return {"role": "assistant", "content": text, "reasoning_content": None, "tool_calls": []}
 
     # ---------------------------------------------------------------- generation
     @torch.inference_mode()

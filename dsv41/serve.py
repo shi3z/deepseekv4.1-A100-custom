@@ -31,22 +31,22 @@ def _params(body: dict) -> GenParams:
     stop = body.get("stop") or []
     if isinstance(stop, str):
         stop = [stop]
-    default_rep_pen = float(os.environ.get("DSV41_REPETITION_PENALTY", "1.10"))
+    default_rep_pen = float(os.environ.get("DSV41_REPETITION_PENALTY", "1.05"))
     default_pres_pen = float(os.environ.get("DSV41_PRESENCE_PENALTY", "0.0"))
-    default_freq_pen = float(os.environ.get("DSV41_FREQUENCY_PENALTY", "0.10"))
+    default_freq_pen = float(os.environ.get("DSV41_FREQUENCY_PENALTY", "0.0"))
     default_window = int(os.environ.get("DSV41_PENALTY_WINDOW", "256"))
-    default_prog_pen = float(os.environ.get("DSV41_PROGRESSIVE_PENALTY", "1.5"))
+    default_prog_pen = float(os.environ.get("DSV41_PROGRESSIVE_PENALTY", "0.0"))
     default_ban_cycles = os.environ.get("DSV41_BAN_CYCLES", "1").strip().lower() not in ("0", "false", "off")
 
-    rep_pen = float(body.get("repetition_penalty") or default_rep_pen)
-    pres_pen = float(body.get("presence_penalty") or default_pres_pen)
-    freq_pen = float(body.get("frequency_penalty") or default_freq_pen)
+    rep_pen = float(body.get("repetition_penalty") if body.get("repetition_penalty") is not None else default_rep_pen)
+    pres_pen = float(body.get("presence_penalty") if body.get("presence_penalty") is not None else default_pres_pen)
+    freq_pen = float(body.get("frequency_penalty") if body.get("frequency_penalty") is not None else default_freq_pen)
     window = int(body.get("penalty_window") or default_window)
-    prog_pen = float(body.get("progressive_penalty") or default_prog_pen)
+    prog_pen = float(body.get("progressive_penalty") if body.get("progressive_penalty") is not None else default_prog_pen)
     ban_cycles = bool(body.get("ban_cycles") if body.get("ban_cycles") is not None else default_ban_cycles)
 
     return GenParams(
-        max_new_tokens=int(body.get("max_tokens") or body.get("max_completion_tokens") or 1024),
+        max_new_tokens=int(body.get("max_tokens") or body.get("max_completion_tokens") or 4096),
         temperature=float(body.get("temperature", 0.6)),
         top_p=float(body.get("top_p", 0.95)),
         stop=list(stop),
@@ -179,7 +179,13 @@ class Handler(BaseHTTPRequestHandler):
                 "[http-debug] prefix-cache=ON for this request",
                 flush=True,
             )
-        messages = body.get("messages") or []
+        messages = copy.deepcopy(body.get("messages") or [])
+        tools = body.get("tools")
+        if tools and messages:
+            if messages[0].get("role") == "system":
+                messages[0]["tools"] = tools
+            else:
+                messages.insert(0, {"role": "system", "content": "", "tools": tools})
         thinking = "thinking" if body.get("reasoning_effort") or body.get("thinking") else None
         try:
             ids = eng.tok.encode(eng.chat_prompt(messages, thinking))
@@ -190,7 +196,7 @@ class Handler(BaseHTTPRequestHandler):
         # with max_tokens=32000.  Keep interactive retries bounded so a
         # response reaches the client and the request can complete.  Hosts
         # that need longer answers can raise this explicitly.
-        _interactive_cap = int(os.environ.get("DSV41_INTERACTIVE_MAX_NEW", "2048"))
+        _interactive_cap = int(os.environ.get("DSV41_INTERACTIVE_MAX_NEW", "8192"))
         requested_max_tokens = body.get("max_tokens") or body.get("max_completion_tokens")
         if _interactive_cap > 0 and params.max_new_tokens > _interactive_cap:
             params.max_new_tokens = _interactive_cap
