@@ -576,6 +576,8 @@ class DecodeRuntime:
             except Exception as _recap_exc:
                 print(f"[decode-cache] CUDA graph recapture failed ({_recap_exc}); falling back to eager decode", flush=True)
                 self.graphs.clear()
+                if hasattr(self, "reset_sync_state"):
+                    self.reset_sync_state()
 
     def set_rows(self, token, pos, seq=None, pmax=None):
         """Fill the row tables: token(s), position(s), sequence id per row (default 0..B-1) and the newest position

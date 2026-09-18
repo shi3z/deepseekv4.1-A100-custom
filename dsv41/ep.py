@@ -541,6 +541,9 @@ class EPRuntime(DecodeRuntime):
                 for d in self.devs:
                     torch.cuda.synchronize(d)
                 self._graph_cache_signature = self._cache_signature()
+        except Exception:
+            self.reset_sync_state()
+            raise
         finally:
             self.dry = False
             for attn, old_cos, old_sin in _rope_restore:
@@ -548,6 +551,22 @@ class EPRuntime(DecodeRuntime):
                 if attn.indexer is not None:
                     attn.indexer.cos, attn.indexer.sin = old_cos, old_sin
             self.m.args.max_seq_len = _logical_max_seq
+
+    def reset_sync_state(self):
+        """Reset sequence counters and P2P flags across all devices to prevent eager deadlock."""
+        self.dry = False
+        self.graphs.clear()
+        for d in self.devs:
+            try:
+                torch.cuda.synchronize(d)
+                self.seqno[d].fill_(1)
+                self.flag_route[d].zero_()
+                self.flag_part[d].zero_()
+                self.flag_hop[d].zero_()
+                self.flag_relay[d].zero_()
+                torch.cuda.synchronize(d)
+            except Exception:
+                pass
 
     def _eager_token(self):
         """One token without graphs, the devices interleaved per layer on their own streams."""
