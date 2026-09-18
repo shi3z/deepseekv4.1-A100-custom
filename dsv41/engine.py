@@ -474,25 +474,87 @@ class Engine:
     def chat_prompt(self, messages: list[dict], thinking_mode: str | None = None) -> str:
         return self._encode(messages, thinking_mode=thinking_mode or self.thinking_mode)
 
+    @staticmethod
+    def _fallback_parse_dsml(text: str) -> list[dict]:
+        import re, json
+        tool_calls = []
+        invokes = re.findall(
+            r'<｜DSML｜ invoke name=[\"\'](.*?)[\"\']>(.*?)(?:</｜DSML｜ invoke>|(?=<｜DSML｜ invoke)|(?=</｜DSML｜ calls>)|$)',
+            text,
+            re.DOTALL,
+        )
+        for name, body in invokes:
+            args = {}
+            params = re.findall(
+                r'<｜DSML｜ parameter name=[\"\'](.*?)[\"\'](?: string=[\"\'].*?[\"\'])?>(.*?)(?:</｜DSML｜ parameter>|(?=<｜DSML｜ parameter)|(?=</｜DSML｜ invoke)|$)',
+                body,
+                re.DOTALL,
+            )
+            for pname, pval in params:
+                pval = re.sub(r'</?(?:｜DSML｜|think|analysis).*?>', '', pval).strip()
+                try:
+                    args[pname] = json.loads(pval)
+                except Exception:
+                    args[pname] = pval
+            tool_calls.append({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(args, ensure_ascii=False),
+                },
+            })
+        return tool_calls
+
     def parse_completion(self, text: str, thinking_mode: str | None = None) -> dict:
         """Structured assistant message (content / reasoning_content / tool_calls). The official parser
         wants the completion to end with the EOS string; we generate without it, so append it."""
         eos = self.tok.eos_token or ""
+        reasoning = None
         clean_text = text
+
+        if "</think>" in clean_text:
+            parts = clean_text.split("</think>", 1)
+            reasoning = parts[0].strip()
+            if "<think>" in reasoning:
+                reasoning = reasoning.split("<think>", 1)[1].strip()
+            clean_text = parts[1]
+
         if "<｜DSML｜ calls>" in clean_text:
+            idx = clean_text.find("<｜DSML｜ calls>")
+            prefix = clean_text[:idx].rstrip("\n")
+            rest = clean_text[idx:]
+            clean_text = prefix + "\n\n" + rest
+
             if "<｜DSML｜ parameter" in clean_text and "</｜DSML｜ parameter>" not in clean_text:
                 clean_text += "</｜DSML｜ parameter>"
             if "<｜DSML｜ invoke" in clean_text and "</｜DSML｜ invoke>" not in clean_text:
                 clean_text += "\n</｜DSML｜ invoke>"
             if "</｜DSML｜ calls>" not in clean_text:
                 clean_text += "\n</｜DSML｜ calls>"
+
         try:
-            return self._parse(clean_text + eos, thinking_mode=thinking_mode or self.thinking_mode)
+            res = self._parse(clean_text + eos, thinking_mode=thinking_mode or self.thinking_mode)
+            if reasoning and not res.get("reasoning_content"):
+                res["reasoning_content"] = reasoning
+            return res
         except Exception:
-            try:
-                return self._parse(text + eos, thinking_mode=thinking_mode or self.thinking_mode)
-            except Exception:
-                return {"role": "assistant", "content": text, "reasoning_content": None, "tool_calls": []}
+            pass
+
+        # Fallback DSML parser if official parser failed on malformed/special tokens
+        if "<｜DSML｜" in text:
+            tool_calls = self._fallback_parse_dsml(text)
+            if tool_calls:
+                content = clean_text
+                if "<｜DSML｜" in content:
+                    content = content[:content.find("<｜DSML｜")].strip()
+                return {
+                    "role": "assistant",
+                    "content": content,
+                    "reasoning_content": reasoning,
+                    "tool_calls": tool_calls,
+                }
+
+        return {"role": "assistant", "content": clean_text.strip(), "reasoning_content": reasoning, "tool_calls": []}
 
     # ---------------------------------------------------------------- generation
     @torch.inference_mode()
