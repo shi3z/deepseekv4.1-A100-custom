@@ -7,7 +7,7 @@ Updated 2026-09-16. The numbers below are from the live five-GPU server logs in 
 ## Current status
 
 - 40 backbone layers and 384 experts are distributed across GPUs `2,0,1,3,4` with EP shards `77,77,77,77,76`.
-- **1,000,000-Token Prefill Demonstrated**: Full 1M context cold prefill is empirically verified and benchmarked on 4$\times$ A100 80GB (`cuda:0,1,2,3`) using 4-stage Chunked Pipeline Parallelism and head-accumulated BMM indexer with zero OOM errors.
+- **1,000,000-Token Prefill Demonstrated**: Full 1M context cold prefill is empirically verified and benchmarked on 4× A100 80GB (`cuda:0,1,2,3`) using 4-stage Chunked Pipeline Parallelism and head-accumulated BMM indexer with zero OOM errors.
 - **CED (Causal Encoder-Decoder) / Decoder SWA Bounded Replay**: Intermediate prefill chunks run exclusively through layers 0..20 (Encoder side), generating all global compressed KV and candidate index representations. Decoder layers 21..39 only process the final 128-token SWA window, saving **~47% of prefill compute** on long contexts.
 - **In-GPU Slot Cache & Prefix Replay**: Consecutive requests sharing a common prefix (e.g. Claude Code tool use / agentic coding) detect Longest Common Prefix (LCP) in GPU VRAM across active slots (`copy_seq`), forwarding only suffix tokens (e.g. 500 suffix tokens in 2s vs re-prefilling 128K tokens in 15 minutes). The web dashboard clearly distinguishes **Cold Prefill** from **Prefix Replay** with live hit rate and instant ETA.
 - **Compacted Canonical Snapshot Storage**: Host-RAM snapshots deduplicate multi-device GPU mirrors into a single canonical copy per owner, bound SWA windows to 128 rows, and slice Engram history to logical prefix length, slashing host RAM footprint by ~75% and accelerating restore via fast P2P GPU broadcast.
@@ -106,7 +106,7 @@ python -m dsv41.serve \
   --host 0.0.0.0 --port 8000 \
   --mtp 0
 ```
-- **Performance Impact**: Evaluates 488 pipelined micro-chunks across 4$\times$ A100 GPUs (1,000,000 tokens) in ~95 minutes without crashing or encountering out-of-memory errors.
+- **Performance Impact**: Evaluates 488 pipelined micro-chunks across 4× A100 GPUs (1,000,000 tokens) in ~95 minutes without crashing or encountering out-of-memory errors.
 
 ---
 
@@ -114,7 +114,7 @@ python -m dsv41.serve \
 
 **Best for**: General software development, multi-turn Claude Code workflows, and 2-stream concurrent serving.
 
-Provides a balanced operating point with **2 concurrent decode slots** (`max_seqs 3`), full 1M context potential, in-GPU slot cache acceleration, dedicated $B=1$ CUDA graph speed, and **7–10 GiB of free VRAM headroom** per GPU.
+Provides a balanced operating point with **2 concurrent decode slots** (`max_seqs 3`), full 1M context potential, in-GPU slot cache acceleration, dedicated `B=1` CUDA graph speed, and **7–10 GiB of free VRAM headroom** per GPU.
 
 ```bash
 # Launch with bundled production script (max-seqs=3, 2 decode slots, 1M context ready)
@@ -213,9 +213,9 @@ At 117,896 tokens, MTP fallback and DSpark unloading were triggered, but the com
 
 ### 1,000,000-Token Prefill Milestone
 
-Full 1M-token ($1,048,576$ max logical) cold prefill has been successfully demonstrated and benchmarked on **4$\times$ NVIDIA A100 80GB PCIe GPUs (`cuda:0, 1, 2, 3`)** using 4-stage Chunked Pipeline Parallelism ($C=2048$) and head-accumulated BMM indexer scoring.
+Full 1M-token (1,048,576 max logical) cold prefill has been successfully demonstrated and benchmarked on **4× NVIDIA A100 80GB PCIe GPUs (`cuda:0, 1, 2, 3`)** using 4-stage Chunked Pipeline Parallelism ($C=2048$) and head-accumulated BMM indexer scoring.
 
-- **Total Tokens Prefilled**: **1,000,000** tokens ($488$ micro-chunks of $2,048$ tokens + final $496$ tokens)
+- **Total Tokens Prefilled**: **1,000,000** tokens (488 micro-chunks of 2,048 tokens + final 496 tokens)
 - **Total Elapsed Time**: **5,729.20 s (95.49 min / ~1.59 hours)**
 - **Cumulative Average Throughput**: **174.54 tok/s**
 - **Peak VRAM Footprint**: `[79.11, 76.00, 78.86, 77.38] GiB` (over 97% capacity on 80 GiB A100s)
@@ -223,7 +223,7 @@ Full 1M-token ($1,048,576$ max logical) cold prefill has been successfully demon
 
 ### Prefill Throughput Benchmark Across Context Lengths
 
-The following measurements evaluate cold prefill performance across varying context lengths on 4$\times$ A100 80GB GPUs:
+The following measurements evaluate cold prefill performance across varying context lengths on 4× A100 80GB GPUs:
 
 | Context Length (Tokens) | Execution Paradigm | Chunk Size ($C$) | Elapsed Time | Instantaneous Throughput | Cumulative Avg Throughput | Peak VRAM (per GPU) | Notes |
 |---|---|---|---|---|---|---|---|
@@ -247,26 +247,26 @@ A critical observation from the benchmarks is why single-request short-context p
    - In DeepSeek-V4.1, attention compute is sparse: each query token only attends to Top-$K$ key tokens ($O(K)$ attention computation per query, which is strictly $O(1)$ relative to sequence length $T$).
    - However, to determine *which* $K$ keys to attend to, the **DSA Indexer** module must compute similarity scores between query index vectors and **all historical compressed key tokens**:
      $$\text{Scores}_{\text{index}} = Q_{\text{idx}} K_{\text{idx}}^T \quad (Q_{\text{idx}} \in \mathbb{R}^{S \times D}, K_{\text{idx}} \in \mathbb{R}^{T \times D})$$
-   - When context is short ($T \le 8,192$), $K_{\text{idx}}$ is small ($<2\text{ MB}$), and the index scoring matrix multiplication completes in microseconds with negligible FLOPs.
-   - When context reaches $1,000,000$ tokens ($T = 10^6$), each incoming micro-chunk ($S=2,048$) must score against the full historical key set of up to $1\text{M}$ tokens across 32 index heads ($D=128$). Even with GPU-accelerated BMM, the memory bandwidth required to scan 1M keys and the dot-product FLOPs scale linearly with $T$ ($O(S \cdot T)$).
-   - Consequently, chunk latency smoothly scales from **$5.17\text{ s}$ per chunk (396 tok/s)** at $T=32\text{K}$ to **$18.2\text{ s}$ per chunk (112.5 tok/s)** at $T=983\text{K}$.
+   - When context is short ($T \le 8,192$), $K_{\text{idx}}$ is small (< 2 MB), and the index scoring matrix multiplication completes in microseconds with negligible FLOPs.
+   - When context reaches 1,000,000 tokens ($T = 10^6$), each incoming micro-chunk ($S=2,048$) must score against the full historical key set of up to 1M tokens across 32 index heads ($D=128$). Even with GPU-accelerated BMM, the memory bandwidth required to scan 1M keys and the dot-product FLOPs scale linearly with $T$ ($O(S \cdot T)$).
+   - Consequently, chunk latency smoothly scales from **5.17 s per chunk (396 tok/s)** at $T=32\text{K}$ to **18.2 s per chunk (112.5 tok/s)** at $T=983\text{K}$.
 
 2. **Monolithic GEMM Saturation vs. Chunked Pipelined Micro-Batches**:
    - In short prompts ($T \le 8,192$), the full sequence is fed into monolithic GEMM kernels ($M=2048, 4096, 8192$). Large matrix dimensions maximize Tensor Core arithmetic intensity and saturate all 108 Streaming Multiprocessors (SMs) on the A100, reaching peak theoretical efficiency (~600 tok/s).
-   - At 1M tokens, a monolithic forward pass is physically impossible: activation memory alone would exceed $100\text{ GiB}$, immediately causing an out-of-memory crash.
-   - Prefill must therefore be sliced into $2,048$-token micro-chunks across a 4-stage pipeline. Slicing prevents activation blowup, but micro-chunk execution incurs pipeline warm-up/drain bubble overhead and operates at slightly lower Tensor Core occupancy than an 8,192 monolithic matrix.
+   - At 1M tokens, a monolithic forward pass is physically impossible: activation memory alone would exceed 100 GiB, immediately causing an out-of-memory crash.
+   - Prefill must therefore be sliced into 2,048-token micro-chunks across a 4-stage pipeline. Slicing prevents activation blowup, but micro-chunk execution incurs pipeline warm-up/drain bubble overhead and operates at slightly lower Tensor Core occupancy than an 8,192 monolithic matrix.
 
 3. **12.5 GiB Static Cache & HBM2 Saturation (>97% VRAM)**:
-   - Supporting 1M tokens requires pre-allocating the full compressed KV cache, window KV cache, and index keys, occupying **$12.5\text{ GiB}$** of VRAM per GPU. Total allocated GPU memory reaches **$76.0 \sim 79.1\text{ GiB}$ out of $80\text{ GiB}$** (>97% capacity).
+   - Supporting 1M tokens requires pre-allocating the full compressed KV cache, window KV cache, and index keys, occupying **12.5 GiB** of VRAM per GPU. Total allocated GPU memory reaches **76.0 ~ 79.1 GiB out of 80 GiB** (>97% capacity).
    - Operating near physical memory capacity eliminates L2 cache residency for key tables and places continuous demand on the HBM2 memory controller bus, moderating throughput compared to small cache allocations.
 
-### Architectural Optimizations Enabling 1M Context on 4$\times$ A100
+### Architectural Optimizations Enabling 1M Context on 4× A100
 
 1. **Head-Accumulated BMM Indexer (`dsv41/model.py`)**:
-   Standard indexer implementations perform full-tensor contraction (`torch.einsum("bshd,btd->bsht", ...)`), which materializes an intermediate tensor of shape `(1, S, 32, T)`. At $T=200,000$, this single tensor required $3.31\text{ GiB}$ of transient activation VRAM, causing an OOM crash. At $T=1,000,000$, it would have required $>16.5\text{ GiB}$. We re-engineered the indexer to iterate over index heads sequentially using `torch.bmm`, reducing peak intermediate memory by **$32\times$** to a constant $256\text{ MB}$, completely eliminating indexer OOMs.
+   Standard indexer implementations perform full-tensor contraction (`torch.einsum("bshd,btd->bsht", ...)`), which materializes an intermediate tensor of shape `(1, S, 32, T)`. At $T=200,000$, this single tensor required 3.31 GiB of transient activation VRAM, causing an OOM crash. At $T=1,000,000$, it would have required > 16.5 GiB. We re-engineered the indexer to iterate over index heads sequentially using `torch.bmm`, reducing peak intermediate memory by **32×** to a constant 256 MB, completely eliminating indexer OOMs.
 
 2. **Zero-Host-Sync GPU Vector MoE Dispatch (`dsv41/moe_kernels.py`)**:
-   Eliminated host-side CPU sorting (`argsort`) in MoE dispatch. Token-to-expert mapping is now performed via pure CUDA tensor operations (`GroupedPairs`), dropping `cudaStreamSynchronize` waiting time from **$5.5\text{ s}$ to $0.004\text{ s}$ per chunk** (>1,000$\times$ scheduling speedup).
+   Eliminated host-side CPU sorting (`argsort`) in MoE dispatch. Token-to-expert mapping is now performed via pure CUDA tensor operations (`GroupedPairs`), dropping `cudaStreamSynchronize` waiting time from **5.5 s to 0.004 s per chunk** (>1,000× scheduling speedup).
 
 3. **4-Stage Chunked Pipeline Parallelism (`forward_pipelined`)**:
    Distributed 40 transformer layers across 4 GPUs (10 layers per GPU: Stage 0 = layers 0–9 on `cuda:0`, Stage 1 = layers 10–19 on `cuda:1`, Stage 2 = layers 20–29 on `cuda:2`, Stage 3 = layers 30–39 on `cuda:3`). Dedicated inter-device P2P CUDA streams and pre-allocated CUDA events overlap activation transfers with stage computations, keeping all 4 GPUs actively computing without CPU blocking.
@@ -324,7 +324,7 @@ Controlled by `DSV41_CED=1` (enabled by default) and `DSV41_CED_TAIL_WINDOW=128`
 For multi-turn agentic workflows (e.g. Claude Code tool use), successive requests share an extensive common prefix (often 95%–99.9% identical tokens). Re-prefilling 128K context for every tool call wastes minutes of compute time.
 
 1. **In-GPU Slot Reuse (`_find_best_gpu_slot`)**:
-   - The engine tracks token sequences across active GPU slots ($0 \dots \text{max\_seqs}-1$).
+   - The engine tracks token sequences across active GPU slots (`0` through `max_seqs - 1`).
    - Upon a new request, it computes the Longest Common Prefix (LCP) against all slots.
    - If an existing slot contains a matching prefix, the runtime copies slot state directly in GPU VRAM via `copy_seq` (< 0.05 ms) and forwards *only the suffix delta* on slot 0.
 2. **Cold Prefill vs. Prefix Replay Separation**:
@@ -340,7 +340,7 @@ For multi-turn agentic workflows (e.g. Claude Code tool use), successive request
    - Prior snapshot engines dumped all 4 mirrors separately into host RAM, resulting in 122 GiB of bloat across 19 entries.
    - The snapshot manager now records only **1 canonical copy per owner** in host RAM and tmpfs, broadcasting GPU-to-GPU via PCIe/NVLink upon restore (75% RAM reduction).
 2. **Dynamic Cache & History Slicing**:
-   - `NgramHashState.cache` is sliced from $1,000,000$ tokens down to the logical prefix length.
+   - `NgramHashState.cache` is sliced from 1,000,000 tokens down to the logical prefix length.
    - `window_kv_cache` is bounded to 128 rows.
 
 ## Jev Mode: Parallel Non-Autoregressive Structured Output & Hierarchical Prefix Cache (Updated 2026-09-17)
@@ -404,7 +404,7 @@ Traditional structured JSON extraction with LLMs serializes data generation into
 
 ### Benchmark Results: Normal Autoregressive JSON vs. Jev Mode
 
-Measured using `python3 -m dsv41.bench_jev` on 4$\times$ NVIDIA A100 80GB PCIe GPUs:
+Measured using `python3 -m dsv41.bench_jev` on 4× NVIDIA A100 80GB PCIe GPUs:
 
 | Case | Fields | Normal JSON Decode Latency | Normal Output Tokens | Jev Mode Latency | Jev Output Tokens | Speedup | Result Consistency | Effective Jev Throughput |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -414,7 +414,7 @@ Measured using `python3 -m dsv41.bench_jev` on 4$\times$ NVIDIA A100 80GB PCIe G
 | **Case D** | 100 fields | 30,745.8 ms (30.7 s) | 898 tok | **61.5 ms** | **798 tok** | **500.1 ×** | 68.0% | **12,979.8 tok/s** |
 
 #### Key Performance Takeaways:
-1. **O(1) Latency Scaling & Massive Throughput**: While normal autoregressive generation scales linearly with field count ($2.0\text{ s} \to 4.2\text{ s} \to 9.8\text{ s} \to 30.7\text{ s}$), Jev Mode execution latency remains **flat at 24.0 ms** from 3 up to 30 fields, scaling effective structured output throughput from **917 tok/s** up to over **12,980 tok/s**.
+1. **O(1) Latency Scaling & Massive Throughput**: While normal autoregressive generation scales linearly with field count (2.0 s → 4.2 s → 9.8 s → 30.7 s), Jev Mode execution latency remains **flat at 24.0 ms** from 3 up to 30 fields, scaling effective structured output throughput from **917 tok/s** up to over **12,980 tok/s**.
 2. **408× Speedup**: On 30 fields, Jev Mode reduces latency from ~9.8 seconds down to 24 milliseconds.
 3. **500× Speedup on 100 Fields**: Normal generation takes over 30 seconds serializing 898 tokens, whereas Jev Mode extracts and tokenizes all 100 typed fields in **61.5 ms** (~13,000 tok/s effective throughput).
 
@@ -424,7 +424,7 @@ See [`examples/jev_mode/`](file:///mnt/ssdraid/git/deepseekv4.1/examples/jev_mod
 
 ### Autoregressive Decode Throughput (Single Stream)
 
-Measured using [`examples/benchmarks/bench_decode_throughput.py`](file:///mnt/ssdraid/git/deepseekv4.1/examples/benchmarks/bench_decode_throughput.py) on 4$\times$ NVIDIA A100 80GB PCIe GPUs:
+Measured using [`examples/benchmarks/bench_decode_throughput.py`](file:///mnt/ssdraid/git/deepseekv4.1/examples/benchmarks/bench_decode_throughput.py) on 4× NVIDIA A100 80GB PCIe GPUs:
 
 | Prompt Context | Target Generated Tokens | Actual Tokens Generated | Total Time | Generation Throughput |
 |:---|:---:|:---:|:---:|:---:|
