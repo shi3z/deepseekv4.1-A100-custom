@@ -19,7 +19,7 @@ export DSV41_EXACT_CACHE_GROW=1
 export DSV41_CED=1
 export DSV41_GPU_SLOT_CACHE=1
 export DSV41_PREFIX_DEDUP_MIRRORS=1
-export DSV41_MAX_SEQS=2
+export DSV41_MAX_SEQS=3
 export DSV41_REPETITION_PENALTY=1.05
 export DSV41_FREQUENCY_PENALTY=0.02
 export DSV41_PRESENCE_PENALTY=0.0
@@ -55,7 +55,7 @@ exec /home/shi3z/.local/bin/python -u -m dsv41.serve \
     --ep \
     --ep-shards 92,95,99,98 \
     --max-seq-len 1048576 \
-    --max-seqs 2 \
+    --max-seqs 3 \
     --host 0.0.0.0 \
     --port 8000 \
     --mtp 0
