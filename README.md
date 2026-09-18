@@ -337,22 +337,109 @@ Measured using `python3 -m dsv41.bench_jev` on 4$\times$ NVIDIA A100 80GB PCIe G
 
 | Case | Fields | Normal JSON Decode Latency | Normal Output Tokens | Jev Mode Latency | Jev Output Tokens | Speedup | Result Consistency | Effective Jev Throughput |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| **Case A** | 3 fields | 1,951.5 ms | 27 tok | **24.0 ms** | **22 tok** | **81.4 ×** | **100.0%** | **917 tok/s** |
-| **Case B** | 10 fields | 3,070.4 ms | 90 tok | **24.0 ms** | **78 tok** | **128.0 ×** | 60.0% | **3,250 tok/s** |
-| **Case C** | 30 fields | 8,798.6 ms (8.8 s) | 268 tok | **24.0 ms** | **238 tok** | **366.9 ×** | 73.3% | **9,917 tok/s** |
-| **Case D** | 100 fields | 24,949.4 ms (24.9 s) | 898 tok | **61.5 ms** | **798 tok** | **405.8 ×** | 45.0% | **12,975 tok/s** |
+| **Case A** | 3 fields | 2,018.8 ms | 27 tok | **24.0 ms** | **22 tok** | **84.2 ×** | **100.0%** | **917.4 tok/s** |
+| **Case B** | 10 fields | 4,204.1 ms | 90 tok | **24.0 ms** | **78 tok** | **175.3 ×** | 80.0% | **3,252.7 tok/s** |
+| **Case C** | 30 fields | 9,773.3 ms (9.8 s) | 268 tok | **24.0 ms** | **238 tok** | **407.6 ×** | 73.3% | **9,924.9 tok/s** |
+| **Case D** | 100 fields | 30,745.8 ms (30.7 s) | 898 tok | **61.5 ms** | **798 tok** | **500.1 ×** | 68.0% | **12,979.8 tok/s** |
 
 #### Key Performance Takeaways:
-1. **O(1) Latency Scaling & Massive Throughput**: While normal autoregressive generation scales linearly with field count ($2\text{ s} \to 3\text{ s} \to 8.8\text{ s} \to 25\text{ s}$), Jev Mode execution latency remains **flat at 24.0 ms** from 3 up to 30 fields, scaling effective structured output throughput from **917 tok/s** up to over **12,900 tok/s**.
-2. **367x Speedup**: On 30 fields, Jev Mode reduces latency from ~9 seconds down to 24 milliseconds.
-3. **Ultra-Fast 100-Field Extraction**: Normal generation takes 25 seconds serializing 898 tokens, whereas Jev Mode extracts and tokenizes all 100 typed fields in **61.5 ms** (~13,000 tok/s effective throughput).
+1. **O(1) Latency Scaling & Massive Throughput**: While normal autoregressive generation scales linearly with field count ($2.0\text{ s} \to 4.2\text{ s} \to 9.8\text{ s} \to 30.7\text{ s}$), Jev Mode execution latency remains **flat at 24.0 ms** from 3 up to 30 fields, scaling effective structured output throughput from **917 tok/s** up to over **12,980 tok/s**.
+2. **408× Speedup**: On 30 fields, Jev Mode reduces latency from ~9.8 seconds down to 24 milliseconds.
+3. **500× Speedup on 100 Fields**: Normal generation takes over 30 seconds serializing 898 tokens, whereas Jev Mode extracts and tokenizes all 100 typed fields in **61.5 ms** (~13,000 tok/s effective throughput).
 
-### Dominant Bottleneck Identification & Optimization Path
+See [`examples/jev_mode/`](file:///mnt/ssdraid/git/deepseekv4.1/examples/jev_mode/README.md) and [`examples/benchmarks/bench_jev_structured.py`](file:///mnt/ssdraid/git/deepseekv4.1/examples/benchmarks/bench_jev_structured.py) for runnable code and live demos.
 
-1. **Request Input Prefill Bottleneck (11.4 ms, 47.5% of total time)**:
-   While system and schema prefixes hit the cache in 0.08 ms, user input text (35 tokens) accounts for nearly half the latency. For workflows analyzing the same document against multiple schemas, caching document tokens at Level 3 allows subsequent queries to execute in **~12 ms**.
-2. **Micro-Batch Scaling for Ultra-Large Schemas (Case D: 100 fields)**:
-   With default `max_batch=32`, 100 fields are processed in 4 micro-batches ($32 \times 3 + 4$), scaling scoring time to $50.0\text{ ms}$. Increasing batch capacity to `DSV41_JEV_MAX_BATCH=128` processes all 100 fields in a single forward pass, reducing 100-field latency to **~24 ms**.
+## Generation Throughput & Prefix Cache Hit Benchmarks (Updated 2026-09-18)
+
+### Autoregressive Decode Throughput (Single Stream)
+
+Measured using [`examples/benchmarks/bench_decode_throughput.py`](file:///mnt/ssdraid/git/deepseekv4.1/examples/benchmarks/bench_decode_throughput.py) on 4$\times$ NVIDIA A100 80GB PCIe GPUs:
+
+| Prompt Context | Target Generated Tokens | Actual Tokens Generated | Total Time | Generation Throughput |
+|:---|:---:|:---:|:---:|:---:|
+| **Short Prompt (12 words)** | 64 | 64 | 1.75 s | **36.5 tok/s** |
+| **Short Prompt (12 words)** | 128 | 128 | 3.05 s | **42.0 tok/s** |
+| **Short Prompt (12 words)** | 256 | 256 | 5.35 s | **47.8 tok/s** |
+| **Medium Prompt (~100 words)** | 128 | 128 | 3.58 s | **35.7 tok/s** |
+| **Medium Prompt (~100 words)** | 256 | 256 | 5.52 s | **46.3 tok/s** |
+
+### Prefix Cache Hit Acceleration (LCP Reuse)
+
+Measured using [`examples/benchmarks/bench_prefix_cache_hit.py`](file:///mnt/ssdraid/git/deepseekv4.1/examples/benchmarks/bench_prefix_cache_hit.py) simulating a multi-turn developer session with a shared 1,367-token context (codebase architecture, tool definitions, rules):
+
+| Conversation Turn | Cache State | Prompt Tokens | Total Round-Trip Time | Speedup vs Cold |
+|:---|:---:|:---:|:---:|:---:|
+| **Turn 1 (Initial Prompt)** | **Cache MISS** (Cold prefill & store) | 1,367 | 6.761 s | Baseline |
+| **Turn 2 (Shared Prefix Turn)** | **Cache HIT** (LCP reuse via GPU slot) | 1,365 | **0.992 s** | **6.82× faster** |
+| **Turn 3 (Multi-turn Continuation)**| **Incremental HIT** (Tail prefill only) | 1,407 | **1.496 s** | **4.52× faster** |
+
+---
+
+## Claude Code Local Backend via LiteLLM
+
+DeepSeek-V4.1 can be used as a drop-in local inference backend for Anthropic's official [Claude Code CLI](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview) (`claude`), providing an entirely private, self-hosted coding assistant with multi-turn prefix cache acceleration.
+
+### Architecture
+
+```mermaid
+flowchart LR
+    subgraph Client ["Developer Workstation"]
+        CC["Claude Code CLI<br/>(ANTHROPIC_BASE_URL)"]
+    end
+
+    subgraph Proxy ["LiteLLM Translation Layer"]
+        LL["LiteLLM Proxy<br/>(:8101)<br/>Anthropic Messages ↔ OpenAI Chat"]
+    end
+
+    subgraph Backend ["Local GPU Cluster"]
+        DS["DeepSeek-V4.1 Engine<br/>(:8000)<br/>EP + Dynamic Compressed KV + LCP Cache"]
+    end
+
+    CC -->|Anthropic API /v1/messages| LL
+    LL -->|OpenAI API /v1/chat/completions| DS
+```
+
+### Quick Setup
+
+1. **Start LiteLLM Proxy**:
+   Use the tested configuration in [`examples/claude_code/dsv41-litellm.yaml`](file:///mnt/ssdraid/git/deepseekv4.1/examples/claude_code/dsv41-litellm.yaml):
+   ```bash
+   litellm --config examples/claude_code/dsv41-litellm.yaml --host 127.0.0.1 --port 8101
+   ```
+
+2. **Verify Connectivity & Tool Calling**:
+   Run the verification suite in [`examples/claude_code/verify_litellm.py`](file:///mnt/ssdraid/git/deepseekv4.1/examples/claude_code/verify_litellm.py):
+   ```bash
+   python3 examples/claude_code/verify_litellm.py
+   ```
+   *(Verifies health, model translation, LCP prefix cache hit, and Anthropic tool use format).*
+
+3. **Launch Claude Code**:
+   Run the pre-configured production wrapper in [`examples/claude_code/claude-dsv41.sh`](file:///mnt/ssdraid/git/deepseekv4.1/examples/claude_code/claude-dsv41.sh):
+   ```bash
+   bash examples/claude_code/claude-dsv41.sh
+   ```
+
+### Prefix Cache Synergy with Claude Code
+Claude Code sessions send growing conversation histories that include system instructions, codebase rules, directory trees, and previous tool outputs. DeepSeek-V4.1's **Longest Common Prefix (LCP)** cache matches these shared prefixes in GPU VRAM across consecutive turns:
+- **Turn 1**: Cold prefill of project context (~2,000–8,000 tokens).
+- **Subsequent Turns**: Reuses up to **99.5%** of cached tokens directly on GPU; the server evaluates only the new tool output or user prompt in < 1 second.
+
+See [`examples/claude_code/README.md`](file:///mnt/ssdraid/git/deepseekv4.1/examples/claude_code/README.md) for detailed configuration, model aliasing, and troubleshooting.
+
+---
+
+## Examples & Developer Ecosystem
+
+Complete guides, runnable scripts, and interactive tools are located in the [`examples/`](file:///mnt/ssdraid/git/deepseekv4.1/examples/README.md) directory:
+
+| Directory | Topic | Key Files |
+|:---|:---|:---|
+| [`examples/claude_code/`](file:///mnt/ssdraid/git/deepseekv4.1/examples/claude_code/README.md) | **Claude Code Backend** | `dsv41-litellm.yaml`, `claude-dsv41.sh`, `verify_litellm.py` |
+| [`examples/jev_mode/`](file:///mnt/ssdraid/git/deepseekv4.1/examples/jev_mode/README.md) | **Parallel Structured Output** | `demo_customer_feedback.py`, `demo_batch_extraction.py`, `demo_interactive.py` |
+| [`examples/benchmarks/`](file:///mnt/ssdraid/git/deepseekv4.1/examples/benchmarks/README.md) | **Performance & Load Testing** | `bench_jev_structured.py`, `bench_decode_throughput.py`, `bench_prefix_cache_hit.py`, `bench_concurrency.py` |
+
+---
 
 ## Historical reference benchmarks
 

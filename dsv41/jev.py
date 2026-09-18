@@ -202,6 +202,12 @@ class JevPrefixTree:
 
     def _ensure_batch_capacity(self, B: int):
         """Ensure model caches have sufficient batch dimension capacity for B parallel fields."""
+        max_seqs = getattr(self.model.args, "max_seqs", 2)
+        if B > max_seqs:
+            raise ValueError(
+                f"Requested Jev batch size {B} exceeds model max_seqs ({max_seqs}). "
+                f"Batch size must be clamped to <= {max_seqs}."
+            )
         with torch.inference_mode(False):
             # 1. Window KV caches across all blocks
             for blk in self.model.blocks:
@@ -582,8 +588,17 @@ class JevEngine:
         field_results = {}
         t_scoring = 0.0
 
-        for batch_start in range(0, K, max_batch):
-            batch_end = min(batch_start + max_batch, K)
+        # Enforce batch size limit to pre-allocated model slots (prevents OOM & cache reallocation)
+        model_max_seqs = getattr(self.model.args, "max_seqs", 2)
+        if hasattr(self.model, "blocks") and len(self.model.blocks) > 0:
+            model_max_seqs = min(model_max_seqs, self.model.blocks[0].attn.window_kv_cache.shape[0])
+        for cache in self.model.shared.compress_kv.values():
+            model_max_seqs = min(model_max_seqs, cache.shape[0])
+            break
+        effective_max_batch = min(max_batch, max(1, model_max_seqs))
+
+        for batch_start in range(0, K, effective_max_batch):
+            batch_end = min(batch_start + effective_max_batch, K)
             cur_fields = fields[batch_start:batch_end]
             B = len(cur_fields)
 

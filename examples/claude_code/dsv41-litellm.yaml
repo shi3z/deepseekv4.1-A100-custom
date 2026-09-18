@@ -1,0 +1,22 @@
+model_list:
+  - model_name: deepseek-v4.1-flash
+    litellm_params:
+      model: openai/deepseek-v4.1-flash
+      api_base: http://127.0.0.1:8000/v1
+      api_key: sk-local
+      timeout: 3600
+      max_tokens: 1048576
+  - model_name: deepseek-v4.1-flash-abliterated
+    litellm_params:
+      model: openai/deepseek-v4.1-flash-abliterated
+      api_base: http://127.0.0.1:8000/v1
+      api_key: sk-local
+      timeout: 3600
+      max_tokens: 1048576
+
+litellm_settings:
+  # Translates Anthropic /v1/messages calls to OpenAI /v1/chat/completions format
+  use_chat_completions_url_for_anthropic_messages: true
+
+general_settings:
+  master_key: sk-local
