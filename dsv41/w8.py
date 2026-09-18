@@ -71,7 +71,15 @@ def linear_w(x: torch.Tensor, w) -> torch.Tensor:
         from .cukern import fp8_gemm_tc
         y = fp8_gemm_tc(x2.contiguous().to(torch.bfloat16), w.w8, w.s8)
     else:
-        y = F.linear(x2, w.bf16())
+        try:
+            from .cukern import fp8_gemm_tc
+            chunks = []
+            for i in range(0, x2.shape[0], MAX_TC_ROWS):
+                cx = x2[i:i + MAX_TC_ROWS].contiguous().to(torch.bfloat16)
+                chunks.append(fp8_gemm_tc(cx, w.w8, w.s8))
+            y = torch.cat(chunks, dim=0)
+        except Exception:
+            y = F.linear(x2, w.bf16())
     return y.view(*lead, w.shape[0])
 
 
