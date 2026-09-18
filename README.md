@@ -22,11 +22,17 @@ DeepSeek-V4.1 supports flexible deployment profiles tailored to specific product
 
 ### Deployment Profiles & Trade-Off Comparison
 
-| Profile | Target Workload | Context Limit (`max_seq_len`) | Concurrent Decode Slots (`max_seqs`) | Single-Stream Decode Speed | Aggregate Parallel Throughput | Free VRAM / GPU | Architectural Trade-offs & Features | Launch Script |
+| Profile | Target Workload | Context Limit (`max_seq_len`) | Concurrent Decode Slots (`max_seqs`) | Single-Stream Decode Speed | Aggregate Parallel Throughput | Free VRAM / GPU | Architectural Trade-offs & Features | Launch Script / Reference |
 |:---|:---|:---:|:---:|:---:|:---:|:---:|:---|:---|
 | **⚡ Speed & Multi-Agent** | Claude Code, interactive chat, parallel tool calls | **64K** (65,536) | **4 Slots** (`5`) | **50–55 tok/s** | **80–120 tok/s** | **12–16 GiB** | Bounds context to 64K to free VRAM; expands concurrency to 4 parallel decode streams | [`./run_speed_agent.sh`](file:///mnt/ssdraid/git/deepseekv4.1/run_speed_agent.sh) |
 | **🛡️ 1M Context Robust** | Full-repo scanning, long document analysis | **1M** (1,048,576) | **1 Slot** (`2`) | **45–50 tok/s** | 45–50 tok/s | **2–4 GiB** | Minimizes KV cache batch dimension to 2 rows; enables CED & exact cache growth to prevent OOM | [`./run_1m_robust.sh`](file:///mnt/ssdraid/git/deepseekv4.1/run_1m_robust.sh) |
 | **⚖️ Balanced Production (Default)** | General software engineering, 2-turn agents | **1M** (1,048,576) | **2 Slots** (`3`) | **50–51 tok/s** | **75–80 tok/s** | **7–10 GiB** | Balances 2 concurrent decode slots with 1M context readiness and 7–10 GiB VRAM headroom | [`./run_server_batched.sh`](file:///mnt/ssdraid/git/deepseekv4.1/run_server_batched.sh) |
+| **🚀 Jev Mode (Structured)** | JSON Schema extraction, classification, agent decisions | **Flexible** (64K–1M) | **Non-Autoregressive** (1-pass parallel queries) | *N/A* (0 decode tokens) | **up to ~13,000 tok/s** *(effective)* | Shared | Non-autoregressive candidate scoring on exact same weights; eliminates JSON formatting decode passes | [Jev Mode](#jev-mode-parallel-non-autoregressive-structured-output--hierarchical-prefix-cache-updated-2026-09-17) / [`examples/jev_mode/`](file:///mnt/ssdraid/git/deepseekv4.1/examples/jev_mode/README.md) |
+
+> [!NOTE]
+> **Generative Throughput vs. Effective Throughput**:
+> - **Profiles 1–3 (Autoregressive Decode)**: Measure physical token generation throughput (generating arbitrary free-form text or code step-by-step across parallel client streams, bounded by GPU memory bandwidth at ~120 tok/s aggregate).
+> - **Jev Mode (Non-Autoregressive Scoring)**: Operates on the **exact same model weights**, but bypasses autoregressive decoding entirely. It evaluates schema field queries simultaneously across sequence slots and scores candidate log-probabilities in a single forward pass, assembling typed JSON directly in Python. Its ~13,000 tok/s rating represents **effective extraction throughput** (798 tokens of structured data delivered in 61.5 ms).
 
 ---
 
