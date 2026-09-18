@@ -91,4 +91,15 @@ def oproj_a(o: torch.Tensor, wo_a, n_groups: int, rank: int) -> torch.Tensor:
     if b * s <= MAX_TC_ROWS:
         from .cukern import fp8_gemm_tc
         return fp8_gemm_tc(o.reshape(b * s * g, d).contiguous(), wo_a.w8, wo_a.s8, group_cols=rank).view(b, s, -1)
-    return torch.einsum("bsgd,grd->bsgr", o, wo_a.bf16().view(n_groups, rank, -1)).flatten(2)
+    try:
+        from .cukern import fp8_gemm_tc
+        chunks = []
+        chunk_s = max(1, MAX_TC_ROWS // b)
+        for s0 in range(0, s, chunk_s):
+            oc = o[:, s0:s0 + chunk_s]
+            sc = oc.shape[1]
+            out_c = fp8_gemm_tc(oc.reshape(b * sc * g, d).contiguous(), wo_a.w8, wo_a.s8, group_cols=rank).view(b, sc, -1)
+            chunks.append(out_c)
+        return torch.cat(chunks, dim=1)
+    except Exception:
+        return torch.einsum("bsgd,grd->bsgr", o, wo_a.bf16().view(n_groups, rank, -1)).flatten(2)
