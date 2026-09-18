@@ -3664,7 +3664,7 @@ class Engine:
         # long-context requests bounded so the gateway can finish instead
         # of timing out during slow single-token decode. Override per host.
         if len(prompt_ids) > _mtp_long_limit:
-            _long_cap = int(os.environ.get("DSV41_LONG_PROMPT_MAX_NEW", os.environ.get("DSV41_INTERACTIVE_MAX_NEW", "16384")))
+            _long_cap = int(os.environ.get("DSV41_LONG_PROMPT_MAX_NEW", os.environ.get("DSV41_INTERACTIVE_MAX_NEW", "65536")))
             max_new = min(max_new, _long_cap)
         gen = None
         if p.seed is not None:
@@ -4598,7 +4598,7 @@ class Engine:
         _mtp_long_limit = int(os.environ.get("DSV41_MTP_LONG_PROMPT_LIMIT", "65536"))
         max_new = min(p.max_new_tokens, self.max_seq_len - len(prompt_ids) - 1)
         if len(prompt_ids) > _mtp_long_limit:
-            _long_cap = int(os.environ.get("DSV41_LONG_PROMPT_MAX_NEW", os.environ.get("DSV41_INTERACTIVE_MAX_NEW", "16384")))
+            _long_cap = int(os.environ.get("DSV41_LONG_PROMPT_MAX_NEW", os.environ.get("DSV41_INTERACTIVE_MAX_NEW", "65536")))
             max_new = min(max_new, _long_cap)
         gen = None
         if p.seed is not None:

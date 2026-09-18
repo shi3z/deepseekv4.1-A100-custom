@@ -47,7 +47,7 @@ def _params(body: dict) -> GenParams:
     ban_cycles = bool(body.get("ban_cycles") if body.get("ban_cycles") is not None else default_ban_cycles)
 
     return GenParams(
-        max_new_tokens=int(body.get("max_tokens") or body.get("max_completion_tokens") or 4096),
+        max_new_tokens=int(body.get("max_tokens") or body.get("max_completion_tokens") or int(os.environ.get("DSV41_INTERACTIVE_MAX_NEW", "65536"))),
         temperature=float(body.get("temperature", 0.6)),
         top_p=float(body.get("top_p", 0.95)),
         stop=list(stop),
@@ -197,7 +197,7 @@ class Handler(BaseHTTPRequestHandler):
         # with max_tokens=32000.  Keep interactive retries bounded so a
         # response reaches the client and the request can complete.  Hosts
         # that need longer answers can raise this explicitly.
-        _interactive_cap = int(os.environ.get("DSV41_INTERACTIVE_MAX_NEW", "16384"))
+        _interactive_cap = int(os.environ.get("DSV41_INTERACTIVE_MAX_NEW", "65536"))
         requested_max_tokens = body.get("max_tokens") or body.get("max_completion_tokens")
         if _interactive_cap > 0 and params.max_new_tokens > _interactive_cap:
             params.max_new_tokens = _interactive_cap
