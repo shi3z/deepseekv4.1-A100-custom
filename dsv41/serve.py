@@ -14,6 +14,7 @@ import time
 import os
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import copy
 
 import os as _os
 import traceback
