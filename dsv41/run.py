@@ -12,7 +12,8 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dsv41.load import load_model  # noqa: E402
 
-CKPT = "/mnt/ssd/models/DeepSeek-V4.1-Flash"
+DEFAULT_CKPT = "/mnt/ssd/models/DeepSeek-V4.1-Flash-Abliterated" if os.path.exists("/mnt/ssd/models/DeepSeek-V4.1-Flash-Abliterated") else "/mnt/ssd/models/DeepSeek-V4.1-Flash"
+CKPT = os.environ.get("DSV41_CKPT", DEFAULT_CKPT)
 
 
 def sample(logits: torch.Tensor, temperature: float) -> torch.Tensor:

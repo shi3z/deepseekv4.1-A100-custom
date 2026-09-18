@@ -18,10 +18,12 @@ export DSV41_CED=1
 export DSV41_GPU_SLOT_CACHE=1
 export DSV41_PREFIX_DEDUP_MIRRORS=1
 export DSV41_MAX_SEQS=5
-export DSV41_REPETITION_PENALTY=1.08
-export DSV41_FREQUENCY_PENALTY=0.05
+export DSV41_REPETITION_PENALTY=1.10
+export DSV41_FREQUENCY_PENALTY=0.10
 export DSV41_PRESENCE_PENALTY=0.0
 export DSV41_PENALTY_WINDOW=256
+export DSV41_PROGRESSIVE_PENALTY=1.5
+export DSV41_BAN_CYCLES=1
 
 export DSV41_PREFIX_CACHE_DIR=/dev/shm/dsv41-prefix-cache
 export DSV41_PREFIX_CACHE_ENTRIES=16
@@ -34,8 +36,14 @@ export DSV41_PREFIX_BLOCK_MIN=16
 export DSV41_PREFIX_ANCHOR_STRIDE=1024
 export DSV41_PREFIX_ANCHOR_MAX=2
 
+DEFAULT_CKPT="/mnt/ssd/models/DeepSeek-V4.1-Flash-Abliterated"
+if [ ! -d "$DEFAULT_CKPT" ]; then
+    DEFAULT_CKPT="/mnt/ssd/models/DeepSeek-V4.1-Flash"
+fi
+CKPT="${DSV41_CKPT:-$DEFAULT_CKPT}"
+
 exec /home/shi3z/.local/bin/python -u -m dsv41.serve \
-    --ckpt /mnt/ssd/models/DeepSeek-V4.1-Flash \
+    --ckpt "$CKPT" \
     --devices 2,3,0,1 \
     --ep \
     --ep-shards 96,96,96,96 \

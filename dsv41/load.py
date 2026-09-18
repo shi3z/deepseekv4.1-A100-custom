@@ -189,7 +189,8 @@ def load_layer(ckpt: Checkpoint, i: int, device, offload=False, ep: list | None 
             for slot, e in enumerate(hot):
                 hw13[slot].copy_(w13[e]); hs13[slot].copy_(s13[e]); hw2[slot].copy_(w2[e]); hs2[slot].copy_(s2[e])
             w["experts.hot"] = {"w13": hw13, "s13": hs13, "w2": hw2, "s2": hs2, "slot": {int(e): k for k, e in enumerate(hot)}, "dummy": n}
-        torch.cuda.synchronize(device)
+        if getattr(device, "type", None) == "cuda" or (isinstance(device, str) and device.startswith("cuda")):
+            torch.cuda.synchronize(device)
         return w
     if ep:
         shards = []
@@ -206,7 +207,8 @@ def load_layer(ckpt: Checkpoint, i: int, device, offload=False, ep: list | None 
                 ss2[j].copy_(ckpt.get(q + "w2.scale"), non_blocking=True)
             shards.append({"device": sd, "start": start, "n": n, "w13": sw13, "s13": ss13, "w2": sw2, "s2": ss2})
         for sh in shards:
-            torch.cuda.synchronize(sh["device"])
+            if getattr(sh["device"], "type", None) == "cuda" or (isinstance(sh["device"], str) and sh["device"].startswith("cuda")):
+                torch.cuda.synchronize(sh["device"])
         own = [sh for sh in shards if sh["device"] == device][0]
         w.update({"experts.w13": own["w13"], "experts.s13": own["s13"], "experts.w2": own["w2"], "experts.s2": own["s2"], "experts.offload": False, "experts.ep": shards})
         return w
@@ -227,7 +229,8 @@ def load_layer(ckpt: Checkpoint, i: int, device, offload=False, ep: list | None 
         w2[e].copy_(ckpt.get(q + "w2.weight").view(torch.uint8), non_blocking=True)
         s2[e].copy_(ckpt.get(q + "w2.scale"), non_blocking=True)
     w.update({"experts.w13": w13, "experts.s13": s13, "experts.w2": w2, "experts.s2": s2, "experts.offload": offload})
-    torch.cuda.synchronize(device)
+    if getattr(device, "type", None) == "cuda" or (isinstance(device, str) and device.startswith("cuda")):
+        torch.cuda.synchronize(device)
     return w
 
 

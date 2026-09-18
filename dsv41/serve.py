@@ -31,15 +31,19 @@ def _params(body: dict) -> GenParams:
     stop = body.get("stop") or []
     if isinstance(stop, str):
         stop = [stop]
-    default_rep_pen = float(os.environ.get("DSV41_REPETITION_PENALTY", "1.08"))
+    default_rep_pen = float(os.environ.get("DSV41_REPETITION_PENALTY", "1.10"))
     default_pres_pen = float(os.environ.get("DSV41_PRESENCE_PENALTY", "0.0"))
-    default_freq_pen = float(os.environ.get("DSV41_FREQUENCY_PENALTY", "0.05"))
+    default_freq_pen = float(os.environ.get("DSV41_FREQUENCY_PENALTY", "0.10"))
     default_window = int(os.environ.get("DSV41_PENALTY_WINDOW", "256"))
+    default_prog_pen = float(os.environ.get("DSV41_PROGRESSIVE_PENALTY", "1.5"))
+    default_ban_cycles = os.environ.get("DSV41_BAN_CYCLES", "1").strip().lower() not in ("0", "false", "off")
 
-    rep_pen = float(body.get("repetition_penalty") if body.get("repetition_penalty") is not None else default_rep_pen)
-    pres_pen = float(body.get("presence_penalty") if body.get("presence_penalty") is not None else default_pres_pen)
-    freq_pen = float(body.get("frequency_penalty") if body.get("frequency_penalty") is not None else default_freq_pen)
-    window = int(body.get("penalty_window") if body.get("penalty_window") is not None else default_window)
+    rep_pen = float(body.get("repetition_penalty") or default_rep_pen)
+    pres_pen = float(body.get("presence_penalty") or default_pres_pen)
+    freq_pen = float(body.get("frequency_penalty") or default_freq_pen)
+    window = int(body.get("penalty_window") or default_window)
+    prog_pen = float(body.get("progressive_penalty") or default_prog_pen)
+    ban_cycles = bool(body.get("ban_cycles") if body.get("ban_cycles") is not None else default_ban_cycles)
 
     return GenParams(
         max_new_tokens=int(body.get("max_tokens") or body.get("max_completion_tokens") or 1024),
@@ -51,6 +55,8 @@ def _params(body: dict) -> GenParams:
         presence_penalty=pres_pen,
         frequency_penalty=freq_pen,
         penalty_window=window,
+        progressive_penalty=prog_pen,
+        ban_cycles=ban_cycles,
     )
 
 
@@ -81,7 +87,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/v1/models":
-            self._json(200, {"object": "list", "data": [{"id": ENGINE.model_name if ENGINE else "deepseek-v4.1-flash", "object": "model", "owned_by": "local"}]})
+            cur_model = ENGINE.model_name if ENGINE else "deepseek-v4.1-flash"
+            data = [{"id": cur_model, "object": "model", "owned_by": "local"}]
+            for alias in ("deepseek-v4.1-flash", "deepseek-v4.1-flash-abliterated"):
+                if alias != cur_model:
+                    data.append({"id": alias, "object": "model", "owned_by": "local"})
+            self._json(200, {"object": "list", "data": data})
         elif self.path == "/health":
             self._json(200, {"status": "ok"})
         elif self.path in ("/dashboard", "/"):
@@ -191,7 +202,9 @@ class Handler(BaseHTTPRequestHandler):
           f"[chat] START req_id={rid} prompt_tokens={len(ids)} "
           f"max_seq_len={eng.max_seq_len} "
           f"max_tokens={params.max_new_tokens} (effective) "
-          f"stream={body.get('stream')}",
+          f"stream={body.get('stream')} "
+          f"rep_pen={params.repetition_penalty} freq_pen={params.frequency_penalty} "
+          f"prog_pen={params.progressive_penalty} ban_cycles={params.ban_cycles}",
           flush=True,
         )
         if body.get("stream"):
@@ -304,7 +317,7 @@ class Handler(BaseHTTPRequestHandler):
                     "id": rid,
                     "object": "chat.completion.chunk",
                     "created": created,
-                    "model": eng.model_name,
+                    "model": body.get("model") or eng.model_name,
                     "choices": [
                         {
                             "index": 0,
@@ -427,7 +440,7 @@ class Handler(BaseHTTPRequestHandler):
             )
         msg = eng.parse_completion(text, thinking)
         content = msg.get("content") if isinstance(msg, dict) else text
-        out = {"id": rid, "object": "chat.completion", "created": created, "model": eng.model_name,
+        out = {"id": rid, "object": "chat.completion", "created": created, "model": body.get("model") or eng.model_name,
                "choices": [{"index": 0, "message": {"role": "assistant", "content": content if content is not None else text},
                             "finish_reason": "length" if n >= params.max_new_tokens else "stop"}],
                "usage": {"prompt_tokens": len(ids), "completion_tokens": n, "total_tokens": len(ids) + n}}
@@ -459,7 +472,7 @@ class Handler(BaseHTTPRequestHandler):
             t_gen_0 = time.perf_counter()
             try:
                 for _, piece in eng.generate(ids, params):
-                    obj = {"id": rid, "object": "text_completion", "created": created, "model": eng.model_name,
+                    obj = {"id": rid, "object": "text_completion", "created": created, "model": body.get("model") or eng.model_name,
                            "choices": [{"index": 0, "text": piece, "finish_reason": None}]}
                     self.wfile.write(f"data: {json.dumps(obj, ensure_ascii=False)}\n\n".encode())
                     self.wfile.flush()
@@ -499,7 +512,7 @@ class Handler(BaseHTTPRequestHandler):
             STATS_TRACKER.record_cache_event(
                 f"Completion: {n} tokens in {dt_gen:.2f}s ({decode_tok_s:.1f} tok/s decode)"
             )
-        self._json(200, {"id": rid, "object": "text_completion", "created": created, "model": eng.model_name,
+        self._json(200, {"id": rid, "object": "text_completion", "created": created, "model": body.get("model") or eng.model_name,
                           "choices": [{"index": 0, "text": text, "finish_reason": "length" if n >= params.max_new_tokens else "stop"}],
                           "usage": {"prompt_tokens": len(ids), "completion_tokens": n, "total_tokens": len(ids) + n}}, t0=t0, is_stream=False)
 
@@ -602,7 +615,7 @@ class Handler(BaseHTTPRequestHandler):
                     "id": rid,
                     "object": "chat.completion.chunk" if self.path == "/v1/chat/completions" else "text_completion",
                     "created": created,
-                    "model": eng.model_name,
+                    "model": body.get("model") or eng.model_name,
                     "choices": [
                         {
                             "index": 0,
@@ -618,7 +631,7 @@ class Handler(BaseHTTPRequestHandler):
                         "id": rid,
                         "object": "chat.completion.chunk" if self.path == "/v1/chat/completions" else "text_completion",
                         "created": created,
-                        "model": eng.model_name,
+                        "model": body.get("model") or eng.model_name,
                         "choices": [
                             {
                                 "index": 0,
@@ -633,7 +646,7 @@ class Handler(BaseHTTPRequestHandler):
                     "id": rid,
                     "object": "chat.completion.chunk" if self.path == "/v1/chat/completions" else "text_completion",
                     "created": created,
-                    "model": eng.model_name,
+                    "model": body.get("model") or eng.model_name,
                     "choices": [
                         {
                             "index": 0,
@@ -682,7 +695,7 @@ class Handler(BaseHTTPRequestHandler):
             "id": rid,
             "object": "chat.completion" if self.path == "/v1/chat/completions" else "text_completion",
             "created": created,
-            "model": eng.model_name,
+            "model": body.get("model") or eng.model_name,
             "choices": [
                 {
                     "index": 0,

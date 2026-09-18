@@ -20,7 +20,8 @@ from .decode import DecodeRuntime
 from .load import load_model
 import traceback
 
-CKPT = "/mnt/ssd/models/DeepSeek-V4.1-Flash"
+DEFAULT_CKPT = "/mnt/ssd/models/DeepSeek-V4.1-Flash-Abliterated" if os.path.exists("/mnt/ssd/models/DeepSeek-V4.1-Flash-Abliterated") else "/mnt/ssd/models/DeepSeek-V4.1-Flash"
+CKPT = os.environ.get("DSV41_CKPT", DEFAULT_CKPT)
 
 
 @dataclass
@@ -30,36 +31,49 @@ class GenParams:
     top_p: float = 0.95
     stop: list[str] = field(default_factory=list)
     seed: int | None = None
-    repetition_penalty: float = 1.0
+    repetition_penalty: float = 1.10
     presence_penalty: float = 0.0
-    frequency_penalty: float = 0.0
+    frequency_penalty: float = 0.10
     penalty_window: int = 256
+    progressive_penalty: float = 1.5
+    ban_cycles: bool = True
+
+
+_WHITESPACE_TOKEN_IDS = {200, 201, 223, 262, 271, 290}
 
 
 def apply_penalties(
     logits: torch.Tensor,
     tokens: list[int],
-    repetition_penalty: float = 1.0,
+    repetition_penalty: float = 1.10,
     presence_penalty: float = 0.0,
-    frequency_penalty: float = 0.0,
+    frequency_penalty: float = 0.10,
     window: int = 256,
+    progressive_penalty: float = 1.5,
+    ban_cycles: bool = True,
 ) -> torch.Tensor:
-    """Apply repetition, presence, and frequency penalties to 1D logits."""
+    """Apply cycle suppression, progressive penalty, and repetition/frequency penalties to 1D logits."""
     if not tokens:
-        return logits
-    if (
-        (repetition_penalty == 1.0 or repetition_penalty <= 0)
-        and presence_penalty == 0.0
-        and frequency_penalty == 0.0
-    ):
-        return logits
-
-    context_tokens = tokens[-window:] if window > 0 and len(tokens) > window else tokens
-    if not context_tokens:
         return logits
 
     penalized = logits.clone()
+    n = len(tokens)
 
+    # 1. Consecutive cycle suppression:
+    # Detect if the last (L-1) tokens match the previous cycle of length L (L in 3..64).
+    # If true, the token tokens[-L] would complete a consecutive repeat of that cycle.
+    if ban_cycles and n >= 5:
+        max_L = min(64, (n + 1) // 2)
+        for L in range(3, max_L + 1):
+            if tokens[-2 * L + 1 : -L] == tokens[-L + 1 :]:
+                banned_tok = tokens[-L]
+                penalized[banned_tok] -= 50.0
+
+    context_tokens = tokens[-window:] if window > 0 and n > window else tokens
+    if not context_tokens:
+        return penalized
+
+    # 2. Multiplicative repetition penalty
     if repetition_penalty != 1.0 and repetition_penalty > 0:
         unique_toks = list(set(context_tokens))
         tok_idx = torch.tensor(unique_toks, dtype=torch.long, device=logits.device)
@@ -71,13 +85,23 @@ def apply_penalties(
         )
         penalized[tok_idx] = penalized_vals
 
-    if presence_penalty != 0.0 or frequency_penalty != 0.0:
+    # 3. Additive frequency and progressive repetition penalty
+    if presence_penalty != 0.0 or frequency_penalty != 0.0 or progressive_penalty > 0.0:
         counts = collections.Counter(context_tokens)
         toks = list(counts.keys())
         cnts = [counts[t] for t in toks]
         tok_idx = torch.tensor(toks, dtype=torch.long, device=logits.device)
         cnt_vals = torch.tensor(cnts, dtype=logits.dtype, device=logits.device)
+
         penalties = float(presence_penalty) + float(frequency_penalty) * cnt_vals
+        if progressive_penalty > 0.0:
+            prog_mask = torch.tensor(
+                [1.0 if t not in _WHITESPACE_TOKEN_IDS else 0.0 for t in toks],
+                dtype=logits.dtype,
+                device=logits.device,
+            )
+            prog = torch.clamp(cnt_vals - 1.0, min=0.0) * float(progressive_penalty) * prog_mask
+            penalties += prog
         penalized[tok_idx] -= penalties
 
     return penalized
@@ -264,7 +288,11 @@ class Engine:
             )
         self.lock = threading.Lock()
         self.eos = self.tok.eos_token_id
-        self.model_name = "deepseek-v4.1-flash"
+        self.ckpt = ckpt
+        if "abliterated" in ckpt.lower():
+            self.model_name = os.environ.get("DSV41_MODEL_NAME", "deepseek-v4.1-flash-abliterated")
+        else:
+            self.model_name = os.environ.get("DSV41_MODEL_NAME", "deepseek-v4.1-flash")
         self._jev_engine = None
         self.stats_tracker = None
         self.last_prefill_stats: dict | None = None
@@ -3607,6 +3635,8 @@ class Engine:
                         p.repetition_penalty != 1.0
                         or p.presence_penalty != 0.0
                         or p.frequency_penalty != 0.0
+                        or p.progressive_penalty > 0.0
+                        or p.ban_cycles
                     ):
                         step_logits = apply_penalties(
                             step_logits,
@@ -3615,6 +3645,8 @@ class Engine:
                             presence_penalty=p.presence_penalty,
                             frequency_penalty=p.frequency_penalty,
                             window=p.penalty_window,
+                            progressive_penalty=p.progressive_penalty,
+                            ban_cycles=p.ban_cycles,
                         )
                     t = sample_token(step_logits, p.temperature, p.top_p, gen)
                     if t == self.eos:
@@ -4360,6 +4392,8 @@ class Engine:
                         req.params.repetition_penalty != 1.0
                         or req.params.presence_penalty != 0.0
                         or req.params.frequency_penalty != 0.0
+                        or req.params.progressive_penalty > 0.0
+                        or req.params.ban_cycles
                     ):
                         slot_logits = apply_penalties(
                             slot_logits,
@@ -4368,6 +4402,8 @@ class Engine:
                             presence_penalty=req.params.presence_penalty,
                             frequency_penalty=req.params.frequency_penalty,
                             window=req.params.penalty_window,
+                            progressive_penalty=req.params.progressive_penalty,
+                            ban_cycles=req.params.ban_cycles,
                         )
                     try:
                         if req.params.temperature <= 0:
