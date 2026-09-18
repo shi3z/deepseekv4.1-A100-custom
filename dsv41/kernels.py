@@ -170,10 +170,12 @@ def fp4_gemm(a: torch.Tensor, w_packed: torch.Tensor, w_scale: torch.Tensor, out
 
 # --------------------------------------------------------------------------- sparse attention
 def sparse_attn(q: torch.Tensor, kv: torch.Tensor, attn_sink: torch.Tensor, topk_idxs: torch.Tensor, softmax_scale: float,
-                q_chunk: int = 512) -> torch.Tensor:
+                q_chunk: int | None = None) -> torch.Tensor:
     """q: [b, s, h, d] bf16; kv: [b, n, d] bf16 (one shared K=V latent for all heads);
     attn_sink: [h] fp32; topk_idxs: [b, s, t] int32 with -1 = empty slot. Returns [b, s, h, d] bf16.
     Same math as the reference kernel: softmax over the selected slots plus a per-head sink term."""
+    if q_chunk is None:
+        q_chunk = int(os.environ.get("DSV41_SPARSE_ATTN_CHUNK", "128"))
     b, s, h, d = q.shape
     out = torch.empty_like(q)
     sink = attn_sink.float().view(1, 1, h)
@@ -244,12 +246,12 @@ def sparse_attn(q: torch.Tensor, kv: torch.Tensor, attn_sink: torch.Tensor, topk
             -1,
             d,
         )  # [b, sc, t, d]
-        scores = torch.einsum("bshd,bstd->bsht", q[:, s0:s1].float(), g.float()) * softmax_scale
+        scores = torch.einsum("bshd,bstd->bsht", q[:, s0:s1], g).float() * softmax_scale
         scores = scores.masked_fill(~valid.unsqueeze(2), float("-inf"))
         mx = scores.amax(dim=-1, keepdim=True).clamp_min(-1e30)
         p = torch.exp(scores - mx)  # [b, sc, h, t]
         denom = p.sum(dim=-1) + torch.exp(sink - mx.squeeze(-1))
-        o = torch.einsum("bsht,bstd->bshd", p, g.float()) / denom.unsqueeze(-1)
+        o = torch.einsum("bsht,bstd->bshd", p.to(g.dtype), g).float() / denom.unsqueeze(-1)
         out[:, s0:s1] = o.to(q.dtype)
     return out
 
