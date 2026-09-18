@@ -5,7 +5,7 @@ cd /mnt/ssdraid/git/deepseekv4.1
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-export DSV41_MOE_PREFILL_CHUNK=1024
+export DSV41_MOE_PREFILL_CHUNK=2048
 export DSV41_ENGRAM_PREFILL_CHUNK=512
 export DSV41_HC_PREFILL_CHUNK=256
 export DSV41_LAYER_COUNTS=10,10,10,10
@@ -48,7 +48,7 @@ exec /home/shi3z/.local/bin/python -u -m dsv41.serve \
     --ckpt "$CKPT" \
     --devices 2,3,0,1 \
     --ep \
-    --ep-shards 95,94,98,97 \
+    --ep-shards 91,93,101,99 \
     --max-seq-len 1048576 \
     --max-seqs 5 \
     --host 0.0.0.0 \
