@@ -605,15 +605,17 @@ class Handler(BaseHTTPRequestHandler):
 
             json_content = json.dumps(assembled, ensure_ascii=False)
             dt_total = time.perf_counter() - t0
+            eff_tokens = metrics.get("completion_tokens", 0)
+            if not eff_tokens:
+                eff_tokens = len(eng.tok.encode(json_content, add_special_tokens=False)) if getattr(eng, "tok", None) else max(1, len(json_content.split()))
 
             if STATS_TRACKER:
-                eff_tokens = metrics.get("prompt_tokens", 0) + metrics.get("num_fields", 0) * 5
                 STATS_TRACKER.record_throughput(eff_tokens / max(dt_total, 1e-6), "jev-stream")
                 reused = metrics.get("prefix_saved_tokens", 0)
                 tot = metrics.get("prompt_tokens", 0)
                 hit_str = "HIT" if metrics.get("cache_hit") else "MISS"
                 STATS_TRACKER.record_cache_event(
-                    f"Jev stream [schema {hit_str}]: {metrics.get('num_fields', 0)} fields, saved {reused}/{tot} tokens ({dt_total*1000:.1f}ms)",
+                    f"Jev stream [schema {hit_str}]: {metrics.get('num_fields', 0)} fields, {eff_tokens} output toks, saved {reused}/{tot} tokens ({dt_total*1000:.1f}ms)",
                     event_type="hit" if metrics.get("cache_hit") else "info"
                 )
 
@@ -661,6 +663,11 @@ class Handler(BaseHTTPRequestHandler):
                             "finish_reason": "stop",
                         }
                     ],
+                    "usage": {
+                        "prompt_tokens": metrics.get("prompt_tokens", 0),
+                        "completion_tokens": eff_tokens,
+                        "total_tokens": metrics.get("prompt_tokens", 0) + eff_tokens,
+                    },
                     "jev_result": assembled,
                     "jev_metrics": metrics,
                 }
@@ -686,15 +693,17 @@ class Handler(BaseHTTPRequestHandler):
 
         json_content = json.dumps(assembled, ensure_ascii=False)
         dt_total = time.perf_counter() - t0
+        eff_tokens = metrics.get("completion_tokens", 0)
+        if not eff_tokens:
+            eff_tokens = len(eng.tok.encode(json_content, add_special_tokens=False)) if getattr(eng, "tok", None) else max(1, len(json_content.split()))
 
         if STATS_TRACKER:
-            eff_tokens = metrics.get("prompt_tokens", 0) + metrics.get("num_fields", 0) * 5
             STATS_TRACKER.record_throughput(eff_tokens / max(dt_total, 1e-6), "jev")
             reused = metrics.get("prefix_saved_tokens", 0)
             tot = metrics.get("prompt_tokens", 0)
             hit_str = "HIT" if metrics.get("cache_hit") else "MISS"
             STATS_TRACKER.record_cache_event(
-                f"Jev [schema {hit_str}]: {metrics.get('num_fields', 0)} fields, saved {reused}/{tot} tokens ({dt_total*1000:.1f}ms)",
+                f"Jev [schema {hit_str}]: {metrics.get('num_fields', 0)} fields, {eff_tokens} output toks, saved {reused}/{tot} tokens ({dt_total*1000:.1f}ms)",
                 event_type="hit" if metrics.get("cache_hit") else "info"
             )
 
@@ -716,8 +725,8 @@ class Handler(BaseHTTPRequestHandler):
             ],
             "usage": {
                 "prompt_tokens": metrics["prompt_tokens"],
-                "completion_tokens": 0,
-                "total_tokens": metrics["prompt_tokens"],
+                "completion_tokens": eff_tokens,
+                "total_tokens": metrics["prompt_tokens"] + eff_tokens,
             },
             "jev_result": assembled,
             "jev_metrics": metrics,

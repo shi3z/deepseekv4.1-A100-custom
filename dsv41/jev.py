@@ -623,6 +623,9 @@ class JevEngine:
             + reused_tokens
         )
 
+        assembled_str = json.dumps(assembled, ensure_ascii=False)
+        output_tokens = len(self.tok.encode(assembled_str, add_special_tokens=False)) if self.tok else len(assembled_str.split())
+
         metrics = {
             "cache_hit": schema_hit,
             "cache_hit_latency_ms": t_cache_hit * 1000.0,
@@ -631,9 +634,16 @@ class JevEngine:
             "prefill_ms": t_prefill * 1000.0,
             "scoring_ms": t_scoring * 1000.0,
             "total_ms": t_total * 1000.0,
+            "total_latency_ms": t_total * 1000.0,
+            "prefill_time_s": t_prefill,
             "num_fields": K,
             "prompt_tokens": req_end_pos,
+            "completion_tokens": output_tokens,
+            "total_tokens": req_end_pos + output_tokens,
             "tokens_saved": total_saved,
+            "prefix_saved_tokens": total_saved,
+            "tok_s": (output_tokens / max(t_total, 1e-6)) if output_tokens > 0 else 0,
+            "effective_tok_s": (output_tokens / max(t_total, 1e-6)) if output_tokens > 0 else 0,
         }
 
         return assembled, metrics

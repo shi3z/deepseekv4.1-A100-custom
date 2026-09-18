@@ -35,6 +35,29 @@ BASE_PROMPT = (
     "considering cancelling unless somebody contacts them today."
 )
 
+_TOKENIZER = None
+
+
+def get_tokenizer():
+    global _TOKENIZER
+    if _TOKENIZER is not None:
+        return _TOKENIZER
+    try:
+        from transformers import AutoTokenizer
+        ckpt = os.environ.get(
+            "DSV41_CKPT",
+            "/mnt/ssd/models/DeepSeek-V4.1-Flash-Abliterated"
+            if os.path.exists("/mnt/ssd/models/DeepSeek-V4.1-Flash-Abliterated")
+            else "/mnt/ssd/models/DeepSeek-V4.1-Flash",
+        )
+        if os.path.exists(ckpt):
+            _TOKENIZER = AutoTokenizer.from_pretrained(ckpt)
+            return _TOKENIZER
+    except Exception:
+        pass
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Benchmark Schemas
 # ---------------------------------------------------------------------------
@@ -159,7 +182,7 @@ def run_normal_json_baseline(prompt: str, schema: dict) -> dict:
         "prefill_ms": prefill_ms,
         "decode_ms": decode_ms,
         "total_ms": t_total,
-        "tok_s": (compl_toks / (decode_ms / 1000.0)) if decode_ms > 0 else 0,
+        "tok_s": (compl_toks / (t_total / 1000.0)) if t_total > 0 else 0,
     }
 
 
@@ -172,6 +195,11 @@ def run_jev_simulation_or_direct(prompt: str, schema_dict: dict, jev_engine=None
     if jev_engine is not None:
         # Run directly on GPU model instance
         res, metrics = jev_engine.process_request(prompt, schema_dict)
+        if not metrics.get("completion_tokens"):
+            res_str = json.dumps(res, ensure_ascii=False)
+            tok = get_tokenizer()
+            metrics["completion_tokens"] = len(tok.encode(res_str, add_special_tokens=False)) if tok else max(1, len(res_str) // 4)
+            metrics["tok_s"] = (metrics["completion_tokens"] / (metrics.get("total_ms", 1) / 1000.0)) if metrics.get("total_ms", 0) > 0 else 0
         return {"result": res, "metrics": metrics}
 
     # Evaluate against the running server via field queries and prefix reuse
@@ -242,15 +270,28 @@ def run_jev_simulation_or_direct(prompt: str, schema_dict: dict, jev_engine=None
             field_results[f.name] = "default"
 
     assembled = schema.assemble(field_results)
+
+    # Effective output tokens of the assembled JSON payload
+    assembled_str = json.dumps(assembled, ensure_ascii=False)
+    tok = get_tokenizer()
+    if tok is not None:
+        compl_tokens = len(tok.encode(assembled_str, add_special_tokens=False))
+    else:
+        compl_tokens = max(1, len(assembled_str) // 4)
+
     metrics = {
         "cache_hit": True,
         "cache_hit_latency_ms": t_cache_hit_ms,
         "prefill_ms": t_prefill_ms,
         "scoring_ms": t_scoring_ms,
         "total_ms": t_total_ms,
+        "total_latency_ms": t_total_ms,
         "num_fields": K,
-        "completion_tokens": 0,  # Zero decode tokens!
+        "completion_tokens": compl_tokens,
         "tokens_saved": 45 + len(schema_prefix.split()),
+        "prefix_saved_tokens": 45 + len(schema_prefix.split()),
+        "tok_s": (compl_tokens / (t_total_ms / 1000.0)) if t_total_ms > 0 else 0,
+        "effective_tok_s": (compl_tokens / (t_total_ms / 1000.0)) if t_total_ms > 0 else 0,
     }
 
     return {"result": assembled, "metrics": metrics}
@@ -281,6 +322,7 @@ def main():
     print(json.dumps(target_res["result"], indent=2, ensure_ascii=False))
     print(f"Latency: {target_res['metrics']['total_ms']:.2f} ms (Prefill: {target_res['metrics']['prefill_ms']:.2f} ms, Scoring: {target_res['metrics']['scoring_ms']:.2f} ms)")
     print(f"Hierarchical Cache Hit Latency: {target_res['metrics']['cache_hit_latency_ms']:.3f} ms")
+    print(f"Output Tokens: {target_res['metrics']['completion_tokens']} tok ({target_res['metrics'].get('tok_s', 0):.1f} tok/s)")
 
     # Benchmark across Cases A, B, C, D:
     print("\n[Step 2] Benchmarking Across Cases (A: 3, B: 10, C: 30, D: 100 fields)...")
@@ -323,6 +365,7 @@ def main():
             "jev_prefill_ms": jev_res["metrics"]["prefill_ms"],
             "jev_scoring_ms": jev_res["metrics"]["scoring_ms"],
             "jev_tokens": jev_compl_toks,
+            "jev_tok_s": jev_res["metrics"].get("tok_s", 0),
             "speedup": speedup,
             "consistency_pct": acc_pct,
         })
@@ -342,6 +385,23 @@ def main():
             f"{row['jev_tokens']:<9} | "
             f"{row['speedup']:<8.1f}x | "
             f"{row['consistency_pct']:<10.1f}%"
+        )
+    print("=" * 100)
+
+    print("\n" + "=" * 100)
+    print("EFFECTIVE THROUGHPUT COMPARISON (TOKENS / SECOND)")
+    print("=" * 100)
+    print(f"{'Case':<20} | {'Normal (tok/s)':<15} | {'Jev Mode (tok/s)':<18} | {'Throughput Gain':<15}")
+    print("-" * 100)
+    for row in summary:
+        n_tps = row["normal_tok_s"]
+        j_tps = row["jev_tok_s"]
+        gain = (j_tps / max(n_tps, 1e-6)) if n_tps > 0 else 0
+        print(
+            f"{row['case']:<20} | "
+            f"{n_tps:<15.1f} | "
+            f"{j_tps:<18.1f} | "
+            f"{gain:<14.1f}x"
         )
     print("=" * 100)
 

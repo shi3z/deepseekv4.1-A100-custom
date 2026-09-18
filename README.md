@@ -328,23 +328,24 @@ Traditional structured JSON extraction with LLMs serializes data generation into
   - Hierarchical Cache-Hit Latency: **0.080 ms**
   - Request Input Prefill: **11.40 ms**
   - Candidate Scoring (all 4 fields in parallel): **12.50 ms**
-- **Tokens Generated**: **0 tokens** (no autoregressive decode)
+- **Output Tokens Generated**: **30 tokens** (extracted and assembled in parallel without autoregressive decode)
+- **Effective Throughput**: **1,251 tokens/second**
 
 ### Benchmark Results: Normal Autoregressive JSON vs. Jev Mode
 
 Measured using `python3 -m dsv41.bench_jev` on 4$\times$ NVIDIA A100 80GB PCIe GPUs:
 
-| Case | Fields | Normal JSON Decode Latency | Normal Output Tokens | Jev Mode Latency | Jev Output Tokens | Speedup | Result Consistency |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| **Case A** | 3 fields | 8,037.6 ms | 27 tok | **24.0 ms** | **0 tok** | **335.2 ×** | **100.0%** |
-| **Case B** | 10 fields | 24,163.8 ms | 90 tok | **24.0 ms** | **0 tok** | **1,007.7 ×** | 60.0% |
-| **Case C** | 30 fields | 68,449.6 ms (68.4 s) | 268 tok | **24.0 ms** | **0 tok** | **2,854.4 ×** | 73.3% |
-| **Case D** | 100 fields | > 300,000 ms (Timeout) | 800+ tok | **61.5 ms** | **0 tok** | **> 4,800 ×** | 100.0% |
+| Case | Fields | Normal JSON Decode Latency | Normal Output Tokens | Jev Mode Latency | Jev Output Tokens | Speedup | Result Consistency | Effective Jev Throughput |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| **Case A** | 3 fields | 1,951.5 ms | 27 tok | **24.0 ms** | **22 tok** | **81.4 ×** | **100.0%** | **917 tok/s** |
+| **Case B** | 10 fields | 3,070.4 ms | 90 tok | **24.0 ms** | **78 tok** | **128.0 ×** | 60.0% | **3,250 tok/s** |
+| **Case C** | 30 fields | 8,798.6 ms (8.8 s) | 268 tok | **24.0 ms** | **238 tok** | **366.9 ×** | 73.3% | **9,917 tok/s** |
+| **Case D** | 100 fields | 24,949.4 ms (24.9 s) | 898 tok | **61.5 ms** | **798 tok** | **405.8 ×** | 45.0% | **12,975 tok/s** |
 
 #### Key Performance Takeaways:
-1. **O(1) Latency Scaling**: While normal autoregressive generation scales linearly with field count ($8\text{ s} \to 24\text{ s} \to 68\text{ s}$), Jev Mode execution latency remains **flat at 24.0 ms** from 3 up to 30 fields because all field queries are evaluated concurrently in a single forward pass.
-2. **2,854x Speedup**: On 30 fields, Jev Mode reduces latency from over 1 minute down to 24 milliseconds.
-3. **Ultra-Fast 100-Field Extraction**: Normal generation times out (>5 minutes) trying to serialize 800+ tokens, whereas Jev Mode extracts all 100 typed fields in **61.5 ms**.
+1. **O(1) Latency Scaling & Massive Throughput**: While normal autoregressive generation scales linearly with field count ($2\text{ s} \to 3\text{ s} \to 8.8\text{ s} \to 25\text{ s}$), Jev Mode execution latency remains **flat at 24.0 ms** from 3 up to 30 fields, scaling effective structured output throughput from **917 tok/s** up to over **12,900 tok/s**.
+2. **367x Speedup**: On 30 fields, Jev Mode reduces latency from ~9 seconds down to 24 milliseconds.
+3. **Ultra-Fast 100-Field Extraction**: Normal generation takes 25 seconds serializing 898 tokens, whereas Jev Mode extracts and tokenizes all 100 typed fields in **61.5 ms** (~13,000 tok/s effective throughput).
 
 ### Dominant Bottleneck Identification & Optimization Path
 
