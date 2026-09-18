@@ -48,7 +48,7 @@ exec /home/shi3z/.local/bin/python -u -m dsv41.serve \
     --ckpt "$CKPT" \
     --devices 2,3,0,1 \
     --ep \
-    --ep-shards 91,93,101,99 \
+    --ep-shards 92,95,99,98 \
     --max-seq-len 1048576 \
     --max-seqs 5 \
     --host 0.0.0.0 \
