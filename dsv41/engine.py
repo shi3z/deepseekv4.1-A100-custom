@@ -37,6 +37,9 @@ class GenParams:
     penalty_window: int = 256
     progressive_penalty: float = 1.5
     ban_cycles: bool = True
+    loop_detect: bool = True
+    min_loop_match: int = 48
+    min_loop_cycle: int = 1
 
 
 _WHITESPACE_TOKEN_IDS = {200, 201, 223, 262, 271, 290}
@@ -60,10 +63,10 @@ def apply_penalties(
     n = len(tokens)
 
     # 1. Consecutive cycle suppression:
-    # Detect if the last (L-1) tokens match the previous cycle of length L (L in 3..64).
+    # Detect if the last (L-1) tokens match the previous cycle of length L (L in 3..256).
     # If true, the token tokens[-L] would complete a consecutive repeat of that cycle.
     if ban_cycles and n >= 5:
-        max_L = min(64, (n + 1) // 2)
+        max_L = min(256, (n + 1) // 2)
         for L in range(3, max_L + 1):
             if tokens[-2 * L + 1 : -L] == tokens[-L + 1 :]:
                 banned_tok = tokens[-L]
@@ -105,6 +108,46 @@ def apply_penalties(
         penalized[tok_idx] -= penalties
 
     return penalized
+
+
+def detect_loop(
+    tokens: list[int],
+    min_match: int = 48,
+    min_cycle: int = 1,
+) -> tuple[int, int, int] | None:
+    """Detect if the trailing `min_match` tokens are an exact repetition of a prior block.
+
+    Returns (cycle_len, trim_count, prev_pos) if a repetition loop is detected, else None.
+    - cycle_len: distance between the previous block and the current repeating block
+    - trim_count: number of duplicate tokens that should be trimmed from the end
+    - prev_pos: index in tokens where the prior matching sequence started
+    """
+    n = len(tokens)
+    if n < min_match + min_cycle:
+        return None
+    tail = tokens[-min_match:]
+    head = tail[0]
+    search_end = n - min_match - min_cycle
+    for p in range(search_end, -1, -1):
+        if tokens[p] == head and tokens[p : p + min_match] == tail:
+            cycle_len = (n - min_match) - p
+            if cycle_len >= min_match:
+                back = 0
+                while (
+                    (n - min_match - 1 - back >= p + min_match)
+                    and (p - 1 - back >= 0)
+                    and (tokens[n - min_match - 1 - back] == tokens[p - 1 - back])
+                ):
+                    back += 1
+                total_match = min_match + back
+                trim_count = total_match
+            else:
+                k = 0
+                while n - 1 - k - cycle_len >= 0 and tokens[n - 1 - k] == tokens[n - 1 - k - cycle_len]:
+                    k += 1
+                trim_count = k
+            return cycle_len, trim_count, p
+    return None
 
 
 class _BatchRequest:
@@ -3773,6 +3816,24 @@ class Engine:
                             return
                         yield t, pending
                         pending = ""
+                    if getattr(p, "loop_detect", True):
+                        min_match = getattr(p, "min_loop_match", 48)
+                        min_cycle = getattr(p, "min_loop_cycle", 1)
+                        if len(out) >= min_match + min_cycle:
+                            loop_res = detect_loop(out, min_match=min_match, min_cycle=min_cycle)
+                            if loop_res is not None:
+                                cycle_len, trim_count, prev_pos = loop_res
+                                print(
+                                    f"[generate] REPETITION LOOP DETECTED on slot 0: "
+                                    f"cycle={cycle_len} tokens, trimming {trim_count} duplicate tokens (prev_pos={prev_pos}). Stopping.",
+                                    flush=True,
+                                )
+                                if trim_count > 0:
+                                    del out[-trim_count:]
+                                    with getattr(self, "_slot_tokens_lock", threading.Lock()):
+                                        if 0 in self._slot_tokens:
+                                            self._slot_tokens[0] = self._slot_tokens[0][:-trim_count]
+                                return
                     logits = self.rt.step(t, pos)
                     pos += 1
                 if out[decoded_upto:]:
@@ -4529,6 +4590,28 @@ class Engine:
                                     req.result_count = len(req.out_tokens)
                                     is_stopped = True
                                     break
+
+                    # Degenerate repetition loop detection & auto-truncation
+                    if not is_stopped and not is_eos and getattr(req.params, "loop_detect", True):
+                        min_match = getattr(req.params, "min_loop_match", 48)
+                        min_cycle = getattr(req.params, "min_loop_cycle", 1)
+                        if len(req.out_tokens) >= min_match + min_cycle:
+                            loop_res = detect_loop(req.out_tokens, min_match=min_match, min_cycle=min_cycle)
+                            if loop_res is not None:
+                                cycle_len, trim_count, prev_pos = loop_res
+                                print(
+                                    f"[batched-engine] REPETITION LOOP DETECTED on slot={s_id}: "
+                                    f"cycle={cycle_len} tokens, trimming {trim_count} duplicate tokens (prev_pos={prev_pos}). Stopping.",
+                                    flush=True,
+                                )
+                                if trim_count > 0:
+                                    req.out_tokens = req.out_tokens[:-trim_count]
+                                    with getattr(self, "_slot_tokens_lock", threading.Lock()):
+                                        if s_id in self._slot_tokens:
+                                            self._slot_tokens[s_id] = self._slot_tokens[s_id][:-trim_count]
+                                req.result_text = self.tok.decode(req.out_tokens, errors="replace")
+                                req.result_count = len(req.out_tokens)
+                                is_stopped = True
 
                     if is_eos or is_max or is_stopped:
                         if not is_stopped:

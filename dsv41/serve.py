@@ -38,6 +38,9 @@ def _params(body: dict) -> GenParams:
     default_window = int(os.environ.get("DSV41_PENALTY_WINDOW", "256"))
     default_prog_pen = float(os.environ.get("DSV41_PROGRESSIVE_PENALTY", "0.0"))
     default_ban_cycles = os.environ.get("DSV41_BAN_CYCLES", "1").strip().lower() not in ("0", "false", "off")
+    default_loop_detect = os.environ.get("DSV41_LOOP_DETECT", "1").strip().lower() not in ("0", "false", "off")
+    default_min_loop_match = int(os.environ.get("DSV41_MIN_LOOP_MATCH", "48"))
+    default_min_loop_cycle = int(os.environ.get("DSV41_MIN_LOOP_CYCLE", "1"))
 
     rep_pen = float(body.get("repetition_penalty") if body.get("repetition_penalty") is not None else default_rep_pen)
     pres_pen = float(body.get("presence_penalty") if body.get("presence_penalty") is not None else default_pres_pen)
@@ -45,6 +48,9 @@ def _params(body: dict) -> GenParams:
     window = int(body.get("penalty_window") or default_window)
     prog_pen = float(body.get("progressive_penalty") if body.get("progressive_penalty") is not None else default_prog_pen)
     ban_cycles = bool(body.get("ban_cycles") if body.get("ban_cycles") is not None else default_ban_cycles)
+    loop_detect = bool(body.get("loop_detect") if body.get("loop_detect") is not None else default_loop_detect)
+    min_loop_match = int(body.get("min_loop_match") or default_min_loop_match)
+    min_loop_cycle = int(body.get("min_loop_cycle") or default_min_loop_cycle)
 
     return GenParams(
         max_new_tokens=int(body.get("max_tokens") or body.get("max_completion_tokens") or int(os.environ.get("DSV41_INTERACTIVE_MAX_NEW", "65536"))),
@@ -58,6 +64,9 @@ def _params(body: dict) -> GenParams:
         penalty_window=window,
         progressive_penalty=prog_pen,
         ban_cycles=ban_cycles,
+        loop_detect=loop_detect,
+        min_loop_match=min_loop_match,
+        min_loop_cycle=min_loop_cycle,
     )
 
 
