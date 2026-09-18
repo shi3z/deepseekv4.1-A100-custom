@@ -7,7 +7,8 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 export DSV41_MOE_PREFILL_CHUNK=2048
 export DSV41_ENGRAM_PREFILL_CHUNK=2048
-export DSV41_HC_PREFILL_CHUNK=2048
+export DSV41_HC_PREFILL_CHUNK=256
+export DSV41_LAYER_COUNTS=8,11,11,10
 export DSV41_EP_COMPACT_XQ=1
 export DSV41_EP_GRAPH_TOKENS=1048576
 export DSV41_EP_CAND_TOKENS=1048576
@@ -46,7 +47,7 @@ exec /home/shi3z/.local/bin/python -u -m dsv41.serve \
     --ckpt "$CKPT" \
     --devices 2,3,0,1 \
     --ep \
-    --ep-shards 96,96,96,96 \
+    --ep-shards 88,100,100,96 \
     --max-seq-len 1048576 \
     --max-seqs 5 \
     --host 0.0.0.0 \
