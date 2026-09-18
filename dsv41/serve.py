@@ -197,7 +197,7 @@ class Handler(BaseHTTPRequestHandler):
         # with max_tokens=32000.  Keep interactive retries bounded so a
         # response reaches the client and the request can complete.  Hosts
         # that need longer answers can raise this explicitly.
-        _interactive_cap = int(os.environ.get("DSV41_INTERACTIVE_MAX_NEW", "8192"))
+        _interactive_cap = int(os.environ.get("DSV41_INTERACTIVE_MAX_NEW", "16384"))
         requested_max_tokens = body.get("max_tokens") or body.get("max_completion_tokens")
         if _interactive_cap > 0 and params.max_new_tokens > _interactive_cap:
             params.max_new_tokens = _interactive_cap
@@ -399,7 +399,7 @@ class Handler(BaseHTTPRequestHandler):
 
                 if tool_calls:
                     finish = "tool_calls"
-                elif n >= params.max_new_tokens:
+                elif getattr(eng, "last_finish_reason", None) == "length" or n >= params.max_new_tokens:
                     finish = "length"
                 else:
                     finish = "stop"
@@ -449,7 +449,7 @@ class Handler(BaseHTTPRequestHandler):
         content = msg.get("content") if isinstance(msg, dict) else text
         out = {"id": rid, "object": "chat.completion", "created": created, "model": body.get("model") or eng.model_name,
                "choices": [{"index": 0, "message": {"role": "assistant", "content": content if content is not None else text},
-                            "finish_reason": "length" if n >= params.max_new_tokens else "stop"}],
+                            "finish_reason": "tool_calls" if (isinstance(msg, dict) and msg.get("tool_calls")) else ("length" if (getattr(eng, "last_finish_reason", None) == "length" or n >= params.max_new_tokens) else "stop")}],
                "usage": {"prompt_tokens": len(ids), "completion_tokens": n, "total_tokens": len(ids) + n}}
         if isinstance(msg, dict) and msg.get("reasoning_content"):
             out["choices"][0]["message"]["reasoning_content"] = msg["reasoning_content"]
@@ -520,7 +520,7 @@ class Handler(BaseHTTPRequestHandler):
                 f"Completion: {n} tokens in {dt_gen:.2f}s ({decode_tok_s:.1f} tok/s decode)"
             )
         self._json(200, {"id": rid, "object": "text_completion", "created": created, "model": body.get("model") or eng.model_name,
-                          "choices": [{"index": 0, "text": text, "finish_reason": "length" if n >= params.max_new_tokens else "stop"}],
+                          "choices": [{"index": 0, "text": text, "finish_reason": "length" if (getattr(eng, "last_finish_reason", None) == "length" or n >= params.max_new_tokens) else "stop"}],
                           "usage": {"prompt_tokens": len(ids), "completion_tokens": n, "total_tokens": len(ids) + n}}, t0=t0, is_stream=False)
 
     # ---------------------------------------------------------------- Jev mode structured output

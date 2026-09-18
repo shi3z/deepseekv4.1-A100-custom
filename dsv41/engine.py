@@ -120,6 +120,7 @@ class _BatchRequest:
         self.done_event = threading.Event()
         self.result_text = ""
         self.result_count = 0
+        self.finish_reason = "stop"
         self.error: Exception | None = None
         self.start_time = time.perf_counter()
         self.first_token_time = 0.0
@@ -305,6 +306,7 @@ class Engine:
         self._slot_tokens_lock = threading.Lock()
         self._last_decode_log_time = 0.0
         self.last_decode_tok_s: float | None = None
+        self.last_finish_reason: str = "stop"
         slots_to_track = list(range(1, self.max_seqs)) if self.max_seqs > 1 else [0]
         for s in slots_to_track:
             self.slot_states[s] = {
@@ -518,6 +520,9 @@ class Engine:
             if "<think>" in reasoning:
                 reasoning = reasoning.split("<think>", 1)[1].strip()
             clean_text = parts[1]
+        elif "<think>" in clean_text:
+            reasoning = clean_text.split("<think>", 1)[1].strip()
+            clean_text = ""
 
         if "<｜DSML｜ calls>" in clean_text:
             idx = clean_text.find("<｜DSML｜ calls>")
@@ -3659,7 +3664,8 @@ class Engine:
         # long-context requests bounded so the gateway can finish instead
         # of timing out during slow single-token decode. Override per host.
         if len(prompt_ids) > _mtp_long_limit:
-            max_new = min(max_new, int(os.environ.get("DSV41_LONG_PROMPT_MAX_NEW", "2048")))
+            _long_cap = int(os.environ.get("DSV41_LONG_PROMPT_MAX_NEW", os.environ.get("DSV41_INTERACTIVE_MAX_NEW", "16384")))
+            max_new = min(max_new, _long_cap)
         gen = None
         if p.seed is not None:
             gen = torch.Generator(device=self.model.blocks[-1].device)
@@ -4528,6 +4534,7 @@ class Engine:
                         if not is_stopped:
                             req.result_text = self.tok.decode(req.out_tokens, errors="replace")
                             req.result_count = len(req.out_tokens)
+                        req.finish_reason = "length" if is_max else "stop"
                         req.done_event.set()
                         finished.append(s_id)
                         dt_gen = max(now - (req.first_token_time or req.start_time), 1e-4)
@@ -4591,7 +4598,8 @@ class Engine:
         _mtp_long_limit = int(os.environ.get("DSV41_MTP_LONG_PROMPT_LIMIT", "65536"))
         max_new = min(p.max_new_tokens, self.max_seq_len - len(prompt_ids) - 1)
         if len(prompt_ids) > _mtp_long_limit:
-            max_new = min(max_new, int(os.environ.get("DSV41_LONG_PROMPT_MAX_NEW", "2048")))
+            _long_cap = int(os.environ.get("DSV41_LONG_PROMPT_MAX_NEW", os.environ.get("DSV41_INTERACTIVE_MAX_NEW", "16384")))
+            max_new = min(max_new, _long_cap)
         gen = None
         if p.seed is not None:
             gen = torch.Generator(device=self.model.blocks[-1].device)
@@ -4603,6 +4611,7 @@ class Engine:
         if req.error:
             raise req.error
         self.last_decode_tok_s = getattr(req, "decode_tok_s", None)
+        self.last_finish_reason = getattr(req, "finish_reason", "stop")
         return req.result_text, req.result_count
 
 
