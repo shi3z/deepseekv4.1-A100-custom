@@ -27,6 +27,7 @@ DeepSeek-V4.1 supports flexible deployment profiles tailored to specific product
 | **⚡ Speed & Multi-Agent** | Claude Code, interactive chat, parallel tool calls | **64K** (65,536) | **4 Slots** (`5`) | **50–55 tok/s** | **80–120 tok/s** | **12–16 GiB** | Bounds context to 64K to free VRAM; expands concurrency to 4 parallel decode streams | [`./run_speed_agent.sh`](file:///mnt/ssdraid/git/deepseekv4.1/run_speed_agent.sh) |
 | **🛡️ 1M Context Robust** | Full-repo scanning, long document analysis | **1M** (1,048,576) | **1 Slot** (`2`) | **45–50 tok/s** | 45–50 tok/s | **2–4 GiB** | Minimizes KV cache batch dimension to 2 rows; enables CED & exact cache growth to prevent OOM | [`./run_1m_robust.sh`](file:///mnt/ssdraid/git/deepseekv4.1/run_1m_robust.sh) |
 | **⚖️ Balanced Production (Default)** | General software engineering, 2-turn agents | **1M** (1,048,576) | **2 Slots** (`3`) | **50–51 tok/s** | **75–80 tok/s** | **7–10 GiB** | Balances 2 concurrent decode slots with 1M context readiness and 7–10 GiB VRAM headroom | [`./run_server_batched.sh`](file:///mnt/ssdraid/git/deepseekv4.1/run_server_batched.sh) |
+| **🏎️ 4-GPU MTP Speculative** | Interactive chat, fast terminal output, single agent | **64K** (65,536) | **1 Slot** (`2`) | **85–93 tok/s** | 85–93 tok/s | **10–14 GiB** | Shards experts as `100,100,100,84` to fit DSpark on `cuda:1`; drafts 5 tokens/step with 1.79 acceptance | [`./run_mtp_4gpu.sh`](file:///mnt/ssdraid/git/deepseekv4.1/run_mtp_4gpu.sh) |
 | **🚀 Jev Mode (Structured)** | JSON Schema extraction, classification, agent decisions | **Flexible** (64K–1M) | **Non-Autoregressive** (1-pass parallel queries) | *N/A* (0 decode tokens) | **up to ~13,000 tok/s** *(effective)* | Shared | Non-autoregressive candidate scoring on exact same weights; eliminates JSON formatting decode passes | [Jev Mode](#jev-mode-parallel-non-autoregressive-structured-output--hierarchical-prefix-cache-updated-2026-09-17) / [`examples/jev_mode/`](file:///mnt/ssdraid/git/deepseekv4.1/examples/jev_mode/README.md) |
 
 > [!NOTE]
@@ -127,6 +128,25 @@ Provides a balanced operating point with **2 concurrent decode slots** (`max_seq
 ./run_server_batched.sh
 ```
 - **Performance Impact**: Sustains single-stream generation at **51.1 tok/s**, scales to **~75–80 tok/s aggregate** under 2 concurrent requests, and preserves ample memory safety margins.
+
+---
+
+### 4. 🏎️ 4-GPU MTP Speculative Profile (Single-Stream Maximum Speed: ~85–93 tok/s)
+
+**Best for**: Highly interactive single-stream terminal chats and agentic thought generation where minimizing user-perceived token latency is paramount.
+
+In a 4-GPU configuration (`--devices 2,3,0,1`), DeepSeek's 3-layer Multi-Token Prediction head (**DSpark**) lives on the last GPU (`cuda:1`). Because DSpark and the output head require ~15.5 GiB of VRAM, hosting the normal 96+ experts on `cuda:1` would cause an out-of-memory error.
+
+**The Solution**: Rebalance expert parallelism shards to **`--ep-shards 100,100,100,84`**:
+- `cuda:2`, `cuda:3`, and `cuda:0` each host 100 experts (+4 experts over even split, +5.1 GiB).
+- `cuda:1` hosts only **84 experts** (12 fewer experts, **freeing ~15.4 GiB of VRAM**).
+- DSpark's 3 blocks, draft KV ring, and LM head fit comfortably within the freed memory.
+
+```bash
+# Launch 4-GPU MTP speculative decoding (85-93 tok/s single-stream)
+./run_mtp_4gpu.sh
+```
+- **Performance Impact**: Proposes 5 draft tokens per step (`--mtp 5`). With an average acceptance rate of 1.79 drafts/step, generation advances by **2.79 tokens per verified step**, accelerating single-stream throughput from **63.3 tok/s to 84.7–93.0 tok/s (~1.35×–1.45× speedup)**.
 
 ---
 
@@ -439,6 +459,20 @@ Measured using [`examples/benchmarks/bench_decode_throughput.py`](file:///mnt/ss
 | **Short Prompt (12 words)** | 256 | 256 | 5.35 s | **47.8 tok/s** |
 | **Medium Prompt (~100 words)** | 128 | 128 | 3.58 s | **35.7 tok/s** |
 | **Medium Prompt (~100 words)** | 256 | 256 | 5.52 s | **46.3 tok/s** |
+
+### MTP (DSpark) Speculative Decode Throughput (4× A100 Single-Stream)
+
+Measured on 4× NVIDIA A100 80GB GPUs (`--devices 2,3,0,1 --ep-shards 100,100,100,84`):
+
+| Speculative Configuration | Verified Step Latency | Draft Acceptance Rate | Tokens Produced per Step | Generation Throughput | Net Speedup |
+|:---|:---:|:---:|:---:|:---:|:---:|
+| **Baseline (MTP Off, B=1)** | 15.8 ms | — | 1.00 tok/step | **63.3 tok/s** | 1.00× (Baseline) |
+| **DSpark MTP ($K=3$ drafts)** | 31.0 ms | 1.53 drafts accepted | 2.53 tok/step | **81.7 tok/s** | **1.29× (+29.1%)** |
+| **DSpark MTP ($K=4$ drafts)** | 31.9 ms | 1.60 drafts accepted | 2.60 tok/step | **81.4 tok/s** | **1.29× (+28.6%)** |
+| **DSpark MTP ($K=5$ drafts)** | 33.0 ms | 1.79 drafts accepted | 2.79 tok/step | **84.7–93.0 tok/s** | **1.34×–1.47× (+34–47%)** |
+
+> [!TIP]
+> On structured tasks with high predictability (e.g. Python coding prompts), the draft acceptance rate increases from 1.62 to **2.12 drafts/step**, pushing batched speculative throughput up to **623 tok/s** across 32 sequences.
 
 ### Prefix Cache Hit Acceleration (LCP Reuse)
 
