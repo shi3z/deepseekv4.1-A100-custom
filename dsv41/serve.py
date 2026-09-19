@@ -790,6 +790,7 @@ def main():
         ENGINE.jev_engine.prefix_tree.init_system_prompt()
     except Exception as e:
         print(f"[jev-init] Note: Jev system prompt prefill deferred ({e})", flush=True)
+    ThreadingHTTPServer.request_queue_size = 128
     srv = ThreadingHTTPServer((a.host, a.port), Handler)
     print(f"serving OpenAI-compatible API on http://{a.host}:{a.port}/v1 (model '{ENGINE.model_name}')", flush=True)
     print(f"monitoring dashboard active at http://{a.host}:{a.port}/dashboard", flush=True)

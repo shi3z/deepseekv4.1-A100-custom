@@ -27,13 +27,20 @@ def send_single_query(req_id: int, max_tokens: int = 32) -> dict:
         "temperature": 0.7,
     }
     t0 = time.perf_counter()
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        res = json.loads(resp.read().decode("utf-8"))
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                res = json.loads(resp.read().decode("utf-8"))
+            break
+        except Exception as exc:
+            if attempt == 2:
+                raise exc
+            time.sleep(0.1 * (attempt + 1))
     elapsed = time.perf_counter() - t0
 
     usage = res.get("usage", {})
