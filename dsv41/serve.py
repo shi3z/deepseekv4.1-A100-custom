@@ -97,11 +97,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/v1/models":
-            cur_model = ENGINE.model_name if ENGINE else "deepseek-v4.1-flash"
+            cur_model = ENGINE.model_name if ENGINE else "deepseek-v4.1-flash-abliterated"
             data = [{"id": cur_model, "object": "model", "owned_by": "local"}]
             known_aliases = [
-                "deepseek-v4.1-flash",
                 "deepseek-v4.1-flash-abliterated",
+                "deepseek-v4.1-flash",
                 "claude-3-5-sonnet-20241022",
                 "claude-3-7-sonnet-20250219",
                 "claude-3-5-haiku-20241022",
@@ -124,16 +124,12 @@ class Handler(BaseHTTPRequestHandler):
             self._json(404, {"error": "not found"})
 
     def _dashboard(self):
-        if not STATS_TRACKER:
-            return self._json(500, {"error": "stats tracker not initialized"})
-        try:
-            import dsv41.stats as _st_mod
-            import importlib
-            importlib.reload(_st_mod)
-            model_name = ENGINE.model_name if ENGINE else "deepseek-v4.1-flash"
+        _st_mod = sys.modules.get("dsv41.stats")
+        if not STATS_TRACKER and _st_mod:
+            model_name = ENGINE.model_name if ENGINE else "deepseek-v4.1-flash-abliterated"
             html = _st_mod._DASHBOARD_HTML_TEMPLATE.replace("__MODEL_NAME__", model_name).encode("utf-8")
-        except Exception:
-            html = STATS_TRACKER.render_dashboard_html(ENGINE.model_name if ENGINE else "deepseek-v4.1-flash").encode("utf-8")
+        elif STATS_TRACKER:
+            html = STATS_TRACKER.render_dashboard_html(ENGINE.model_name if ENGINE else "deepseek-v4.1-flash-abliterated").encode("utf-8")
         try:
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")

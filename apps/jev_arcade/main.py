@@ -45,7 +45,7 @@ class PlayRequest(BaseModel):
 
 
 def get_current_local_model() -> str:
-    """Fetch the currently active model from the local engine, defaulting to deepseek-v4.1-flash."""
+    """Fetch the currently active model from the local engine, defaulting to deepseek-v4.1-flash-abliterated."""
     try:
         req = urllib.request.Request(f"{LOCAL_SERVER_URL}/v1/models", headers={"User-Agent": "JevArcade/1.0"})
         with urllib.request.urlopen(req, timeout=2) as resp:
@@ -54,7 +54,7 @@ def get_current_local_model() -> str:
                 return data["data"][0]["id"]
     except Exception:
         pass
-    return "deepseek-v4.1-flash"
+    return "deepseek-v4.1-flash-abliterated"
 
 
 def call_local_jev(prompt: str, schema: dict, model: Optional[str] = None) -> tuple[dict, float, int, dict]:

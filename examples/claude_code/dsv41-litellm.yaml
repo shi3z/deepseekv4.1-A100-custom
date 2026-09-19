@@ -1,12 +1,12 @@
 model_list:
-  - model_name: deepseek-v4.1-flash
+  - model_name: deepseek-v4.1-flash-abliterated
     litellm_params:
-      model: openai/deepseek-v4.1-flash
+      model: openai/deepseek-v4.1-flash-abliterated
       api_base: http://127.0.0.1:8000/v1
       api_key: sk-local
       timeout: 3600
       max_tokens: 1048576
-  - model_name: deepseek-v4.1-flash-abliterated
+  - model_name: deepseek-v4.1-flash
     litellm_params:
       model: openai/deepseek-v4.1-flash-abliterated
       api_base: http://127.0.0.1:8000/v1
@@ -15,7 +15,7 @@ model_list:
       max_tokens: 1048576
   - model_name: "*"
     litellm_params:
-      model: openai/deepseek-v4.1-flash
+      model: openai/deepseek-v4.1-flash-abliterated
       api_base: http://127.0.0.1:8000/v1
       api_key: sk-local
       timeout: 3600
@@ -24,21 +24,22 @@ model_list:
 router_settings:
   enable_fallbacks: true
   model_group_alias:
-    "claude-3-5-sonnet-20241022": "deepseek-v4.1-flash"
-    "claude-3-7-sonnet-20250219": "deepseek-v4.1-flash"
-    "claude-3-5-haiku-20241022": "deepseek-v4.1-flash"
-    "claude-3-opus-20240229": "deepseek-v4.1-flash"
-    "gpt-4o": "deepseek-v4.1-flash"
-    "gpt-4": "deepseek-v4.1-flash"
-    "default": "deepseek-v4.1-flash"
+    "claude-3-5-sonnet-20241022": "deepseek-v4.1-flash-abliterated"
+    "claude-3-7-sonnet-20250219": "deepseek-v4.1-flash-abliterated"
+    "claude-3-5-haiku-20241022": "deepseek-v4.1-flash-abliterated"
+    "claude-3-opus-20240229": "deepseek-v4.1-flash-abliterated"
+    "gpt-4o": "deepseek-v4.1-flash-abliterated"
+    "gpt-4": "deepseek-v4.1-flash-abliterated"
+    "default": "deepseek-v4.1-flash-abliterated"
+    "deepseek-v4.1-flash": "deepseek-v4.1-flash-abliterated"
   fallbacks:
-    - "*": ["deepseek-v4.1-flash"]
+    - "*": ["deepseek-v4.1-flash-abliterated"]
 
 litellm_settings:
   # Translates Anthropic /v1/messages calls to OpenAI /v1/chat/completions format
   use_chat_completions_url_for_anthropic_messages: true
   fallbacks:
-    - "*": ["deepseek-v4.1-flash"]
+    - "*": ["deepseek-v4.1-flash-abliterated"]
 
 general_settings:
   master_key: sk-local
