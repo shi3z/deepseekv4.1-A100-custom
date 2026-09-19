@@ -25,6 +25,7 @@ DeepSeek-V4.1 supports flexible deployment profiles tailored to specific product
 | Profile | Target Workload | Context Limit (`max_seq_len`) | Concurrent Decode Slots (`max_seqs`) | Single-Stream Decode Speed | Aggregate Parallel Throughput | Free VRAM / GPU | Architectural Trade-offs & Features | Launch Script / Reference |
 |:---|:---|:---:|:---:|:---:|:---:|:---:|:---|:---|
 | **⚡ Speed & Multi-Agent** | Claude Code, interactive chat, parallel tool calls | **64K** (65,536) | **4 Slots** (`5`) | **50–55 tok/s** | **80–120 tok/s** | **12–16 GiB** | Bounds context to 64K to free VRAM; expands concurrency to 4 parallel decode streams | [`./run_speed_agent.sh`](file:///mnt/ssdraid/git/deepseekv4.1/run_speed_agent.sh) |
+| **👥 128K High-Concurrency** | Multi-agent swarms, parallel code generation, 8-stream batched serving | **128K** (131,072) | **8 Slots** (`9`) | **50–52 tok/s** | **110–120 tok/s** | **7–11 GiB** | Bounds context to 128K (~1.56 GiB/slot KV cache); scales out to 8 parallel decode streams | [`./run_128k_8slots.sh`](file:///mnt/ssdraid/git/deepseekv4.1/run_128k_8slots.sh) |
 | **🛡️ 1M Context Robust** | Full-repo scanning, long document analysis | **1M** (1,048,576) | **1 Slot** (`2`) | **45–50 tok/s** | 45–50 tok/s | **2–4 GiB** | Minimizes KV cache batch dimension to 2 rows; enables CED & exact cache growth to prevent OOM | [`./run_1m_robust.sh`](file:///mnt/ssdraid/git/deepseekv4.1/run_1m_robust.sh) |
 | **⚖️ Balanced Production (Default)** | General software engineering, 2-turn agents | **1M** (1,048,576) | **2 Slots** (`3`) | **50–51 tok/s** | **75–80 tok/s** | **7–10 GiB** | Balances 2 concurrent decode slots with 1M context readiness and 7–10 GiB VRAM headroom | [`./run_server_batched.sh`](file:///mnt/ssdraid/git/deepseekv4.1/run_server_batched.sh) |
 | **🏎️ 4-GPU MTP Speculative** | Interactive chat, fast terminal output, single agent | **64K** (65,536) | **1 Slot** (`2`) | **85–93 tok/s** | 85–93 tok/s | **10–14 GiB** | Shards experts as `100,100,100,84` to fit DSpark on `cuda:1`; drafts 5 tokens/step with 1.79 acceptance | [`./run_mtp_4gpu.sh`](file:///mnt/ssdraid/git/deepseekv4.1/run_mtp_4gpu.sh) |
@@ -32,7 +33,7 @@ DeepSeek-V4.1 supports flexible deployment profiles tailored to specific product
 
 > [!NOTE]
 > **Generative Throughput vs. Effective Throughput**:
-> - **Profiles 1–3 (Autoregressive Decode)**: Measure physical token generation throughput (generating arbitrary free-form text or code step-by-step across parallel client streams, bounded by GPU memory bandwidth at ~120 tok/s aggregate).
+> - **Autoregressive Profiles (1–4)**: Measure physical token generation throughput (generating arbitrary free-form text or code step-by-step across parallel client streams, bounded by GPU memory bandwidth at ~110–120 tok/s aggregate).
 > - **Jev Mode (Non-Autoregressive Scoring)**: Operates on the **exact same model weights**, but bypasses autoregressive decoding entirely. It evaluates schema field queries simultaneously across sequence slots and scores candidate log-probabilities in a single forward pass, assembling typed JSON directly in Python. Its ~13,000 tok/s rating represents **effective extraction throughput** (798 tokens of structured data delivered in 61.5 ms).
 
 ---
@@ -75,7 +76,45 @@ python -m dsv41.serve \
 
 ---
 
-### 2. 🛡️ 1,000,000-Token Context Robust Profile (Zero-OOM Ultra-Long Processing)
+### 2. 👥 128K Context High-Concurrency Profile (8 Parallel Decode Streams)
+
+**Best for**: Multi-agent swarms, parallel code generation benchmarks, high-density serving, and automated test runners.
+
+Restricting maximum context length to **128K tokens** (131,072) reduces KV cache memory consumption to just **~1.56 GiB per slot** (compared to ~12.5 GiB/slot for 1M context). This dramatic memory reduction allows sequence concurrency to be expanded to **8 parallel decode slots** (`max_seqs 9` = 1 prefill scratchpad + 8 concurrent decode streams) on 4× A100 80GB GPUs while maintaining **7–11 GiB of VRAM headroom** per GPU.
+
+```bash
+#!/usr/bin/env bash
+# run_128k_8slots.sh: High-concurrency 8-stream decode with 128K context
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+# Context sizing (128K horizon)
+export DSV41_CACHE_INIT_TOKENS=32768
+export DSV41_EP_PREALLOC_TOKENS=32768
+export DSV41_EXACT_CACHE_GROW=1
+
+# Concurrency: 8 parallel decode streams (max_seqs 9: slot 0 scratchpad + slots 1..8 decode)
+export DSV41_MAX_SEQS=9
+
+# Communication & Cache Acceleration
+export DSV41_EP_COMPACT_XQ=1
+export DSV41_GPU_SLOT_CACHE=1
+export DSV41_PREFIX_DEDUP_MIRRORS=1
+export DSV41_CED=1
+
+python -m dsv41.serve \
+  --ckpt /mnt/ssd/models/DeepSeek-V4.1-Flash-Abliterated \
+  --devices 2,3,0,1 \
+  --ep --ep-shards 92,95,99,98 \
+  --max-seq-len 131072 \
+  --max-seqs 9 \
+  --host 0.0.0.0 --port 8000 \
+  --mtp 0
+```
+- **Performance Impact**: Serves up to 8 parallel agent subtasks or code generation streams concurrently, scaling aggregate throughput to **110–120 tok/s** (119.2 tok/s on 8-stream code generation, 119.9 tok/s peak dashboard decode).
+
+---
+
+### 3. 🛡️ 1,000,000-Token Context Robust Profile (Zero-OOM Ultra-Long Processing)
 
 **Best for**: Ingesting entire code repositories (hundreds of thousands of lines), analyzing whole libraries, or processing massive document corpuses up to 1,000,000 tokens.
 
@@ -117,7 +156,7 @@ python -m dsv41.serve \
 
 ---
 
-### 3. ⚖️ Balanced Production Profile (Default Recommended Setup)
+### 4. ⚖️ Balanced Production Profile (Default Recommended Setup)
 
 **Best for**: General software development, multi-turn Claude Code workflows, and 2-stream concurrent serving.
 
@@ -131,7 +170,7 @@ Provides a balanced operating point with **2 concurrent decode slots** (`max_seq
 
 ---
 
-### 4. 🏎️ 4-GPU MTP Speculative Profile (Single-Stream Maximum Speed: ~85–93 tok/s)
+### 5. 🏎️ 4-GPU MTP Speculative Profile (Single-Stream Maximum Speed: ~85–93 tok/s)
 
 **Best for**: Highly interactive single-stream terminal chats and agentic thought generation where minimizing user-perceived token latency is paramount.
 
@@ -486,10 +525,21 @@ Measured using [`examples/benchmarks/bench_code_generation.py`](file:///mnt/ssdr
 | **Trie Prefix Tree** | 768 tok | 14.55 s | **52.8 tok/s** | PASS | PASS |
 | **Topological Sort (Cycle Detection)** | 768 tok | 14.52 s | **52.9 tok/s** | PASS | PASS |
 
-- **Average Single-Stream Coding Speed**: **52.70 tok/s** (consistent ~52–53 tok/s across all tasks)
-- **2-Worker Concurrent Coding Speed**: **70.70 tok/s aggregate** (35.4 tok/s per stream)
+- **Average Single-Stream Coding Speed**: **52.70 tok/s** (consistent ~50–53 tok/s across all tasks)
 - **Python AST Syntax Pass Rate**: **80.0%** (100% on completed code blocks)
 - **Functional Unit Test Pass Rate**: **80.0%** (inline test suites executed and passed in sandbox)
+
+#### Multi-Worker Concurrency Scaling (128K Profile, 4× A100)
+
+| Concurrency Level | Workload | Tokens Generated | Wall-Clock Time | Per-Stream Latency | Aggregate Throughput |
+|:---:|:---|:---:|:---:|:---:|:---:|
+| **1 Worker** | Single code generation task | 400 tok | 7.96 s | 7.96 s | **50.3 tok/s** |
+| **2 Workers** | Parallel code generation tasks | 1,024 tok | 14.15 s | 14.15 s | **70.7 tok/s** |
+| **4 Workers** | Parallel algorithmic challenges | 1,600 tok | 18.43 s | 18.40 s | **86.8 tok/s** |
+| **8 Workers** | Full 8-stream parallel code gen | 2,048 tok | 17.18 s | 17.16 s | **119.2 tok/s** *(119.9 peak)* |
+
+> [!TIP]
+> Under 8 concurrent streams on 4× A100 GPUs, aggregate decode throughput scales from 50.3 tok/s to **119.2 tok/s** (a **2.37× throughput expansion**) while maintaining low memory pressure (~70–75 GiB VRAM per GPU).
 
 ### Prefix Cache Hit Acceleration (LCP Reuse)
 

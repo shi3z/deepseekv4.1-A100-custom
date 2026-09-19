@@ -48,6 +48,14 @@ DEFAULT_TASKS = [
         "name": "Exponential Backoff Retry Decorator",
         "prompt": "Write a Python decorator that retries a function with exponential backoff on exceptions, with tests.",
     },
+    {
+        "name": "Min-Heap Priority Queue",
+        "prompt": "Implement a binary min-heap priority queue in Python supporting push, pop, and peek, with unit tests.",
+    },
+    {
+        "name": "Thread-Safe Circular Buffer",
+        "prompt": "Implement a thread-safe bounded circular ring buffer in Python with put and get methods, with unit tests.",
+    },
 ]
 
 
