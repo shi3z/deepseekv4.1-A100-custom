@@ -537,6 +537,8 @@ Measured using [`examples/benchmarks/bench_code_generation.py`](file:///mnt/ssdr
 | **2 Streams** | [`./run_server_batched.sh`](file:///mnt/ssdraid/git/deepseekv4.1/run_server_batched.sh) | 1M | 70.7 tok/s | **78.2 tok/s** | 1.55× |
 | **4 Streams** | [`./run_speed_agent.sh`](file:///mnt/ssdraid/git/deepseekv4.1/run_speed_agent.sh) | 64K | 86.8 tok/s | **98.4 tok/s** | 1.95× |
 | **8 Streams** | [`./run_128k_8slots.sh`](file:///mnt/ssdraid/git/deepseekv4.1/run_128k_8slots.sh) | 128K | 119.2 tok/s | **119.9 tok/s** | 2.38× |
+| **16 Streams** | [`./run_16slots.sh`](file:///mnt/ssdraid/git/deepseekv4.1/run_16slots.sh) | 32K | 127.4 tok/s | **269.3 tok/s** | **5.35×** |
+| **24 Streams** | [`./run_24slots.sh`](file:///mnt/ssdraid/git/deepseekv4.1/run_24slots.sh) | 32K | 141.4 tok/s | **321.9 tok/s** | **6.40×** |
 | **32 Streams** | [`./run_32slots.sh`](file:///mnt/ssdraid/git/deepseekv4.1/run_32slots.sh) | 16K | 159.8 tok/s | **376.5 tok/s** | **7.48×** |
 | **64 Streams** | [`./run_64slots.sh`](file:///mnt/ssdraid/git/deepseekv4.1/run_64slots.sh) | 8K | 167.5 tok/s | **475.6 tok/s** | **9.45×** |
 
