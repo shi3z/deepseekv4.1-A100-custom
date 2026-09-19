@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <title>Jev Arcade 20 - DeepSeek-V4.1 超高速構造化ジャッジ</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <!-- Top Navigation Header -->
+    <header class="app-header">
+        <div class="header-container">
+            <div class="brand">
+                <div class="brand-logo">⚡</div>
+                <div class="brand-text">
+                    <h1>JEV ARCADE <span class="badge-version">20 GAMES</span></h1>
+                    <p class="subtitle">DeepSeek-V4.1 超高速非自己回帰ジャッジ & TypeSafe System One</p>
+                </div>
+            </div>
+
+            <div class="header-controls">
+                <!-- Engine Selector Pill -->
+                <div class="engine-toggle-group">
+                    <button id="engine-local-btn" class="engine-btn active" data-engine="local" title="Local 4x A100 DeepSeek-V4.1">
+                        <span class="engine-dot"></span>
+                        <span class="engine-name">Local A100</span>
+                    </button>
+                    <button id="engine-cloud-btn" class="engine-btn" data-engine="official" title="Official TypeSafe Cloud Jev">
+                        <span class="engine-dot cloud"></span>
+                        <span class="engine-name">Official Jev</span>
+                    </button>
+                </div>
+
+                <!-- Sound FX Toggle -->
+                <button id="sound-btn" class="icon-btn" title="サウンド切り替え" aria-label="Toggle Sound">
+                    <span id="sound-icon">🔊</span>
+                </button>
+
+                <!-- Tailscale Indicator -->
+                <div class="tailscale-pill" title="iPad Tailnet 接続">
+                    <span class="pulse-dot"></span>
+                    <span class="ts-text">100.126.237.55</span>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <!-- Hero Banner / Stats -->
+    <section class="hero-bar">
+        <div class="hero-content">
+            <div class="stat-pill">
+                <span class="stat-num" id="total-games-count">20</span>
+                <span class="stat-label">収録ゲーム</span>
+            </div>
+            <div class="stat-pill">
+                <span class="stat-num" id="play-counter">0</span>
+                <span class="stat-label">プレイ回数</span>
+            </div>
+            <div class="stat-pill">
+                <span class="stat-num" id="avg-latency">--</span>
+                <span class="stat-label">平均レスポンス</span>
+            </div>
+            <div class="stat-pill">
+                <span class="stat-num" id="last-engine-label">Local A100</span>
+                <span class="stat-label">稼働エンジン</span>
+            </div>
+        </div>
+    </section>
+
+    <!-- Genre Filter Tabs -->
+    <nav class="filter-nav">
+        <div class="filter-scroll-wrapper">
+            <button class="filter-tab active" data-filter="all">すべて <span class="tab-count">(20)</span></button>
+            <button class="filter-tab" data-filter="心理サバイバル,心理分析,交渉バトル,深層心理,刑事ドラマ,恋愛心理">心理・交渉 <span class="tab-count">(6)</span></button>
+            <button class="filter-tab" data-filter="ファンタジーRPG,中二病査定,クリーチャー錬成,MCバトル">RPG・バトル <span class="tab-count">(4)</span></button>
+            <button class="filter-tab" data-filter="お笑い判定,異世界コメディ,ユーモア創出">大喜利・笑い <span class="tab-count">(3)</span></button>
+            <button class="filter-tab" data-filter="極限サバイバル,推理ゲーム,論理パズル">極限・推理 <span class="tab-count">(3)</span></button>
+            <button class="filter-tab" data-filter="哲学と悪意,神秘の占い,美食ジャッジ,心理ポーカー">診断・哲学 <span class="tab-count">(4)</span></button>
+        </div>
+    </nav>
+
+    <!-- Main Game Grid -->
+    <main class="main-container">
+        <div id="games-grid" class="games-grid">
+            <!-- Rendered by JavaScript -->
+            <div class="loading-placeholder">
+                <div class="spinner"></div>
+                <p>ゲームデータをロード中...</p>
+            </div>
+        </div>
+    </main>
+
+    <!-- Active Game Stage Modal -->
+    <div id="game-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+        <div class="modal-card">
+            <!-- Modal Header -->
+            <div class="modal-header">
+                <div class="modal-title-group">
+                    <span id="modal-emoji" class="modal-emoji">👔</span>
+                    <div>
+                        <div class="modal-tag-row">
+                            <span id="modal-tag" class="modal-tag">心理サバイバル</span>
+                            <span id="modal-game-id" class="modal-subtag">#1 / 20</span>
+                        </div>
+                        <h2 id="modal-title" class="modal-title">言い訳サバイバル</h2>
+                    </div>
+                </div>
+                <button id="modal-close-btn" class="close-btn" aria-label="閉じる">&times;</button>
+            </div>
+
+            <!-- Modal Body (Scrollable) -->
+            <div class="modal-body">
+                <!-- Description -->
+                <p id="modal-desc" class="modal-desc">遅刻や大炎上バグを出してしまった！激怒する鬼上司に絶妙な言い訳をして解雇を免れろ！</p>
+
+                <!-- Scenario Box -->
+                <div class="scenario-box">
+                    <div class="scenario-header">
+                        <span class="scenario-icon">🎬</span>
+                        <span class="scenario-title">現在のシチュエーション</span>
+                    </div>
+                    <div id="modal-scenario" class="scenario-content">
+                        「おい貴様！今朝の重役プレゼンの開始直前に本番DBを全DROPしたそうだな！？一体どういうことだ説明しろ！！」
+                    </div>
+                </div>
+
+                <!-- Presets ("ワンタップで試す") -->
+                <div class="presets-section">
+                    <div class="presets-label">
+                        <span>⚡ ワンタップで試す:</span>
+                        <span class="presets-hint">(タップで入力欄に即時セット)</span>
+                    </div>
+                    <div id="modal-presets" class="presets-chips">
+                        <!-- Rendered by JS -->
+                    </div>
+                </div>
+
+                <!-- Player Input -->
+                <div class="input-section">
+                    <label id="modal-input-label" for="user-text-input" class="input-label">あなたの上司への言い訳</label>
+                    <textarea id="user-text-input" class="text-input" rows="3" placeholder="ここに入力するか、上のワンタップボタンを押してください..."></textarea>
+                </div>
+
+                <!-- Action Controls -->
+                <div class="modal-actions">
+                    <button id="play-submit-btn" class="action-btn primary-btn">
+                        <span class="btn-icon">⚡</span>
+                        <span class="btn-text">JEVで瞬時判定！</span>
+                    </button>
+                    <button id="clear-input-btn" class="action-btn secondary-btn" title="入力をクリア">
+                        <span>クリア</span>
+                    </button>
+                </div>
+
+                <!-- Loading State -->
+                <div id="judging-indicator" class="judging-box hidden">
+                    <div class="scanner-line"></div>
+                    <div class="judging-text">
+                        <span class="spinner-small"></span>
+                        <span id="judging-message">DeepSeek-V4.1 Jev Mode 意味空間ダイレクト査定中...</span>
+                    </div>
+                </div>
+
+                <!-- Evaluation Result Presentation Area -->
+                <div id="result-container" class="result-container hidden">
+                    <div class="result-header">
+                        <div class="result-banner" id="result-banner">
+                            <span id="result-verdict-icon">🏆</span>
+                            <span id="result-verdict-title">判定完了</span>
+                        </div>
+                        <div class="result-meta">
+                            <span id="result-engine-badge" class="meta-badge">Local A100</span>
+                            <span id="result-latency-badge" class="meta-badge">⚡ 1,240ms</span>
+                            <span id="result-tokens-badge" class="meta-badge">86 tokens</span>
+                        </div>
+                    </div>
+
+                    <!-- Structured Cards -->
+                    <div id="result-cards-grid" class="result-cards-grid">
+                        <!-- Dynamically filled with parsed attributes -->
+                    </div>
+
+                    <!-- Extra Metrics (Scoring ms, Prefix Tokens Saved) -->
+                    <div id="result-metrics-row" class="result-metrics-row">
+                        <!-- Metrics chips -->
+                    </div>
+
+                    <!-- Raw JSON Accordion -->
+                    <details class="json-accordion">
+                        <summary>詳細スキーマ & 生JSON レスポンス</summary>
+                        <pre id="result-json" class="json-display"></pre>
+                    </details>
+                </div>
+            </div>
+
+            <!-- Modal Footer Navigation (iPad Friendly) -->
+            <div class="modal-footer">
+                <button id="prev-game-btn" class="nav-btn">◀ 前のゲーム</button>
+                <div class="modal-nav-center">
+                    <span id="modal-game-counter">1 / 20</span>
+                </div>
+                <button id="next-game-btn" class="nav-btn">次のゲーム ▶</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Scripts -->
+    <script src="/static/audio.js"></script>
+    <script src="/static/app.js"></script>
+</body>
+</html>
