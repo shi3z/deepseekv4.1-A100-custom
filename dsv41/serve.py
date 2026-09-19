@@ -99,8 +99,19 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/v1/models":
             cur_model = ENGINE.model_name if ENGINE else "deepseek-v4.1-flash"
             data = [{"id": cur_model, "object": "model", "owned_by": "local"}]
-            for alias in ("deepseek-v4.1-flash", "deepseek-v4.1-flash-abliterated"):
-                if alias != cur_model:
+            known_aliases = [
+                "deepseek-v4.1-flash",
+                "deepseek-v4.1-flash-abliterated",
+                "claude-3-5-sonnet-20241022",
+                "claude-3-7-sonnet-20250219",
+                "claude-3-5-haiku-20241022",
+                "claude-3-opus-20240229",
+                "gpt-4o",
+                "gpt-4",
+                "default",
+            ]
+            for alias in known_aliases:
+                if not any(d["id"] == alias for d in data):
                     data.append({"id": alias, "object": "model", "owned_by": "local"})
             self._json(200, {"object": "list", "data": data})
         elif self.path == "/health":

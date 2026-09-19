@@ -40,52 +40,31 @@ class PlayRequest(BaseModel):
     game_id: str
     user_input: str
     engine: str = "local"  # "local" | "official"
+    model: Optional[str] = None
     api_key: Optional[str] = None
 
 
-@app.get("/api/games")
-async def list_games():
-    """Return all 20 mini-games metadata."""
-    return {"games": GAMES, "total": len(GAMES)}
-
-
-@app.get("/api/health")
-async def health_check():
-    """Check connectivity to local DeepSeek-V4.1 server and official TypeSafe API."""
-    local_ok = False
-    local_ms = 0.0
+def get_current_local_model() -> str:
+    """Fetch the currently active model from the local engine, defaulting to deepseek-v4.1-flash."""
     try:
-        t0 = time.perf_counter()
-        req = urllib.request.Request(f"{LOCAL_SERVER_URL}/health", headers={"User-Agent": "JevArcade/1.0"})
-        with urllib.request.urlopen(req, timeout=3) as resp:
-            if resp.status == 200:
-                local_ok = True
-        local_ms = (time.perf_counter() - t0) * 1000.0
+        req = urllib.request.Request(f"{LOCAL_SERVER_URL}/v1/models", headers={"User-Agent": "JevArcade/1.0"})
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if data.get("data") and len(data["data"]) > 0:
+                return data["data"][0]["id"]
     except Exception:
         pass
-
-    return {
-        "status": "ok",
-        "local_engine": {
-            "url": LOCAL_SERVER_URL,
-            "connected": local_ok,
-            "latency_ms": round(local_ms, 1),
-            "model": "DeepSeek-V4.1-Flash (4x A100)",
-        },
-        "official_engine": {
-            "url": "https://api.typesafe.ai/v1/systemone",
-            "model": "jev-latest (Cloud)",
-            "key_configured": bool(DEFAULT_TYPESAFE_KEY),
-        },
-        "tailscale_ip": "100.126.237.55",
-    }
+    return "deepseek-v4.1-flash"
 
 
-def call_local_jev(prompt: str, schema: dict) -> tuple[dict, float, int]:
-    """Execute evaluation using local DeepSeek-V4.1 Jev Mode."""
+def call_local_jev(prompt: str, schema: dict, model: Optional[str] = None) -> tuple[dict, float, int, dict]:
+    """Execute evaluation using local DeepSeek-V4.1 Jev Mode, falling back to current active model if model differs."""
     url = f"{LOCAL_SERVER_URL}/v1/chat/completions"
+    current_model = get_current_local_model()
+    target_model = model or current_model
+
     payload = {
-        "model": "deepseek-v4.1-flash",
+        "model": target_model,
         "prompt": prompt,
         "jev": True,
         "schema": schema,
@@ -97,8 +76,23 @@ def call_local_jev(prompt: str, schema: dict) -> tuple[dict, float, int]:
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=45) as resp:
-        res = json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            res = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if target_model != current_model:
+            print(f"[JEV] Model '{target_model}' failed ({e.code}), falling back to current model '{current_model}'")
+            payload["model"] = current_model
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=45) as resp:
+                res = json.loads(resp.read().decode("utf-8"))
+        else:
+            raise
+
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
     jev_result = res.get("jev_result") or {}
@@ -152,6 +146,46 @@ def call_official_typesafe_jev(prompt: str, schema: dict, api_key: str) -> tuple
     return jev_result, elapsed_ms, total_tokens, {}
 
 
+@app.get("/api/games")
+async def list_games():
+    """Return all 20 mini-games metadata."""
+    return {"games": GAMES, "total": len(GAMES)}
+
+
+@app.get("/api/health")
+async def health_check():
+    """Check connectivity to local DeepSeek-V4.1 server and official TypeSafe API."""
+    local_ok = False
+    local_ms = 0.0
+    active_model = "DeepSeek-V4.1-Flash (4x A100)"
+    try:
+        t0 = time.perf_counter()
+        req = urllib.request.Request(f"{LOCAL_SERVER_URL}/health", headers={"User-Agent": "JevArcade/1.0"})
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            if resp.status == 200:
+                local_ok = True
+        local_ms = (time.perf_counter() - t0) * 1000.0
+        active_model = get_current_local_model()
+    except Exception:
+        pass
+
+    return {
+        "status": "ok",
+        "local_engine": {
+            "url": LOCAL_SERVER_URL,
+            "connected": local_ok,
+            "latency_ms": round(local_ms, 1),
+            "model": active_model,
+        },
+        "official_engine": {
+            "url": "https://api.typesafe.ai/v1/systemone",
+            "model": "jev-latest (Cloud)",
+            "key_configured": bool(DEFAULT_TYPESAFE_KEY),
+        },
+        "tailscale_ip": "100.126.237.55",
+    }
+
+
 @app.post("/api/client_error")
 async def client_error(data: Dict[str, Any]):
     """Log client-side errors forwarded from iPad/browser."""
@@ -162,7 +196,7 @@ async def client_error(data: Dict[str, Any]):
 @app.post("/api/play")
 async def play_game(req: PlayRequest):
     """Run an evaluation step for a specific game."""
-    print(f"\n👉 [PLAY REQUEST] game={req.game_id}, engine={req.engine}, input={req.user_input[:60]!r}")
+    print(f"\n👉 [PLAY REQUEST] game={req.game_id}, engine={req.engine}, model={req.model}, input={req.user_input[:60]!r}")
     game = GAMES_MAP.get(req.game_id)
     if not game:
         print(f"❌ [NOT FOUND] game_id={req.game_id}")
@@ -184,7 +218,7 @@ async def play_game(req: PlayRequest):
             result, elapsed_ms, tokens, metrics = call_official_typesafe_jev(full_prompt, game["schema"], key)
             engine_name = "TypeSafe Jev (Cloud API)"
         else:
-            result, elapsed_ms, tokens, metrics = call_local_jev(full_prompt, game["schema"])
+            result, elapsed_ms, tokens, metrics = call_local_jev(full_prompt, game["schema"], model=req.model)
             engine_name = "DeepSeek-V4.1 Jev Mode (Local 4x A100)"
 
         print(f"✅ [PLAY SUCCESS] {req.game_id} ({engine_name}) in {elapsed_ms:.1f}ms -> {result}")
