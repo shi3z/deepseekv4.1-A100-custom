@@ -9,9 +9,30 @@
     let currentEngine = 'local'; // 'local' | 'official'
     let currentFilter = 'all';
 
-    // Stats in localStorage
-    const savedStats = JSON.parse(localStorage.getItem('jev_arcade_stats') || '{"plays": 0, "totalMs": 0}');
-    let stats = savedStats;
+    // Global Client Error Reporting to Server
+    window.onerror = function(msg, url, line, col, error) {
+        fetch('/api/client_error', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ type: 'uncaught_error', msg, url, line, col, error: String(error) })
+        }).catch(() => {});
+    };
+    window.onunhandledrejection = function(event) {
+        fetch('/api/client_error', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ type: 'unhandled_rejection', reason: String(event.reason) })
+        }).catch(() => {});
+    };
+
+    // Stats in localStorage (Safari Private Mode safe)
+    let stats = { plays: 0, totalMs: 0 };
+    try {
+        const s = localStorage.getItem('jev_arcade_stats');
+        if (s) stats = JSON.parse(s);
+    } catch (e) {
+        console.warn("localStorage read restricted:", e);
+    }
 
     // DOM Elements
     const gamesGrid = document.getElementById('games-grid');
@@ -324,7 +345,21 @@
             recordPlayStat(data.elapsed_ms);
 
         } catch (err) {
-            alert("エラー: " + err.message);
+            console.error("Play error:", err);
+            fetch('/api/client_error', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    type: 'play_error',
+                    message: err.message,
+                    stack: err.stack,
+                    game_id: game ? game.id : null,
+                    input: inputVal,
+                    engine: currentEngine
+                })
+            }).catch(() => {});
+
+            alert("判定エラー: " + err.message);
             if (window.soundFX) window.soundFX.failure();
         } finally {
             judgingIndicator.classList.add('hidden');
@@ -417,7 +452,11 @@
 
         // Scroll result into view smoothly
         setTimeout(() => {
-            resultContainer.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+            try {
+                resultContainer.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+            } catch (_) {
+                try { resultContainer.scrollIntoView(false); } catch (e) {}
+            }
         }, 100);
     }
 
@@ -433,7 +472,11 @@
     function recordPlayStat(latencyMs) {
         stats.plays += 1;
         stats.totalMs += latencyMs;
-        localStorage.setItem('jev_arcade_stats', JSON.stringify(stats));
+        try {
+            localStorage.setItem('jev_arcade_stats', JSON.stringify(stats));
+        } catch (e) {
+            console.warn("localStorage write restricted:", e);
+        }
         updateStatsDisplay();
     }
 

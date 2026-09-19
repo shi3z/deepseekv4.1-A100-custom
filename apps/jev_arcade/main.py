@@ -152,11 +152,20 @@ def call_official_typesafe_jev(prompt: str, schema: dict, api_key: str) -> tuple
     return jev_result, elapsed_ms, total_tokens, {}
 
 
+@app.post("/api/client_error")
+async def client_error(data: Dict[str, Any]):
+    """Log client-side errors forwarded from iPad/browser."""
+    print(f"🔥 [CLIENT ERROR from iPad]: {json.dumps(data, ensure_ascii=False)}")
+    return {"status": "ok"}
+
+
 @app.post("/api/play")
 async def play_game(req: PlayRequest):
     """Run an evaluation step for a specific game."""
+    print(f"\n👉 [PLAY REQUEST] game={req.game_id}, engine={req.engine}, input={req.user_input[:60]!r}")
     game = GAMES_MAP.get(req.game_id)
     if not game:
+        print(f"❌ [NOT FOUND] game_id={req.game_id}")
         raise HTTPException(status_code=404, detail=f"Game '{req.game_id}' not found")
 
     full_prompt = (
@@ -178,6 +187,7 @@ async def play_game(req: PlayRequest):
             result, elapsed_ms, tokens, metrics = call_local_jev(full_prompt, game["schema"])
             engine_name = "DeepSeek-V4.1 Jev Mode (Local 4x A100)"
 
+        print(f"✅ [PLAY SUCCESS] {req.game_id} ({engine_name}) in {elapsed_ms:.1f}ms -> {result}")
         return {
             "status": "success",
             "game_id": req.game_id,
@@ -189,6 +199,7 @@ async def play_game(req: PlayRequest):
             "prompt_preview": full_prompt[:120] + "...",
         }
     except Exception as e:
+        print(f"❌ [PLAY ERROR] {req.game_id}: {str(e)}")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Inference error: {str(e)}")
 
