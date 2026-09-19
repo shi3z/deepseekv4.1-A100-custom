@@ -65,6 +65,24 @@ python3 examples/benchmarks/bench_concurrency.py --workers 1 2 4 --requests-per-
 
 ---
 
+### 5. Python Code Generation Benchmark (`bench_code_generation.py`)
+Evaluates DeepSeek-V4.1 on realistic algorithmic and systems programming tasks (LRU cache, binary search, token bucket rate limiter, trie prefix tree, topological sort).
+
+```bash
+# Run single-stream evaluation
+python3 examples/benchmarks/bench_code_generation.py --num-tasks 5 --max-tokens 768
+
+# Run concurrent multi-worker code generation (2 parallel streams)
+python3 examples/benchmarks/bench_code_generation.py --num-tasks 4 --max-tokens 512 --concurrency 2
+```
+
+**What it measures:**
+- Single-stream coding decode speed (~52–53 tok/s) and concurrent aggregate speed (~70–75 tok/s).
+- Syntactic validity rate via Python AST verification (`ast.parse`).
+- Functional test pass rate by executing generated inline unit tests in an isolated namespace.
+
+---
+
 ## ⚙️ Environment Variables
 
 All benchmark scripts respect the following environment configuration:

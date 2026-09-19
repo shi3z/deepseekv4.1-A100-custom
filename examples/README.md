@@ -23,6 +23,7 @@ examples/
 └── benchmarks/              # Performance Measurement & Load Testing
     ├── bench_jev_structured.py   # Normal JSON vs Jev Mode (84x-500x speedup)
     ├── bench_decode_throughput.py# Single-stream decode speed (34-39 tok/s)
+    ├── bench_code_generation.py  # Python coding speed (52-53 tok/s) & test pass rate
     ├── bench_prefix_cache_hit.py # LCP cache acceleration test (cold vs warm prefill)
     ├── bench_concurrency.py      # Concurrent client load & scheduling benchmark
     └── README.md                 # Benchmark instructions & metric explanations
