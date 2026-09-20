@@ -3110,9 +3110,10 @@ class Engine:
             )
             self._remember_prefill_prefix(prompt_ids)
             self._record_prefill_stats(
-                total_tokens=_n,
-                reused_tokens=0,
-                suffix_tokens=_n,
+                mode="cold_vision",
+                total=_n,
+                reused=0,
+                new_tokens=_n,
                 dt=_dt,
                 prefill_type="cold_vision",
             )
