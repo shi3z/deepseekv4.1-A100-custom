@@ -205,7 +205,7 @@ class Handler(BaseHTTPRequestHandler):
                 messages.insert(0, {"role": "system", "content": "", "tools": tools})
         thinking = "thinking" if body.get("reasoning_effort") or body.get("thinking") else None
         try:
-            ids = eng.tok.encode(eng.chat_prompt(messages, thinking))
+            ids, images, token_types = eng.format_chat(messages, thinking)
         except Exception as e:  # malformed messages / unsupported content
             return self._json(400, {"error": f"cannot encode messages: {e}"})
         params = _params(body)
@@ -259,7 +259,7 @@ class Handler(BaseHTTPRequestHandler):
                 STATS_TRACKER.record_request_start(len(ids), stream=True)
             t_gen_0 = time.perf_counter()
             try:
-                text, n = eng.generate_text(ids, params)
+                text, n = eng.generate_text(ids, params, images=images, token_types=token_types)
 
             except torch.OutOfMemoryError as e:
                 heartbeat_stop.set()
@@ -444,7 +444,7 @@ class Handler(BaseHTTPRequestHandler):
             STATS_TRACKER.record_request_start(len(ids), stream=False)
         t_gen_0 = time.perf_counter()
         try:
-            text, n = eng.generate_text(ids, params)
+            text, n = eng.generate_text(ids, params, images=images, token_types=token_types)
         except Exception as e:
             tb = traceback.format_exc()
             print(f"\n[chat-error] non-streaming generation failed req_id={rid}: {e}\n{tb}", flush=True)
@@ -480,7 +480,11 @@ class Handler(BaseHTTPRequestHandler):
         prompt = body.get("prompt") or ""
         if isinstance(prompt, list):
             prompt = prompt[0]
-        ids = eng.tok.encode(prompt)
+        if "<image>" in prompt and "</image>" in prompt:
+            ids, images, token_types = eng.format_chat([{"role": "user", "content": prompt}], thinking_mode="chat")
+        else:
+            ids = eng.tok.encode(prompt)
+            images, token_types = None, None
         params = _params(body)
         rid = f"cmpl-{uuid.uuid4().hex[:24]}"
         created = int(time.time())
@@ -494,7 +498,7 @@ class Handler(BaseHTTPRequestHandler):
             n = 0
             t_gen_0 = time.perf_counter()
             try:
-                for _, piece in eng.generate(ids, params):
+                for _, piece in eng.generate(ids, params, images=images, token_types=token_types):
                     obj = {"id": rid, "object": "text_completion", "created": created, "model": body.get("model") or eng.model_name,
                            "choices": [{"index": 0, "text": piece, "finish_reason": None}]}
                     self.wfile.write(f"data: {json.dumps(obj, ensure_ascii=False)}\n\n".encode())
@@ -519,7 +523,7 @@ class Handler(BaseHTTPRequestHandler):
             STATS_TRACKER.record_request_start(len(ids), stream=False)
         t_gen_0 = time.perf_counter()
         try:
-            text, n = eng.generate_text(ids, params)
+            text, n = eng.generate_text(ids, params, images=images, token_types=token_types)
         except Exception as e:
             tb = traceback.format_exc()
             print(f"\n[completion-error] generation failed req_id={rid}: {e}\n{tb}", flush=True)

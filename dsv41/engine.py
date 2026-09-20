@@ -151,12 +151,14 @@ def detect_loop(
 
 
 class _BatchRequest:
-    def __init__(self, prompt_ids: list[int], params: GenParams, max_new: int, gen: torch.Generator | None, req_id: str = ""):
+    def __init__(self, prompt_ids: list[int], params: GenParams, max_new: int, gen: torch.Generator | None, req_id: str = "", images=None, token_types=None):
         self.req_id = req_id or f"req_{id(self):x}"
         self.prompt_ids = prompt_ids
         self.params = params
         self.max_new = max_new
         self.gen = gen
+        self.images = images
+        self.token_types = token_types
         self.pos = 0
         self.next_token = 0
         self.out_tokens: list[int] = []
@@ -518,6 +520,35 @@ class Engine:
     # ---------------------------------------------------------------- prompts
     def chat_prompt(self, messages: list[dict], thinking_mode: str | None = None) -> str:
         return self._encode(messages, thinking_mode=thinking_mode or self.thinking_mode)
+
+    def format_chat(self, messages: list[dict], thinking_mode: str | None = None) -> tuple[list[int], list | None, torch.Tensor | None]:
+        """Format chat messages with multimodal image support.
+        Returns: (prompt_tokens, images, token_types_tensor)."""
+        from .vision import parse_tagged_text, prepare_vl_inputs, VisionConfig
+
+        # Normalize <image>...</image> inside string content
+        normalized_messages = []
+        for m in messages:
+            m_copy = dict(m)
+            c = m_copy.get("content")
+            if isinstance(c, str) and "<image>" in c and "</image>" in c:
+                m_copy["content"] = parse_tagged_text(c)
+            normalized_messages.append(m_copy)
+
+        prompt, media_data = self._encode(
+            normalized_messages,
+            thinking_mode=thinking_mode or self.thinking_mode,
+            return_multi_modal_data=True,
+        )
+        images_raw = media_data.get("images", []) if isinstance(media_data, dict) else []
+        if not images_raw:
+            return self.tok.encode(prompt), None, None
+
+        v_cfg = VisionConfig.from_cfg(self.model.args.cfg)
+        tokens, token_types, image_inputs = prepare_vl_inputs(prompt, images_raw, self.tok, v_cfg)
+        dev0 = self.model.blocks[0].device
+        token_types_tensor = torch.tensor([token_types], device=dev0, dtype=torch.long)
+        return tokens, [image_inputs], token_types_tensor
 
     @staticmethod
     def _fallback_parse_dsml(text: str) -> list[dict]:
@@ -3055,7 +3086,38 @@ class Engine:
     def _prefill_with_prefix_reuse(
         self,
         prompt_ids: list[int],
+        images=None,
+        token_types=None,
     ):
+        if images is not None:
+            _t0 = time.perf_counter()
+            dev0 = self.model.blocks[0].device
+            logits = self.model.forward(
+                torch.tensor([prompt_ids], dtype=torch.long, device=dev0),
+                0,
+                images=images,
+                token_types=token_types,
+            )
+            if torch.is_tensor(logits) and logits.is_cuda:
+                torch.cuda.synchronize(logits.device)
+            _dt = time.perf_counter() - _t0
+            _n = len(prompt_ids)
+            print(
+                f"[vision-prefill] full-prefill tokens={_n:,} "
+                f"time={_dt:.3f}s "
+                f"tok_s={_n/max(_dt,1e-9):,.1f}",
+                flush=True,
+            )
+            self._remember_prefill_prefix(prompt_ids)
+            self._record_prefill_stats(
+                total_tokens=_n,
+                reused_tokens=0,
+                suffix_tokens=_n,
+                dt=_dt,
+                prefill_type="cold_vision",
+            )
+            return logits, 0
+
         # ------------------------------------------------------------
         # Debug correctness switch.
         #
@@ -3669,7 +3731,7 @@ class Engine:
         return logits, 0
 
     @torch.inference_mode()
-    def generate(self, prompt_ids: list[int], p: GenParams) -> Iterator[tuple[int, str]]:
+    def generate(self, prompt_ids: list[int], p: GenParams, images=None, token_types=None) -> Iterator[tuple[int, str]]:
         """Yields (token_id, text_piece) as they are produced. Holds the engine lock for the duration."""
         assert len(prompt_ids) < self.max_seq_len, f"prompt of {len(prompt_ids)} tokens exceeds max_seq_len={self.max_seq_len}"
         # MTP keeps DSpark resident on GPU4. At very long cold-prefill
@@ -3700,7 +3762,7 @@ class Engine:
             # Keep plain mode after unloading DSpark. Restoring self.mtp here
             # races with concurrent Claude retries that can enter the MTP
             # path while ds is still absent. A server restart re-enables MTP.
-            yield from self.generate(prompt_ids, p)
+            yield from self.generate(prompt_ids, p, images=images, token_types=token_types)
             return
         max_new = min(p.max_new_tokens, self.max_seq_len - len(prompt_ids) - 1)
         # Claude may request 32K output even for a 100K+ context. Keep
@@ -3717,7 +3779,7 @@ class Engine:
             self.current_phase = "prefill"
             self.current_context_tokens = len(prompt_ids)
             try:
-                if self.mtp:
+                if self.mtp and images is None:
                     yield from self._generate_mtp_locked(
                         prompt_ids,
                         p,
@@ -3727,7 +3789,9 @@ class Engine:
                     return
 
                 logits, _prefix_reused = self._prefill_with_prefix_reuse(
-                    prompt_ids
+                    prompt_ids,
+                    images=images,
+                    token_types=token_types,
                 )
                 with getattr(self, "_slot_tokens_lock", threading.Lock()):
                     self._slot_tokens[0] = list(prompt_ids)
@@ -4318,15 +4382,15 @@ class Engine:
             )
 
     @torch.inference_mode()
-    def generate_text(self, prompt_ids: list[int], p: GenParams) -> tuple[str, int]:
+    def generate_text(self, prompt_ids: list[int], p: GenParams, images=None, token_types=None) -> tuple[str, int]:
         if self.max_seqs <= 1:
             pieces, n = [], 0
-            for _, piece in self.generate(prompt_ids, p):
+            for _, piece in self.generate(prompt_ids, p, images=images, token_types=token_types):
                 pieces.append(piece)
                 n += 1
             return "".join(pieces), n
 
-        return self._generate_text_batched(prompt_ids, p)
+        return self._generate_text_batched(prompt_ids, p, images=images, token_types=token_types)
 
     def _init_batch_scheduler(self):
         self._batch_queue: queue.Queue[_BatchRequest] = queue.Queue()
@@ -4354,7 +4418,7 @@ class Engine:
                     break
 
                 # Smart slot assignment: if a GPU slot retains the best prefix and is currently free, reuse it!
-                best_gpu_slot, best_gpu_lcp = self._find_best_gpu_slot(req.prompt_ids)
+                best_gpu_slot, best_gpu_lcp = (0, 0) if req.images is not None else self._find_best_gpu_slot(req.prompt_ids)
                 if best_gpu_slot in self._free_decode_slots and best_gpu_slot != 0:
                     self._free_decode_slots.remove(best_gpu_slot)
                     slot_id = best_gpu_slot
@@ -4384,7 +4448,7 @@ class Engine:
                 try:
                     with self.lock:
                         # Prefill using slot 0 (fully compatible with prefix-cache / snapshots / GPU cache)
-                        logits, _reused = self._prefill_with_prefix_reuse(req.prompt_ids)
+                        logits, _reused = self._prefill_with_prefix_reuse(req.prompt_ids, images=req.images, token_types=req.token_types)
                         first_tok = sample_token(logits[0], req.params.temperature, req.params.top_p, req.gen)
                         # Copy per-sequence cache state from slot 0 to target decode slot
                         self.rt.copy_seq(0, slot_id, req_id=req.req_id)
@@ -4677,7 +4741,7 @@ class Engine:
                     self._free_decode_slots.append(s_id)
 
     @torch.inference_mode()
-    def _generate_text_batched(self, prompt_ids: list[int], p: GenParams) -> tuple[str, int]:
+    def _generate_text_batched(self, prompt_ids: list[int], p: GenParams, images=None, token_types=None) -> tuple[str, int]:
         _mtp_long_limit = int(os.environ.get("DSV41_MTP_LONG_PROMPT_LIMIT", "65536"))
         max_new = min(p.max_new_tokens, self.max_seq_len - len(prompt_ids) - 1)
         if len(prompt_ids) > _mtp_long_limit:
@@ -4688,7 +4752,7 @@ class Engine:
             gen = torch.Generator(device=self.model.blocks[-1].device)
             gen.manual_seed(p.seed)
 
-        req = _BatchRequest(prompt_ids, p, max_new, gen)
+        req = _BatchRequest(prompt_ids, p, max_new, gen, images=images, token_types=token_types)
         self._batch_queue.put(req)
         req.done_event.wait()
         if req.error:

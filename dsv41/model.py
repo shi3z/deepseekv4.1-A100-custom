@@ -1463,6 +1463,7 @@ class MoE:
         self.swiglu_limit = args.swiglu_limit
         self.gate_w = w["ffn.gate.weight"].float()
         self.gate_bias = w["ffn.gate.bias"].float()
+        self.gate_bias_vl = w["ffn.gate.bias_vl"].float() if "ffn.gate.bias_vl" in w else None
         self.w13 = w["experts.w13"]  # uint8 [E, 2*inter, dim/2]  (w1 rows then w3 rows)
         self.s13 = w["experts.s13"]  # uint8 [E, 2*inter, dim/32]
         self.w2 = w["experts.w2"]  # uint8 [E, dim, inter/2]
@@ -1483,7 +1484,7 @@ class MoE:
         self.device = device
         self._cache: dict = {}
 
-    def gate(self, x: torch.Tensor):
+    def gate(self, x: torch.Tensor, image_mask: torch.Tensor | None = None):
         scores = F.linear(x.float(), self.gate_w) / self.gate_temp
         if self.score_func == "softmax":
             scores = scores.softmax(dim=-1)
@@ -1491,7 +1492,10 @@ class MoE:
             scores = scores.sigmoid()
         else:
             scores = F.softplus(scores).sqrt()
-        indices = (scores + self.gate_bias).topk(self.topk, dim=-1)[1]
+        bias = self.gate_bias
+        if image_mask is not None and getattr(self, "gate_bias_vl", None) is not None:
+            bias = torch.where(image_mask.unsqueeze(-1), self.gate_bias_vl, bias)
+        indices = (scores + bias).topk(self.topk, dim=-1)[1]
         weights = scores.gather(1, indices)
         if self.norm_topk_prob and self.topk > 1:
             weights /= weights.sum(dim=-1, keepdim=True) + 1e-20
@@ -1894,11 +1898,12 @@ class MoE:
             grouped_fp4_gemm(hq, b["w2"][:n], b["s2"][:n], p2, n_tok, out=y)
         return y
 
-    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+    def __call__(self, x: torch.Tensor, image_mask: torch.Tensor | None = None) -> torch.Tensor:
         shape = x.size()
         x = x.reshape(-1, self.dim)
         n_tok = x.size(0)
-        weights, indices = self.gate(x)
+        im = image_mask.reshape(-1) if image_mask is not None else None
+        weights, indices = self.gate(x, image_mask=im)
         if ROUTE_STATS is not None:  # expert usage histogram per layer (for the hot-expert cache design)
             ROUTE_STATS.setdefault(self.layer_id, torch.zeros(self.n_experts, dtype=torch.int64)).add_(
                 torch.bincount(indices.flatten().cpu(), minlength=self.n_experts))
@@ -2237,7 +2242,7 @@ class Block:
     def hc_post(self, x, residual, post, comb):
         return _hc_post(x, residual, post, comb)
 
-    def __call__(self, x: torch.Tensor, start_pos: int, pre_mix: torch.Tensor):
+    def __call__(self, x: torch.Tensor, start_pos: int, pre_mix: torch.Tensor, image_mask: torch.Tensor | None = None):
         t = time.perf_counter()
         residual = x
         attn_pre, attn_post, attn_comb = self.hc_mixes(x, *self.hc_attn)
@@ -2252,7 +2257,7 @@ class Block:
         x = self.hc_pre(x, attn_pre)
         x = rmsnorm(x, self.ffn_norm_w, self.eps)
         t = _tick("hc+norm", t)
-        x = self.ffn(x)
+        x = self.ffn(x, image_mask=image_mask)
         t = _tick("moe", t)
         x = self.hc_post(x, residual, ffn_post, ffn_comb)
         _tick("hc+norm", t)
@@ -2269,6 +2274,7 @@ class Transformer:
         self.head = None  # bf16 [vocab, dim] on device of last layer
         self.norm_w = None
         self.engram_hash = None
+        self.vision_tower = None
         self.hc = args.hc_mult
 
     def reset_cache(self):
@@ -2323,13 +2329,17 @@ class Transformer:
         return stages
 
     @torch.inference_mode()
-    def _forward_sequential(self, input_ids: torch.Tensor, start_pos: int = 0) -> torch.Tensor:
+    def _forward_sequential(self, input_ids: torch.Tensor, start_pos: int = 0, images=None, token_types: torch.Tensor | None = None) -> torch.Tensor:
         """input_ids [b, s] (long) -> logits for the last position [b, vocab] (fp32)."""
         dev0 = self.blocks[0].device
         input_ids = input_ids.to(dev0)
         B, S = input_ids.shape
-        hashes = self.engram_hash(input_ids, start_pos) if self.engram_hash is not None else None
+        image_mask = None if token_types is None else (token_types >= 0).to(dev0)
+        engram_mask = None if image_mask is None else ~image_mask
+        hashes = self.engram_hash(input_ids, start_pos, token_mask=engram_mask) if self.engram_hash is not None else None
         h = F.embedding(input_ids, self.embed)
+        if images is not None and start_pos == 0 and getattr(self, "vision_tower", None) is not None:
+            self.vision_tower.merge_image_embeddings(images, h)
         h = h.unsqueeze(2).repeat(1, 1, self.hc, 1)
         pre_mix = h.new_zeros(h.size(0), h.size(1), self.hc, dtype=torch.float32)
         pre_mix[:, :, 0] = 1.0
@@ -2361,7 +2371,8 @@ class Transformer:
                     _tick("engram", t)
                 if blk.layer_id in targets:
                     main_hiddens.append(h.mean(dim=2))
-                h, pre_mix = blk(h, start_pos, pre_mix)
+                im = None if image_mask is None else image_mask.to(blk.device)
+                h, pre_mix = blk(h, start_pos, pre_mix, image_mask=im)
 
             # Stage 2: Decoder pass (layers enc_last_id + 1 .. 39) on ONLY bounded tail window.
             tail_len = min(S, max(win_size, int(os.environ.get("DSV41_CED_TAIL_WINDOW", str(win_size)))))
@@ -2382,7 +2393,8 @@ class Transformer:
                     _tick("engram", t)
                 if blk.layer_id in targets:
                     main_hiddens.append(h_dec.mean(dim=2))
-                h_dec, pre_mix_dec = blk(h_dec, start_pos_dec, pre_mix_dec)
+                im_dec = None if image_mask is None else image_mask[:, -tail_len:].to(blk.device)
+                h_dec, pre_mix_dec = blk(h_dec, start_pos_dec, pre_mix_dec, image_mask=im_dec)
 
             if main_hiddens:
                 keep = int(self.args.cfg.get("window_size", 0))
@@ -2405,7 +2417,8 @@ class Transformer:
                 _tick("engram", t)
             if blk.layer_id in targets:  # DSpark reads the attention input of its target layers
                 main_hiddens.append(h.mean(dim=2))
-            h, pre_mix = blk(h, start_pos, pre_mix)
+            im = None if image_mask is None else image_mask.to(blk.device)
+            h, pre_mix = blk(h, start_pos, pre_mix, image_mask=im)
         if main_hiddens:
             # MTP/DSpark only consumes the recent main attention window.
             keep = int(self.args.cfg.get("window_size", 0))
@@ -2423,6 +2436,8 @@ class Transformer:
         start_pos: int = 0,
         chunk_size: int = 2048,
         progress_interval: int = 0,
+        images=None,
+        token_types: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Pipelined prefill across multi-GPU stages with chunked prompt tokens.
 
@@ -2438,6 +2453,7 @@ class Transformer:
         last_dev = stages[-1]["device"]
         input_ids = input_ids.to(dev0)
         B, S = input_ids.shape
+        image_mask = None if token_types is None else (token_types >= 0)
 
         if not hasattr(self, "_stage_streams") or len(self._stage_streams) != K:
             self._stage_streams = [torch.cuda.Stream(device=s["device"]) for s in stages]
@@ -2536,11 +2552,16 @@ class Transformer:
                     if k == 0:
                         chunk_ids = input_ids[:, c0:c1].to(dev_k, non_blocking=True)
                         h = F.embedding(chunk_ids, self.embed)
+                        if images is not None and m == 0 and start_pos == 0 and getattr(self, "vision_tower", None) is not None:
+                            self.vision_tower.merge_image_embeddings(images, h)
                         h = h.unsqueeze(2).repeat(1, 1, self.hc, 1)
                         pre_mix = h.new_zeros(h.size(0), h.size(1), self.hc, dtype=torch.float32)
                         pre_mix[:, :, 0] = 1.0
                         if self.engram_hash is not None:
-                            chunk_hashes_map[m] = self.engram_hash(chunk_ids, p_m)
+                            chunk_engram_mask = None
+                            if image_mask is not None:
+                                chunk_engram_mask = (~image_mask[:, c0:c1]).to(dev_k)
+                            chunk_hashes_map[m] = self.engram_hash(chunk_ids, p_m, token_mask=chunk_engram_mask)
                     else:
                         stream_k.wait_event(ev_stage_done[k - 1][m])
                         h_prev, pre_mix_prev = chunk_activations[k - 1][m]
@@ -2562,7 +2583,10 @@ class Transformer:
                             h = blk.engram(h, blk_hash)
                         if blk.layer_id in targets:
                             chunk_main_hiddens[blk.layer_id].append(h.mean(dim=2))
-                        h, pre_mix = blk(h, p_m, pre_mix)
+                        chunk_im = None
+                        if image_mask is not None:
+                            chunk_im = image_mask[:, c0:c1].to(dev_k)
+                        h, pre_mix = blk(h, p_m, pre_mix, image_mask=chunk_im)
 
                     # Free chunk hashes as soon as all stages with engram (stages 0 and 1) have processed chunk m
                     if k >= min(1, K - 1):
@@ -2620,7 +2644,7 @@ class Transformer:
         return final_logits
 
     @torch.inference_mode()
-    def forward(self, input_ids: torch.Tensor, start_pos: int = 0) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor, start_pos: int = 0, images=None, token_types: torch.Tensor | None = None) -> torch.Tensor:
         """input_ids [b, s] (long) -> logits for the last position [b, vocab] (fp32)."""
         stages = self._get_stages()
         seqlen = input_ids.shape[1]
@@ -2631,5 +2655,5 @@ class Transformer:
             and seqlen >= chunk_size * 2
         )
         if use_pipeline:
-            return self.forward_pipelined(input_ids, start_pos=start_pos, chunk_size=chunk_size)
-        return self._forward_sequential(input_ids, start_pos=start_pos)
+            return self.forward_pipelined(input_ids, start_pos=start_pos, chunk_size=chunk_size, images=images, token_types=token_types)
+        return self._forward_sequential(input_ids, start_pos=start_pos, images=images, token_types=token_types)

@@ -44,6 +44,7 @@ export DSV41_MIN_LOOP_CYCLE=1
 export DSV41_INTERACTIVE_MAX_NEW=4096
 export DSV41_LONG_PROMPT_MAX_NEW=4096
 export DSV41_MODEL_NAME="deepseek-v4.1-flash-abliterated"
+export DSV41_VISION_DEVICE="cuda:4"
 
 DEFAULT_CKPT="/mnt/ssd/models/DeepSeek-V4.1-Flash-Abliterated"
 if [ ! -d "$DEFAULT_CKPT" ]; then

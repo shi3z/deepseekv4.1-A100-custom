@@ -156,7 +156,7 @@ def load_layer(ckpt: Checkpoint, i: int, device, offload=False, ep: list | None 
     w: dict[str, torch.Tensor] = {}
     for n in ckpt.names(p):
         key = n[len(p):]
-        if ".experts." in key or key.startswith("engram.embed") or key.endswith(".scale") or "bias_vl" in key:
+        if ".experts." in key or key.startswith("engram.embed") or key.endswith(".scale") or ("bias_vl" in key and not key.endswith("ffn.gate.bias_vl")):
             continue
         if key.endswith(".weight") and ckpt.meta(n)[0] in ("F8_E4M3", "BF16"):
             w[key] = _dense(ckpt, n, device)
@@ -446,5 +446,7 @@ def load_model(ckpt_path: str, devices: list[int], max_seq_len: int = 16384, max
             blk.engram = Engram(cfg["dim"], cfg["hc_mult"], layout, HostEngramTable(weight, scale),
                                 _dense(ckpt, p + "wkv.weight", dev), ckpt.get(p + "q_weight", dev), ckpt.get(p + "k_weight", dev), cfg["norm_eps"])
             blk.engram.layer_hash_index = li
+    from .vision import load_vision_tower
+    model.vision_tower = load_vision_tower(ckpt, cfg, dev0)
     print(f"loaded in {time.time() - t0:.0f}s", flush=True)
     return model

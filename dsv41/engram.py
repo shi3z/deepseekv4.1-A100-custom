@@ -115,10 +115,12 @@ class NgramHashState:
         tokens = torch.stack(tokens, dim=-1)  # [B, 1, max_ngram]
         return self._hash(tokens)
 
-    def __call__(self, input_ids: torch.Tensor, start_pos: int, chunk_size: int = 2048) -> torch.Tensor:
+    def __call__(self, input_ids: torch.Tensor, start_pos: int, chunk_size: int = 2048, token_mask: torch.Tensor | None = None) -> torch.Tensor:
         """input_ids [B, L] -> hash ids [B, L, n_engram_layers, n_hash_cols] (int64, on device)."""
         batch, seqlen = input_ids.shape
         compressed = self.token_map[input_ids]
+        if token_mask is not None:
+            compressed = torch.where(token_mask.to(compressed.device), compressed, self.DEAD)
         self.cache[:batch, start_pos : start_pos + seqlen] = compressed
 
         if seqlen <= chunk_size:
