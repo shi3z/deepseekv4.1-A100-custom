@@ -39,7 +39,7 @@ def _params(body: dict) -> GenParams:
     default_window = int(os.environ.get("DSV41_PENALTY_WINDOW", "256"))
     default_prog_pen = float(os.environ.get("DSV41_PROGRESSIVE_PENALTY", "0.0"))
     default_ban_cycles = os.environ.get("DSV41_BAN_CYCLES", "1").strip().lower() not in ("0", "false", "off")
-    default_loop_detect = os.environ.get("DSV41_LOOP_DETECT", "1").strip().lower() not in ("0", "false", "off")
+    default_loop_detect = os.environ.get("DSV41_LOOP_DETECT", "0").strip().lower() in ("1", "true", "on")
     default_min_loop_match = int(os.environ.get("DSV41_MIN_LOOP_MATCH", "48"))
     default_min_loop_cycle = int(os.environ.get("DSV41_MIN_LOOP_CYCLE", "1"))
 
@@ -119,8 +119,21 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"status": "ok"})
         elif self.path in ("/dashboard", "/"):
             self._dashboard()
-        elif self.path in ("/api/metrics", "/api/stats"):
+        elif self.path in (
+            "/api/metrics", "/api/stats", "/stats", "/status", "/metrics",
+            "/v1/stats", "/api/status", "/metrics.json", "/api/state",
+            "/api/monitor", "/queue"
+        ):
             self._json(200, STATS_TRACKER.get_metrics(ENGINE) if STATS_TRACKER else {})
+        elif self.path in ("/api/slots", "/slots"):
+            slots_data = {
+                "max_seqs": getattr(ENGINE, "max_seqs", 1) if ENGINE else 0,
+                "max_decode_slots": getattr(ENGINE, "max_decode_slots", 1) if ENGINE else 0,
+                "free_slots": len(getattr(ENGINE, "_free_decode_slots", [])) if ENGINE else 0,
+                "queue_depth": ENGINE._batch_queue.qsize() if ENGINE and hasattr(ENGINE, "_batch_queue") else 0,
+                "slots": ENGINE.slot_states if ENGINE and hasattr(ENGINE, "slot_states") else {},
+            }
+            self._json(200, slots_data)
         else:
             self._json(404, {"error": "not found"})
 
@@ -235,109 +248,15 @@ class Handler(BaseHTTPRequestHandler):
           flush=True,
         )
         if body.get("stream"):
-            # Send SSE headers immediately and emit keep-alive comments while
-            # long-context prefill/generation is running. Previously the
-            # server buffered the entire response, so LiteLLM timed out on
-            # 100K+ prompts despite stream=True.
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "keep-alive")
             self.end_headers()
-            heartbeat_stop = threading.Event()
-            sse_lock = threading.Lock()
-            heartbeat_thread = None
-            def _sse_write(data):
-                with sse_lock:
-                    self.wfile.write(data)
-                    self.wfile.flush()
-            def _heartbeat():
-                while not heartbeat_stop.wait(10.0):
-                    try:
-                        _sse_write(b": keep-alive\n\n")
-                    except (BrokenPipeError, ConnectionResetError, OSError):
-                        break
-            heartbeat_thread = threading.Thread(target=_heartbeat, daemon=True)
-            heartbeat_thread.start()
+
             if STATS_TRACKER:
                 STATS_TRACKER.record_request_start(len(ids), stream=True)
             t_gen_0 = time.perf_counter()
-            try:
-                text, n = eng.generate_text(ids, params, images=images, token_types=token_types)
-
-            except torch.OutOfMemoryError as e:
-                heartbeat_stop.set()
-                heartbeat_thread.join(timeout=1.0)
-                torch.cuda.empty_cache()
-                try:
-                    _sse_write(("data: " + json.dumps({"error": {
-                        "message": f"CUDA out of memory: {e}",
-                        "type": "cuda_out_of_memory",
-                    }}, ensure_ascii=False) + "\n\n").encode())
-                    _sse_write(b"data: [DONE]\n\n")
-                except (BrokenPipeError, ConnectionResetError, OSError):
-                    pass
-                return
-
-            except Exception as e:
-                heartbeat_stop.set()
-                heartbeat_thread.join(timeout=1.0)
-                tb = traceback.format_exc()
-
-                print(
-                    "\n========== GENERATION TRACEBACK ==========",
-                    flush=True,
-                )
-                print(tb, flush=True)
-                print(
-                    "==========================================",
-                    flush=True,
-                )
-
-                try:
-                    Path("/tmp/dsv41-last-traceback.log").write_text(tb)
-                except Exception:
-                    pass
-
-                try:
-                    _sse_write(("data: " + json.dumps({"error": {
-                        "message": str(e),
-                        "type": "generation_error",
-                        "traceback": tb,
-                    }}, ensure_ascii=False) + "\n\n").encode())
-                    _sse_write(b"data: [DONE]\n\n")
-                except (BrokenPipeError, ConnectionResetError, OSError):
-                    pass
-                return
-
-            heartbeat_stop.set()
-            heartbeat_thread.join(timeout=1.0)
-
-            # DeepSeek completion may contain thinking / DSML tool calls.
-            # Always parse it before exposing an OpenAI-compatible response.
-            msg = eng.parse_completion(text, thinking)
-
-            if isinstance(msg, dict):
-                content = msg.get("content")
-                reasoning = msg.get("reasoning_content")
-                tool_calls = msg.get("tool_calls") or []
-            else:
-                content = text
-                reasoning = None
-                tool_calls = []
-
-            # Never silently discard generated text.
-            if not content and not tool_calls:
-                content = text
-
-            print(
-                f"[chat] GENERATED n={n} "
-                f"raw_chars={len(text)} "
-                f"content_chars={len(content or '')} "
-                f"tool_calls={len(tool_calls)} "
-                f"raw_preview={text[:300]!r}",
-                flush=True,
-            )
 
             def chunk(delta, finish=None):
                 obj = {
@@ -353,56 +272,64 @@ class Handler(BaseHTTPRequestHandler):
                         }
                     ],
                 }
+                payload = "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
+                self.wfile.write(payload.encode("utf-8"))
+                self.wfile.flush()
 
-                payload = (
-                    "data: "
-                    + json.dumps(obj, ensure_ascii=False)
-                    + "\n\n"
-                )
-
-                _sse_write(payload.encode("utf-8"))
+            in_thinking = False
+            has_dsml = False
+            full_pieces = []
+            n = 0
 
             try:
-                # Do NOT emit content:"" here.
                 chunk({"role": "assistant"})
+                for tok_id, piece in eng.generate_stream(ids, params, images=images, token_types=token_types):
+                    if not piece:
+                        continue
+                    full_pieces.append(piece)
+                    n += 1
 
-                if reasoning:
-                    # LiteLLM understands reasoning_content for OpenAI-style
-                    # backends. Keep it separate from visible answer text.
-                    chunk({"reasoning_content": reasoning})
+                    # Tool call handling: if DSML marker detected, buffer for structured parsing
+                    if "<｜DSML｜" in piece or has_dsml:
+                        has_dsml = True
+                        continue
 
-                if content:
-                    # Send text in moderate chunks rather than one huge
-                    # delta. This is friendlier to LiteLLM's Anthropic
-                    # streaming bridge.
-                    for i in range(0, len(content), 64):
-                        chunk(
-                            {
-                                "content": content[i:i + 64]
-                            }
-                        )
+                    # Thinking / reasoning detection
+                    if "<think>" in piece and not in_thinking:
+                        in_thinking = True
+                        piece = piece.replace("<think>", "")
+                        if not piece:
+                            continue
 
-                if tool_calls:
-                    for i, tc in enumerate(tool_calls):
-                        tc = dict(tc)
+                    if in_thinking:
+                        if "</think>" in piece:
+                            reasoning_part, text_part = piece.split("</think>", 1)
+                            if reasoning_part:
+                                chunk({"reasoning_content": reasoning_part})
+                            in_thinking = False
+                            if text_part:
+                                chunk({"content": text_part})
+                        else:
+                            chunk({"reasoning_content": piece})
+                    else:
+                        chunk({"content": piece})
 
-                        tc.setdefault(
-                            "id",
-                            f"call_{uuid.uuid4().hex[:24]}",
-                        )
-                        tc.setdefault("type", "function")
-
-                        fn = tc.get("function") or {}
-                        args = fn.get("arguments", "")
-
-                        if not isinstance(args, str):
-                            args = json.dumps(
-                                args,
-                                ensure_ascii=False,
-                            )
-
-                        chunk(
-                            {
+                # If DSML tool calls were encountered, parse and emit structured tool_calls chunk
+                full_text = "".join(full_pieces)
+                tool_calls = []
+                if has_dsml:
+                    parsed = eng.parse_completion(full_text, thinking)
+                    tool_calls = parsed.get("tool_calls", [])
+                    if tool_calls:
+                        for i, tc in enumerate(tool_calls):
+                            tc = dict(tc)
+                            tc.setdefault("id", f"call_{uuid.uuid4().hex[:24]}")
+                            tc.setdefault("type", "function")
+                            fn = tc.get("function") or {}
+                            args = fn.get("arguments", "")
+                            if not isinstance(args, str):
+                                args = json.dumps(args, ensure_ascii=False)
+                            chunk({
                                 "tool_calls": [
                                     {
                                         "index": i,
@@ -414,8 +341,7 @@ class Handler(BaseHTTPRequestHandler):
                                         },
                                     }
                                 ]
-                            }
-                        )
+                            })
 
                 if tool_calls:
                     finish = "tool_calls"
@@ -425,14 +351,37 @@ class Handler(BaseHTTPRequestHandler):
                     finish = "stop"
 
                 chunk({}, finish)
-
-                _sse_write(b"data: [DONE]\n\n")
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
 
             except (BrokenPipeError, ConnectionResetError):
                 elapsed = time.perf_counter() - t0
                 print(f"[http] client disconnected during chat stream elapsed={elapsed:.3f}s tokens={n}", flush=True)
                 if STATS_TRACKER:
                     STATS_TRACKER.record_disconnect()
+                return
+            except torch.OutOfMemoryError as e:
+                torch.cuda.empty_cache()
+                try:
+                    err_obj = {"error": {"message": f"CUDA out of memory: {e}", "type": "cuda_out_of_memory"}}
+                    self.wfile.write(f"data: {json.dumps(err_obj)}\n\ndata: [DONE]\n\n".encode())
+                    self.wfile.flush()
+                except Exception:
+                    pass
+                return
+            except Exception as e:
+                tb = traceback.format_exc()
+                print(f"\n[chat-error] streaming generation failed req_id={rid}: {e}\n{tb}", flush=True)
+                try:
+                    Path("/tmp/dsv41-last-traceback.log").write_text(tb)
+                except Exception:
+                    pass
+                try:
+                    err_obj = {"error": {"message": str(e), "type": "generation_error", "traceback": tb}}
+                    self.wfile.write(f"data: {json.dumps(err_obj)}\n\ndata: [DONE]\n\n".encode())
+                    self.wfile.flush()
+                except Exception:
+                    pass
                 return
 
             dt_gen = time.perf_counter() - t_gen_0
