@@ -1083,6 +1083,16 @@ _DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
     </div>
   </div>
   <div class="header-badges">
+    <a href="http://tsuginosuke:8888" id="jev-arcade-link" target="_blank" style="text-decoration:none; display:inline-flex; align-items:center; gap:6px; font-size:13px; font-weight:700; color:#fff; background:linear-gradient(135deg, #a855f7, #ec4899); padding:6px 14px; border-radius:8px; box-shadow:0 0 12px rgba(168,85,247,0.4); transition:opacity 0.2s;" onmouseover="this.style.opacity=0.85" onmouseout="this.style.opacity=1.0">🎮 Jev Arcade (20 AI Games)</a>
+    <script>
+      // Dynamically use current host for the Jev Arcade link
+      document.addEventListener('DOMContentLoaded', () => {
+        const link = document.getElementById('jev-arcade-link');
+        if (link && window.location.hostname) {
+          link.href = 'http://' + window.location.hostname + ':8888';
+        }
+      });
+    </script>
     <div class="phase-tag" id="engine-phase-badge">PHASE: IDLE</div>
     <div class="status-tag">
       <div class="pulse"></div>

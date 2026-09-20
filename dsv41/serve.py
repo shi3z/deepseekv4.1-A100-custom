@@ -7,6 +7,7 @@ from pathlib import Path
 
 Endpoints: GET /v1/models, POST /v1/chat/completions (stream or not), POST /v1/completions, GET /health, GET /dashboard.
 One request is generated at a time; others wait on the engine lock."""
+import sys
 import torch
 import argparse
 import json
@@ -124,12 +125,15 @@ class Handler(BaseHTTPRequestHandler):
             self._json(404, {"error": "not found"})
 
     def _dashboard(self):
-        _st_mod = sys.modules.get("dsv41.stats")
-        if not STATS_TRACKER and _st_mod:
-            model_name = ENGINE.model_name if ENGINE else "deepseek-v4.1-flash-abliterated"
-            html = _st_mod._DASHBOARD_HTML_TEMPLATE.replace("__MODEL_NAME__", model_name).encode("utf-8")
-        elif STATS_TRACKER:
-            html = STATS_TRACKER.render_dashboard_html(ENGINE.model_name if ENGINE else "deepseek-v4.1-flash-abliterated").encode("utf-8")
+        model_name = ENGINE.model_name if ENGINE else "deepseek-v4.1-flash-abliterated"
+        try:
+            if STATS_TRACKER:
+                html = STATS_TRACKER.render_dashboard_html(model_name).encode("utf-8")
+            else:
+                from .stats import _DASHBOARD_HTML_TEMPLATE
+                html = _DASHBOARD_HTML_TEMPLATE.replace("__MODEL_NAME__", model_name).encode("utf-8")
+        except Exception as e:
+            html = f"<html><body><h1>Dashboard Error</h1><p>{e}</p></body></html>".encode("utf-8")
         try:
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
