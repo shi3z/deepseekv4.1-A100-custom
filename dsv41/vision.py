@@ -375,23 +375,39 @@ class VisionTower(nn.Module):
         vit_feats = self.vision(patches, n_vit_h, n_vit_w)
         return self.aligner(vit_feats, n_vit_h, n_vit_w)
 
-    def merge_image_embeddings(self, images: list[list[ImageInput]] | list[ImageInput], h: torch.Tensor):
-        """Overwrite image token spans in token embeddings h [B, S, dim] with ViT/aligner features."""
+    def merge_image_embeddings(self, images: list[list[ImageInput]] | list[ImageInput], h: torch.Tensor, offset: int = 0):
+        """Overwrite image token spans in token embeddings h [B, S, dim] with ViT/aligner features.
+        h may be a chunk of the prompt starting at prompt position `offset` (chunked prefill): only the part of each
+        image span that falls inside [offset, offset + S) is written, and the ViT features are computed once per image."""
         # Handle both flat list and nested list of samples
         if images and isinstance(images[0], ImageInput):
             sample_list = [images]
         else:
             sample_list = images
 
+        S = h.shape[1]
         for i, sample in enumerate(sample_list):
             for img in sample or ():
-                types = img.types.to(h.device)
-                span = h[i, img.start : img.start + types.numel()]
+                n = img.types.numel()
+                lo, hi = max(img.start, offset), min(img.start + n, offset + S)
+                if lo >= hi:
+                    continue  # this image lies in another chunk
+                types_all = img.types.to(h.device)
+                types = types_all[lo - img.start : hi - img.start]
+                span = h[i, lo - offset : hi - offset]
                 span[types == IMAGE_START] = self.image_start.to(device=h.device, dtype=h.dtype)
                 span[types == IMAGE_END] = self.image_end.to(device=h.device, dtype=h.dtype)
                 span[types == IMAGE_NEW_LINE] = self.image_newline.to(device=h.device, dtype=h.dtype)
-                embeds = self.encode_image(img.patches, img.n_vit_h, img.n_vit_w)
-                span[types == IMAGE] = embeds.to(device=h.device, dtype=h.dtype)
+                embeds = getattr(img, "_embeds", None)
+                if embeds is None:
+                    embeds = self.encode_image(img.patches, img.n_vit_h, img.n_vit_w)
+                    try:
+                        img._embeds = embeds
+                    except Exception:
+                        pass
+                k0 = int((types_all[: lo - img.start] == IMAGE).sum())  # image tokens of this image before the chunk
+                k1 = k0 + int((types == IMAGE).sum())
+                span[types == IMAGE] = embeds[k0:k1].to(device=h.device, dtype=h.dtype)
 
 
 def load_vision_tower(ckpt: Any, cfg: dict, dev0: torch.device) -> VisionTower | None:
@@ -400,13 +416,13 @@ def load_vision_tower(ckpt: Any, cfg: dict, dev0: torch.device) -> VisionTower |
         return None
 
     env_dev = os.environ.get("DSV41_VISION_DEVICE")
+    ALLOWED_VISION_GPUS = (0, 1, 2, 3)
     if env_dev:
         vision_device = torch.device(env_dev)
     else:
-        # Check if an auxiliary GPU has >= 10 GB free memory (e.g. cuda:4)
         vision_device = dev0
         try:
-            for d in range(torch.cuda.device_count()):
+            for d in ALLOWED_VISION_GPUS:
                 dev_obj = torch.device(f"cuda:{d}")
                 if dev_obj != dev0:
                     free, _ = torch.cuda.mem_get_info(d)

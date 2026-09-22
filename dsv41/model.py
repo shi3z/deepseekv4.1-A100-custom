@@ -2552,8 +2552,8 @@ class Transformer:
                     if k == 0:
                         chunk_ids = input_ids[:, c0:c1].to(dev_k, non_blocking=True)
                         h = F.embedding(chunk_ids, self.embed)
-                        if images is not None and m == 0 and start_pos == 0 and getattr(self, "vision_tower", None) is not None:
-                            self.vision_tower.merge_image_embeddings(images, h)
+                        if images is not None and start_pos == 0 and getattr(self, "vision_tower", None) is not None:
+                            self.vision_tower.merge_image_embeddings(images, h, offset=c0)  # every chunk: images may start past chunk 0
                         h = h.unsqueeze(2).repeat(1, 1, self.hc, 1)
                         pre_mix = h.new_zeros(h.size(0), h.size(1), self.hc, dtype=torch.float32)
                         pre_mix[:, :, 0] = 1.0
