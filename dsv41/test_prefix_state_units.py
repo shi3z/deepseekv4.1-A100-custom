@@ -137,6 +137,19 @@ class PrefixStateTests(unittest.TestCase):
         import collections
         e.prefill_history = collections.deque(maxlen=10)
         e.stats_tracker = None
+        # Two attention layers with an 8-position window ring for 3 slots, and a host window log
+        # covering all 100 prompt positions of slots 0 and 2 (see Engine._slot_window_log).
+        attns = [
+            SimpleNamespace(layer_id=i, head_dim=4, window=8, window_kv_cache=torch.zeros(3, 8, 4, dtype=torch.bfloat16))
+            for i in range(2)
+        ]
+        e.model = SimpleNamespace(
+            blocks=[SimpleNamespace(attn=a) for a in attns],
+            shared=SimpleNamespace(window_log=None, window_log_range=[-1, -1]),
+        )
+        log = torch.arange(2 * 100 * 4, dtype=torch.float32).view(2, 100, 4).to(torch.bfloat16)
+        e._slot_window_log[2] = (log, 0, 100)
+        e._slot_window_log[0] = (log, 0, 100)
 
         prompt = list(range(100)) # 100 tokens
         logits, reused = e._prefill_with_gpu_slot_reuse(prompt, best_slot=2, best_lcp=85)
@@ -144,6 +157,25 @@ class PrefixStateTests(unittest.TestCase):
         self.assertEqual(reused, 80)
         self.assertEqual(copied, [(2, 0)])
         self.assertEqual(forwarded, [(prompt, 80)])
+        # the window history [73, 80) of the source log was written into slot 0's ring (slot = pos % 8)
+        for a in attns:
+            self.assertTrue(torch.equal(a.window_kv_cache[0, 1:8], log[a.layer_id, 73:80]))
+            self.assertTrue(torch.equal(a.window_kv_cache[0, 0], torch.zeros(4, dtype=torch.bfloat16)))
+
+        # without a window log for the source slot the GPU-slot reuse is refused
+        e._slot_window_log.pop(2)
+        self.assertIsNone(e._gpu_slot_reuse_pos(2, 85, 100))
+        with self.assertRaises(RuntimeError):
+            e._prefill_with_gpu_slot_reuse(prompt, best_slot=2, best_lcp=85)
+        e._slot_window_log[2] = (log, 0, 100)
+        # a log that ends before the wanted position caps the reuse to the logged prompt (multi-turn)
+        e._slot_window_log[1] = (log, 0, 70)
+        self.assertEqual(e._gpu_slot_reuse_pos(1, 85, 100), 64)
+        # a log that starts too late (snapshot-restored tail only) refuses
+        e._slot_window_log[1] = (log, 78, 100)
+        self.assertIsNone(e._gpu_slot_reuse_pos(1, 85, 100))
+        copied.clear()
+        forwarded.clear()
         self.assertEqual(e.last_prefill_stats["mode"], "gpu_slot_hit")
         self.assertEqual(e.last_prefill_stats["reused_tokens"], 80)
         self.assertEqual(e.last_prefill_stats["new_tokens"], 20)

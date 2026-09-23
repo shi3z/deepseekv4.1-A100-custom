@@ -278,6 +278,11 @@ class SharedAttn:
     """
 
     def __init__(self):
+        # Optional host log [n_layers, prompt_len, head_dim] of the raw window K/V written by a
+        # bsz == 1 prefill (set by the engine around each prefill; None = off). window_log_range
+        # is the [lo, hi) position range that has been written into it.
+        self.window_log: torch.Tensor | None = None
+        self.window_log_range: list[int] = [-1, -1]
         self.compress_kv: dict[tuple[int, torch.device], torch.Tensor] = {}
         self.index_k: dict[tuple[int, torch.device], torch.Tensor] = {}
 
@@ -980,6 +985,19 @@ class Attention:
         )
 
         kv = fake_quant_fp8(kv, 32)
+
+        # Host-side log of the raw window K/V of every prefilled position (bsz == 1 prefill only).
+        # The ring below keeps only the last `win` positions of a sequence, so a later continuation
+        # from an earlier position (GPU-slot prefix reuse, see Engine._prefill_with_gpu_slot_reuse)
+        # restores its window history from this log instead of reading whatever the ring holds now.
+        _log = getattr(self.shared, "window_log", None)
+        if _log is not None and bsz == 1 and seqlen > 0:
+            _end = start_pos + seqlen
+            if _end <= _log.shape[1]:
+                _log[self.layer_id, start_pos:_end].copy_(kv[0])
+                _rng = self.shared.window_log_range
+                _rng[0] = start_pos if _rng[0] < 0 else min(_rng[0], start_pos)
+                _rng[1] = max(_rng[1], _end)
 
         # ----------------------------------------------------
         # Normal initial prefill.

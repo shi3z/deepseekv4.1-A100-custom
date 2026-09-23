@@ -344,3 +344,25 @@ def memcpy_async(dst: torch.Tensor, src: torch.Tensor, device: torch.device, nby
     with torch.cuda.device(device):
         stream = torch.cuda.current_stream(device).cuda_stream
         _check(_cuda.cuMemcpyAsync(ctypes.c_void_p(dst.data_ptr()), ctypes.c_void_p(src.data_ptr()), n, ctypes.c_void_p(stream)), "cuMemcpyAsync")
+
+
+def hit_mask_select(eid: torch.Tensor, eid_rem: torch.Tensor, spec_gu: torch.Tensor, gu: torch.Tensor,
+                    e_pred: int, hit_flag: torch.Tensor | None = None):
+    """GPU-side Hit/Miss resolution for speculative expert execution (no host roundtrips)."""
+    topk_e = eid.numel()
+    N = spec_gu.shape[-1]
+    dev = eid.device
+    fn = get_function("hit_select.cu", "hit_mask_select", dev)
+    flag_ptr = ctypes.c_void_p(hit_flag.data_ptr()) if hit_flag is not None else ctypes.c_void_p(0)
+    args = [
+        ctypes.c_void_p(eid.data_ptr()),
+        ctypes.c_void_p(eid_rem.data_ptr()),
+        ctypes.c_void_p(spec_gu.data_ptr()),
+        ctypes.c_void_p(gu.data_ptr()),
+        ctypes.c_int(e_pred),
+        flag_ptr,
+        ctypes.c_int(topk_e),
+        ctypes.c_int(N),
+    ]
+    launch(fn, (1, 1, 1), (256, 1, 1), args, dev)
+

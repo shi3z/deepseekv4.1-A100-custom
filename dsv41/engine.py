@@ -4,7 +4,7 @@ sequence; requests are serialized with a lock)."""
 from __future__ import annotations
 from array import array
 import hashlib
-
+import math
 import os
 import sys
 import threading
@@ -18,6 +18,8 @@ import torch
 
 from .decode import DecodeRuntime
 from .load import load_model
+from .jev_policy import JevPolicyController, JevDecision, PrefillObservation, verify_and_constrain
+from .policy_logger import PolicyLogger
 import traceback
 
 DEFAULT_CKPT = "/mnt/ssd/models/DeepSeek-V4.1-Flash-Abliterated" if os.path.exists("/mnt/ssd/models/DeepSeek-V4.1-Flash-Abliterated") else "/mnt/ssd/models/DeepSeek-V4.1-Flash"
@@ -367,6 +369,11 @@ class Engine:
             }
         if self.max_seqs > 1:
             self._init_batch_scheduler()
+
+        self.jev_controller = JevPolicyController()
+        self.policy_logger = PolicyLogger()
+        self._forced_prefill_policy_once = None
+        self.last_policy_decision: JevDecision | None = None
 
     def _record_prefill_stats(
         self,
@@ -1426,6 +1433,7 @@ class Engine:
         start_pos,
         *,
         snapshot_at=None,
+        block_size=None,
     ):
         """Replay cached suffix using production decode runtime.
 
@@ -1544,6 +1552,7 @@ class Engine:
         )
 
         done = 0
+        blocks_count = 0
 
         # ------------------------------------------------------------
         # Prefix replay.
@@ -1573,15 +1582,18 @@ class Engine:
             ) == "1"
         )
 
-        block_size = max(
-            2,
-            int(
-                os.environ.get(
-                    "DSV41_PREFIX_BLOCK_SIZE",
-                    "128",
-                )
-            ),
-        )
+        if block_size is None:
+            block_size = max(
+                2,
+                int(
+                    os.environ.get(
+                        "DSV41_PREFIX_BLOCK_SIZE",
+                        "128",
+                    )
+                ),
+            )
+        else:
+            block_size = max(2, int(block_size))
 
         block_min = max(
             2,
@@ -1685,6 +1697,7 @@ class Engine:
                         self._write_prefix_draft_hidden(model.main_hidden, end_pos)
                     n = end_pos - pos
                     done += n
+                    blocks_count += 1
                     pos = end_pos
 
                     # Synchronize only at reporting boundaries.
@@ -1776,6 +1789,7 @@ class Engine:
                         )
 
                 done += 1
+                blocks_count += 1
 
                 if (
                     done % report_every == 0
@@ -1877,6 +1891,7 @@ class Engine:
                     model.collect_main_hidden = old_collect
 
             done += 1
+            blocks_count += 1
 
             if not hasattr(model, "main_hidden"):
                 raise RuntimeError(
@@ -1922,6 +1937,11 @@ class Engine:
 
         # Snapshot at total means state after the entire prompt.
         _capture_prefix_anchor(total)
+
+        self._last_replay_stats = {
+            "actual_tokens_processed": done,
+            "blocks_executed": blocks_count,
+        }
 
         if _multi_snapshot:
             new_snapshots.sort(
@@ -2963,6 +2983,83 @@ class Engine:
                 best_slot = slot_id
         return best_slot, best_lcp
 
+    def _remove_prefix_cache_entry(self, entry: dict):
+        """Evict a specific snapshot entry from in-memory cache."""
+        entries = self._prefix_cache_entries()
+        if entry in entries:
+            try:
+                entries.remove(entry)
+            except Exception:
+                pass
+
+    def _collect_prefill_observation(
+        self,
+        prompt_ids: list[int],
+    ) -> tuple[PrefillObservation, dict | None, int, int, int]:
+        """Extract multi-level cache and resource state for policy selection."""
+        total = len(prompt_ids)
+        best_gpu_slot, best_gpu_lcp = self._find_best_gpu_slot(prompt_ids)
+        min_gpu_prefix = int(os.environ.get("DSV41_GPU_PREFIX_MIN", "64"))
+        has_gpu_slot = (best_gpu_slot >= 0 and best_gpu_lcp >= min_gpu_prefix)
+
+        entry = self._find_prefix_cache_entry(prompt_ids)
+        has_anchor = (entry is not None and len(entry.get("base_ids", [])) > 0)
+        anchor_base_tokens = len(entry["base_ids"]) if has_anchor else 0
+
+        lcp = 0
+        for candidate in self._prefix_cache_entries():
+            c = self._prompt_lcp(candidate["prompt_ids"], prompt_ids)
+            if c > lcp:
+                lcp = c
+        if has_gpu_slot and best_gpu_lcp > lcp:
+            lcp = best_gpu_lcp
+
+        if has_gpu_slot:
+            cache_hit_type = "gpu_slot"
+            suffix_tokens = max(0, total - best_gpu_lcp)
+        elif has_anchor:
+            cache_hit_type = "anchor_snapshot"
+            suffix_tokens = max(0, total - anchor_base_tokens)
+        else:
+            cache_hit_type = "none"
+            suffix_tokens = total
+
+        expected_epoch = os.environ.get(
+            "DSV41_PREFIX_CACHE_EPOCH",
+            "fullstate-v5-index-engram-dspark",
+        )
+        if entry is not None:
+            epoch_matched = (entry.get("cache_epoch", expected_epoch) == expected_epoch)
+        else:
+            epoch_matched = True
+
+        with getattr(self, "_slot_tokens_lock", threading.Lock()):
+            active_slots = len(self._slot_tokens)
+        free_slots = max(0, self.max_seqs - active_slots)
+
+        from dsv41.jev_policy import get_allowed_gpus_min_free_mem_gb
+        gpu_min_free_mem_gb = get_allowed_gpus_min_free_mem_gb()
+
+        is_multi_turn = (cache_hit_type != "none" or lcp >= 128)
+        estimated_replay_tokens = suffix_tokens
+
+        obs = PrefillObservation(
+            prompt_tokens=total,
+            lcp_tokens=lcp,
+            suffix_tokens=suffix_tokens,
+            cache_hit_type=cache_hit_type,
+            gpu_slot_id=best_gpu_slot if has_gpu_slot else -1,
+            gpu_slot_lcp=best_gpu_lcp if has_gpu_slot else 0,
+            anchor_base_tokens=anchor_base_tokens,
+            active_slots=active_slots,
+            free_slots=free_slots,
+            gpu_min_free_mem_gb=gpu_min_free_mem_gb,
+            epoch_matched=epoch_matched,
+            is_multi_turn=is_multi_turn,
+            estimated_replay_tokens=estimated_replay_tokens,
+        )
+        return obs, entry, best_gpu_slot, best_gpu_lcp, lcp
+
     @torch.inference_mode()
     def _forward_prefix_continuation(
         self,
@@ -2994,6 +3091,8 @@ class Engine:
         self._set_prefix_replay_mode(True)
         pos = start_pos
         logits = None
+        cont_tokens = 0
+        cont_blocks = 0
         try:
             while pos < total:
                 end_pos = min(total, pos + chunk_size)
@@ -3002,9 +3101,15 @@ class Engine:
                 logits = model.forward(input_tensor, pos)
                 if use_mtp_tail and hasattr(model, "main_hidden") and model.main_hidden is not None:
                     self._write_prefix_draft_hidden(model.main_hidden, end_pos)
+                cont_tokens += (end_pos - pos)
+                cont_blocks += 1
                 pos = end_pos
         finally:
             self._set_prefix_replay_mode(False)
+            self._last_continuation_stats = {
+                "actual_tokens_processed": cont_tokens,
+                "blocks_executed": cont_blocks,
+            }
 
         if logits is None:
             raise RuntimeError(
@@ -3019,10 +3124,12 @@ class Engine:
         best_slot: int,
         best_lcp: int,
         req_id: str = "",
+        reuse_pos: int | None = None,
     ) -> tuple[torch.Tensor, int]:
         """Reuse existing GPU KV cache from best_slot, forward only the suffix delta on slot 0."""
         t0 = time.perf_counter()
         total = len(prompt_ids)
+        src_log = self._slot_window_log.get(best_slot) if self._window_log_enabled() else None
 
         # 1. If best_slot is not slot 0, copy its per-sequence state to slot 0 on GPU
         if best_slot != 0:
@@ -3038,10 +3145,21 @@ class Engine:
 
         # 2. Align reuse_pos to compression ratio boundary (multiple of 16).
         # If best_lcp matches the entire prompt, keep at least 1-16 tokens to compute logits.
-        if best_lcp >= total:
-            reuse_pos = max(0, total - 16)
-        else:
-            reuse_pos = (best_lcp // 16) * 16
+        if reuse_pos is None:
+            reuse_pos = self._gpu_slot_reuse_pos(best_slot, best_lcp, total)
+            if reuse_pos is None:
+                raise RuntimeError(f"window history for slot {best_slot} unavailable (lcp={best_lcp}, total={total})")
+
+        # The ring of best_slot holds the LAST `window` positions of that sequence, not the
+        # history the continuation at reuse_pos needs; rebuild it from the slot's window log.
+        if src_log is not None:
+            src_buf, src_lo, _src_hi = src_log
+            self._restore_window_ring(0, src_buf, reuse_pos)
+            new_buf = getattr(self.model.shared, "window_log", None)
+            if new_buf is not None:
+                lo = max(0, int(src_lo))
+                new_buf[:, lo:reuse_pos].copy_(src_buf[:, lo:reuse_pos])
+                self.model.shared.window_log_range = [lo, reuse_pos]
 
         suffix_len = total - reuse_pos
         print(
@@ -3080,12 +3198,126 @@ class Engine:
 
         return logits, reuse_pos
 
-    @torch.inference_mode()
+    # ------------------------------------------------------------------
+    # Window K/V log (per sequence slot, host memory).
+    #
+    # Every attention layer keeps the sliding-window K/V in a ring of `window` (128) positions per
+    # slot, so once a sequence has advanced past position P the ring no longer holds the history
+    # [P-127, P) that a continuation starting at P needs. The GPU-slot prefix reuse used to read
+    # that clobbered ring (the previous request's later tokens leaked into the new request's
+    # window attention). The prefill therefore logs the raw window K/V of every prefilled position
+    # to a host buffer, one per prefill, attached to slot 0 and (via copy_seq) to the decode slot;
+    # a continuation restores its window history from the log of the slot it reuses.
+    # ------------------------------------------------------------------
+    @property
+    def _slot_window_log(self) -> dict:
+        d = self.__dict__.get("_slot_window_log_d")
+        if d is None:
+            d = self.__dict__["_slot_window_log_d"] = {}
+        return d
+
+    def _window_log_enabled(self) -> bool:
+        return os.environ.get("DSV41_WINDOW_LOG", "1") != "0"
+
+    def _window_log_new(self, total: int) -> torch.Tensor:
+        blocks = self.model.blocks
+        n_layers = max(int(b.attn.layer_id) for b in blocks) + 1
+        return torch.empty(n_layers, max(1, int(total)), blocks[0].attn.head_dim, dtype=torch.bfloat16)
+
+    def _log_window_from_ring(self, pos: int):
+        """After a snapshot restore into slot 0 at position `pos`, copy the (valid) ring contents
+        [pos-window, pos) into the current window log so a later reuse can start anywhere >= pos."""
+        shared = self.model.shared
+        buf = getattr(shared, "window_log", None)
+        if buf is None:
+            return
+        win = int(self.model.blocks[0].attn.window)
+        pos = min(int(pos), int(buf.shape[1]))
+        p0 = max(0, pos - win)
+        if p0 >= pos:
+            return
+        slots = torch.arange(p0, pos) % win
+        for blk in self.model.blocks:
+            A = blk.attn
+            buf[A.layer_id, p0:pos].copy_(A.window_kv_cache[0, slots.to(A.window_kv_cache.device)])
+        rng = shared.window_log_range
+        rng[0] = p0 if rng[0] < 0 else min(rng[0], p0)
+        rng[1] = max(rng[1], pos)
+
+    def _restore_window_ring(self, slot: int, buf: torch.Tensor, pos: int):
+        """Write the window history [pos-(window-1), pos) of `buf` into the ring of `slot`."""
+        win = int(self.model.blocks[0].attn.window)
+        p0 = max(0, int(pos) - (win - 1))
+        if p0 >= pos:
+            return
+        slots = torch.arange(p0, pos) % win
+        for blk in self.model.blocks:
+            A = blk.attn
+            dev = A.window_kv_cache.device
+            A.window_kv_cache[slot, slots.to(dev)] = buf[A.layer_id, p0:pos].to(dev)
+
+    def _gpu_slot_reuse_pos(self, best_slot: int, best_lcp: int, total: int) -> int | None:
+        """Position a GPU-slot continuation can start from (multiple of 16), or None when the
+        window history that continuation needs is not available for `best_slot`."""
+        if best_lcp >= total:
+            reuse_pos = max(0, total - 16)
+        else:
+            reuse_pos = (best_lcp // 16) * 16
+        if not self._window_log_enabled():
+            return reuse_pos if reuse_pos > 0 else None
+        src = self._slot_window_log.get(best_slot)
+        if src is None:
+            return None
+        _buf, lo, hi = src
+        if reuse_pos > hi:
+            # the log covers the prompt only: recompute the generated tail as prompt tokens
+            reuse_pos = (hi // 16) * 16
+        win = int(self.model.blocks[0].attn.window)
+        p0 = max(0, reuse_pos - (win - 1))
+        if reuse_pos <= 0 or p0 < lo or reuse_pos > hi:
+            return None
+        return reuse_pos
+
     def _prefill_with_prefix_reuse(
         self,
         prompt_ids: list[int],
         images=None,
         token_types=None,
+        req_id: str = "",
+    ):
+        """Prefill into slot 0 while logging the window K/V of every prefilled position to a host
+        buffer that becomes slot 0's window log (see _slot_window_log)."""
+        shared = self.model.shared
+        if not self._window_log_enabled():
+            shared.window_log = None
+            self._slot_window_log.pop(0, None)
+            return self._prefill_with_prefix_reuse_impl(prompt_ids, images=images, token_types=token_types, req_id=req_id)
+        # slot 0's previous log stays visible during the prefill: the reuse check reads it and the
+        # GPU-slot continuation copies its head into the new buffer.
+        buf = self._window_log_new(len(prompt_ids))
+        shared.window_log = buf
+        shared.window_log_range = [-1, -1]
+        try:
+            out = self._prefill_with_prefix_reuse_impl(prompt_ids, images=images, token_types=token_types, req_id=req_id)
+        except BaseException:
+            self._slot_window_log.pop(0, None)  # slot 0's ring is now in an unknown state
+            raise
+        finally:
+            lo, hi = shared.window_log_range
+            shared.window_log = None
+        if 0 <= lo < hi:
+            self._slot_window_log[0] = (buf, int(lo), int(hi))
+        else:
+            self._slot_window_log.pop(0, None)
+        return out
+
+    @torch.inference_mode()
+    def _prefill_with_prefix_reuse_impl(
+        self,
+        prompt_ids: list[int],
+        images=None,
+        token_types=None,
+        req_id: str = "",
     ):
         if images is not None:
             _t0 = time.perf_counter()
@@ -3197,11 +3429,58 @@ class Engine:
         total = len(prompt_ids)
 
         # ------------------------------------------------------------
-        # Level 1 Cache: In-GPU Sequence Slot Cache.
-        #
-        # If any GPU decode slot or prefill slot 0 already retains a
-        # prefix of prompt_ids in VRAM, avoid all host RAM restore, PCIe
-        # traffic, and slow rollback.
+        # Jev System 1 Execution Policy Controller
+        # ------------------------------------------------------------
+        obs, entry, best_gpu_slot, best_gpu_lcp, lcp = self._collect_prefill_observation(prompt_ids)
+
+        if entry is not None:
+            old_prompt = entry["prompt_ids"]
+            old_base_ids = entry["base_ids"]
+            old_snapshot = entry["snapshot"]
+            old_base = len(old_base_ids)
+            entry["last_used"] = time.monotonic()
+            entry["hits"] = int(entry.get("hits", 0)) + 1
+        else:
+            old_prompt = None
+            old_base_ids = None
+            old_snapshot = None
+            old_base = 0
+
+        target_base = max(0, total - guard)
+        reusable = (entry is not None and old_base > 0)
+
+        forced = getattr(self, "_forced_prefill_policy_once", None)
+        self._forced_prefill_policy_once = None
+
+        if forced:
+            forced = forced.strip().lower()
+            block_sz = 512 if "512" in forced else (256 if "256" in forced else (128 if "128" in forced else 0))
+            decision = JevDecision(
+                policy=forced,
+                block_size=block_sz,
+                confidence=1.0,
+                reason_code=f"forced_override:{forced}",
+                fallback_used=False,
+                model="forced-override",
+            )
+            decision = verify_and_constrain(decision, obs)
+        else:
+            decision = self.jev_controller.decide_policy(obs)
+
+        self.last_policy_decision = decision
+
+        print(
+            f"[jev-policy] DECISION policy={decision.policy} "
+            f"conf={decision.confidence:.2f} block={decision.block_size} "
+            f"fb={decision.fallback_used} time={decision.latency_ms:.1f}ms "
+            f"reason={decision.reason_code}",
+            flush=True,
+        )
+
+        t0 = time.perf_counter()
+
+        # ------------------------------------------------------------
+        # Policy Branch 1: In-GPU Sequence Slot Cache
         # ------------------------------------------------------------
         use_gpu_cache = (
             os.environ.get("DSV41_GPU_PREFIX_CACHE", "1") != "0"
@@ -3209,14 +3488,35 @@ class Engine:
         min_gpu_prefix = int(
             os.environ.get("DSV41_GPU_PREFIX_MIN", "64")
         )
-        best_gpu_slot, best_gpu_lcp = self._find_best_gpu_slot(prompt_ids)
-
-        if use_gpu_cache and best_gpu_slot >= 0 and best_gpu_lcp >= min_gpu_prefix:
+        gpu_reuse_pos = None
+        if decision.policy == "reuse_gpu_slot" and use_gpu_cache and best_gpu_slot >= 0 and best_gpu_lcp >= min_gpu_prefix:
+            gpu_reuse_pos = self._gpu_slot_reuse_pos(best_gpu_slot, best_gpu_lcp, total)
+            if gpu_reuse_pos is None:
+                print(
+                    f"[gpu-slot-cache] SKIP best_slot={best_gpu_slot} lcp={best_gpu_lcp:,}: "
+                    f"window history not logged for that slot, using host snapshots / full prefill",
+                    flush=True,
+                )
+        if gpu_reuse_pos is not None:
             try:
                 logits, reused_pos = self._prefill_with_gpu_slot_reuse(
                     prompt_ids,
                     best_gpu_slot,
                     best_gpu_lcp,
+                    req_id=req_id,
+                    reuse_pos=gpu_reuse_pos,
+                )
+                dt_gpu = time.perf_counter() - t0
+                self.policy_logger.log_decision_and_outcome(
+                    observation=obs,
+                    decision=decision,
+                    actual_policy="reuse_gpu_slot",
+                    prefill_time_s=dt_gpu,
+                    reused_tokens=reused_pos,
+                    new_tokens=total - reused_pos,
+                    total_tokens=total,
+                    req_id=req_id,
+                    success=True,
                 )
                 return logits, reused_pos
             except Exception as exc:
@@ -3227,55 +3527,18 @@ class Engine:
                 )
                 traceback.print_exc()
 
-        # Search ALL retained host-RAM snapshots.
-        entry = self._find_prefix_cache_entry(
-            prompt_ids
-        )
+        # ------------------------------------------------------------
+        # Policy Branch 2: Safe Recompute (evicts stale/corrupted entry)
+        # ------------------------------------------------------------
+        if decision.policy == "safe_recompute":
+            if entry is not None:
+                print(f"[prefix-cache] SAFE RECOMPUTE evicting entry base={old_base}", flush=True)
+                self._remove_prefix_cache_entry(entry)
+                reusable = False
 
-        if entry is not None:
-            old_prompt = entry["prompt_ids"]
-            old_base_ids = entry["base_ids"]
-            old_snapshot = entry["snapshot"]
-            old_base = len(old_base_ids)
-
-            entry["last_used"] = time.monotonic()
-            entry["hits"] = int(
-                entry.get("hits", 0)
-            ) + 1
-        else:
-            old_prompt = None
-            old_base_ids = None
-            old_snapshot = None
-            old_base = 0
-
-        # For diagnostics, also find the best LCP against every cached
-        # request, even when none has a reusable base.
-        lcp = 0
-        lcp_prompt = None
-
-        for candidate in self._prefix_cache_entries():
-            cp = candidate["prompt_ids"]
-
-            c = self._prompt_lcp(
-                cp,
-                prompt_ids,
-            )
-
-            if c > lcp:
-                lcp = c
-                lcp_prompt = cp
-
-        target_base = max(
-            0,
-            total - guard,
-        )
-
-        reusable = (
-            entry is not None
-            and old_base > 0
-        )
-
-        t0 = time.perf_counter()
+        # If policy is full_prefill, bypass reusable branch directly
+        if decision.policy == "full_prefill":
+            reusable = False
 
         # ========================================================
         # HIT: restore stable base and replay only its tail.
@@ -3294,6 +3557,7 @@ class Engine:
             self._restore_prefix_state(
                 old_snapshot
             )
+            self._log_window_from_ring(old_base)
 
             # Do NOT roll the snapshot forward on every request.
             #
@@ -3398,6 +3662,7 @@ class Engine:
                 prompt_ids,
                 old_base,
                 snapshot_at=snapshot_at,
+                block_size=decision.block_size,
             )
 
             if logits is None:
@@ -3406,6 +3671,7 @@ class Engine:
                 self._restore_prefix_state(
                     old_snapshot
                 )
+                self._log_window_from_ring(old_base)
 
                 redo = max(0, total - 1)
 
@@ -3413,6 +3679,7 @@ class Engine:
                     prompt_ids,
                     redo,
                     snapshot_at=None,
+                    block_size=decision.block_size,
                 )
 
             if isinstance(snap_at, list):
@@ -3547,6 +3814,18 @@ class Engine:
                 base_tokens=old_base,
                 suffix_tokens=replay_n,
             )
+
+            self.policy_logger.log_decision_and_outcome(
+                observation=obs,
+                decision=decision,
+                actual_policy=decision.policy,
+                prefill_time_s=dt,
+                reused_tokens=old_base,
+                new_tokens=replay_n,
+                total_tokens=total,
+                req_id=req_id,
+                success=True,
+            )
             return logits, old_base
 
         # ========================================================
@@ -3604,6 +3883,18 @@ class Engine:
                 lcp=lcp,
                 base_tokens=0,
                 suffix_tokens=total,
+            )
+
+            self.policy_logger.log_decision_and_outcome(
+                observation=obs,
+                decision=decision,
+                actual_policy="full_prefill",
+                prefill_time_s=dt,
+                reused_tokens=0,
+                new_tokens=total,
+                total_tokens=total,
+                req_id=req_id,
+                success=True,
             )
             return logits, 0
 
@@ -3727,7 +4018,229 @@ class Engine:
             base_tokens=0,
             suffix_tokens=total,
         )
+        self.policy_logger.log_decision_and_outcome(
+            observation=obs,
+            decision=decision,
+            actual_policy=decision.policy if decision.policy in ("full_prefill", "safe_recompute") else "full_prefill_fallback",
+            prefill_time_s=dt,
+            reused_tokens=0,
+            new_tokens=total,
+            total_tokens=total,
+            req_id=req_id,
+            success=True,
+        )
         return logits, 0
+
+    @torch.inference_mode()
+    def prime_benchmark_base(self, base_ids: list[int]) -> dict:
+        """Prime base prefix for isolated benchmark evaluation without cache pollution.
+
+        Strict System Invariant:
+        - GPUs 0, 1, 2, 3 ONLY are synchronized/used.
+        - Captures clean base snapshot and initialises slot 0 KV cache.
+        """
+        with self.lock:
+            BENCHMARK_ALLOWED_GPUS = (0, 1, 2, 3)
+            for d in BENCHMARK_ALLOWED_GPUS:
+                torch.cuda.synchronize(d)
+
+            t0 = time.perf_counter()
+            dev0 = self.model.blocks[0].device
+            logits = self.model.forward(
+                torch.tensor([base_ids], dtype=torch.long, device=dev0),
+                0,
+            )
+            for d in BENCHMARK_ALLOWED_GPUS:
+                torch.cuda.synchronize(d)
+            prefill_s = time.perf_counter() - t0
+
+            base_len = len(base_ids)
+            snap, snap_bytes = self._snapshot_prefix_state(used_tokens=base_len)
+            self._benchmark_base_snapshot = (snap, snap_bytes)
+            self._benchmark_base_ids = list(base_ids)
+            with getattr(self, "_slot_tokens_lock", threading.Lock()):
+                self._slot_tokens[0] = list(base_ids)
+            self._benchmark_ref_logits = {}
+
+            print(
+                f"[benchmark-prime] base_tokens={base_len:,} time={prefill_s:.3f}s snapshot={snap_bytes/2**20:.1f}MiB",
+                flush=True,
+            )
+            return {
+                "status": "ok",
+                "base_tokens": base_len,
+                "prefill_s": round(prefill_s, 4),
+                "snapshot_bytes": snap_bytes,
+            }
+
+    @torch.inference_mode()
+    def run_isolated_benchmark_step(
+        self,
+        prompt_ids: list[int],
+        policy: str,
+        block_size: int | None = None,
+    ) -> dict:
+        """Run an isolated, unpolluted benchmark step against the primed base snapshot.
+
+        Strict System Invariant:
+        - GPUs 0, 1, 2, 3 ONLY are synchronized/used.
+        - After each step, GPU slot 0 is restored back to the clean base snapshot.
+        - No entries are written to self._prefix_cache or tmpfs.
+        """
+        with self.lock:
+            BENCHMARK_ALLOWED_GPUS = (0, 1, 2, 3)
+            base_snapshot_tuple = getattr(self, "_benchmark_base_snapshot", None)
+            base_ids = getattr(self, "_benchmark_base_ids", None)
+            if base_snapshot_tuple is None or base_ids is None:
+                raise RuntimeError("Base prefix is not primed. Call prime_benchmark_base first.")
+
+            base_len = len(base_ids)
+            total_len = len(prompt_ids)
+            if prompt_ids[:base_len] != base_ids:
+                raise ValueError(f"prompt_ids does not start with primed base (base_len={base_len})")
+
+            suffix_len = total_len - base_len
+            policy = policy.strip().lower()
+            restore_ms = 0.0
+            prefill_ms = 0.0
+            actual_tokens_processed = 0
+            blocks_executed = 0
+            state_source = "cold"
+            dev0 = self.model.blocks[0].device
+
+            # Always ensure GPUs 0..3 are fully idle before timing
+            for d in BENCHMARK_ALLOWED_GPUS:
+                torch.cuda.synchronize(d)
+
+            if policy == "full_prefill":
+                state_source = "cold"
+                t0 = time.perf_counter()
+                logits = self.model.forward(
+                    torch.tensor([prompt_ids], dtype=torch.long, device=dev0),
+                    0,
+                )
+                for d in BENCHMARK_ALLOWED_GPUS:
+                    torch.cuda.synchronize(d)
+                prefill_ms = (time.perf_counter() - t0) * 1000.0
+                actual_tokens_processed = total_len
+                blocks_executed = 1
+
+            elif policy == "reuse_gpu_slot":
+                state_source = "gpu_resident"
+                # Ensure slot 0 has base KV cache
+                self._restore_prefix_state(base_snapshot_tuple[0])
+                with getattr(self, "_slot_tokens_lock", threading.Lock()):
+                    self._slot_tokens[0] = list(base_ids)
+                for d in BENCHMARK_ALLOWED_GPUS:
+                    torch.cuda.synchronize(d)
+
+                # Forward suffix continuation
+                t0 = time.perf_counter()
+                chunk_sz = block_size or 512
+                logits = self._forward_prefix_continuation(prompt_ids, base_len, chunk_size=chunk_sz)
+                for d in BENCHMARK_ALLOWED_GPUS:
+                    torch.cuda.synchronize(d)
+                prefill_ms = (time.perf_counter() - t0) * 1000.0
+                stats = getattr(self, "_last_continuation_stats", {})
+                actual_tokens_processed = stats.get("actual_tokens_processed", suffix_len)
+                blocks_executed = stats.get("blocks_executed", math.ceil(suffix_len / chunk_sz))
+
+            elif "block" in policy or policy in ("reuse_anchor_block256", "reuse_anchor_block512"):
+                state_source = "host_snapshot"
+                # 1. Restore base snapshot from host RAM to GPU
+                tR0 = time.perf_counter()
+                self._restore_prefix_state(base_snapshot_tuple[0])
+                with getattr(self, "_slot_tokens_lock", threading.Lock()):
+                    self._slot_tokens[0] = list(base_ids)
+                for d in BENCHMARK_ALLOWED_GPUS:
+                    torch.cuda.synchronize(d)
+                restore_ms = (time.perf_counter() - tR0) * 1000.0
+
+                # 2. Replay suffix tail with instrumented block size (NO snapshotting / anchoring)
+                blk = 256 if "256" in policy else (512 if "512" in policy else (block_size or 512))
+                t0 = time.perf_counter()
+                logits, _ = self._replay_prefix_tail(
+                    prompt_ids,
+                    base_len,
+                    snapshot_at=None,
+                    block_size=blk,
+                )
+                for d in BENCHMARK_ALLOWED_GPUS:
+                    torch.cuda.synchronize(d)
+                prefill_ms = (time.perf_counter() - t0) * 1000.0
+                stats = getattr(self, "_last_replay_stats", {})
+                actual_tokens_processed = stats.get("actual_tokens_processed", suffix_len)
+                blocks_executed = stats.get("blocks_executed", math.ceil(suffix_len / blk))
+
+            else:
+                raise ValueError(f"Unknown benchmark policy: {policy}")
+
+            # Post-step isolation cleanup: Reset GPU slot 0 back to clean base
+            self._restore_prefix_state(base_snapshot_tuple[0])
+            with getattr(self, "_slot_tokens_lock", threading.Lock()):
+                self._slot_tokens[0] = list(base_ids)
+            for d in BENCHMARK_ALLOWED_GPUS:
+                torch.cuda.synchronize(d)
+
+            # Logits analysis
+            if logits is None:
+                raise RuntimeError("No logits produced by benchmark step")
+            last_logits = (logits[0, -1, :] if logits.ndim == 3 else logits[-1, :]).detach().float().cpu()
+            top5 = torch.topk(last_logits, 5)
+            top5_list = [{"token_id": int(i), "logit": round(float(v), 4)} for i, v in zip(top5.indices, top5.values)]
+
+            # Compare against full_prefill reference for numerical correctness
+            ref_logits_dict = getattr(self, "_benchmark_ref_logits", {})
+            prompt_key = suffix_len
+            diff_stats = {}
+            if policy == "full_prefill":
+                ref_logits_dict[prompt_key] = last_logits.clone()
+                self._benchmark_ref_logits = ref_logits_dict
+                diff_stats = {
+                    "top5_match": True,
+                    "max_abs_diff": 0.0,
+                    "mean_abs_diff": 0.0,
+                    "reference_policy": "self",
+                }
+            elif prompt_key in ref_logits_dict:
+                ref = ref_logits_dict[prompt_key]
+                diff = torch.abs(last_logits - ref)
+                ref_top5 = torch.topk(ref, 5).indices.tolist()
+                cur_top5 = top5.indices.tolist()
+                diff_stats = {
+                    "top5_match": (cur_top5 == ref_top5),
+                    "max_abs_diff": round(float(torch.max(diff).item()), 6),
+                    "mean_abs_diff": round(float(torch.mean(diff).item()), 6),
+                    "reference_policy": "full_prefill",
+                }
+            else:
+                diff_stats = {
+                    "top5_match": None,
+                    "max_abs_diff": None,
+                    "mean_abs_diff": None,
+                    "reference_policy": None,
+                }
+
+            total_ms = restore_ms + prefill_ms
+            tok_s = round(actual_tokens_processed / max(prefill_ms / 1000.0, 1e-9), 1)
+            effective_tok_s = round(total_len / max(total_ms / 1000.0, 1e-9), 1)
+
+            return {
+                "policy": policy,
+                "state_source": state_source,
+                "base_tokens": base_len,
+                "suffix_tokens": suffix_len,
+                "total_tokens": total_len,
+                "actual_tokens_processed": actual_tokens_processed,
+                "blocks_executed": blocks_executed,
+                "restore_ms": round(restore_ms, 2),
+                "prefill_ms": round(prefill_ms, 2),
+                "total_ms": round(total_ms, 2),
+                "tok_s": tok_s,
+                "effective_tok_s": effective_tok_s,
+                "top5_logits": top5_list,
+                "diff_against_full": diff_stats,
+            }
 
     @torch.inference_mode()
     def generate(self, prompt_ids: list[int], p: GenParams, images=None, token_types=None) -> Iterator[tuple[int, str]]:
@@ -4454,10 +4967,20 @@ class Engine:
                 try:
                     with self.lock:
                         # Prefill using slot 0 (fully compatible with prefix-cache / snapshots / GPU cache)
-                        logits, _reused = self._prefill_with_prefix_reuse(req.prompt_ids, images=req.images, token_types=req.token_types)
+                        logits, _reused = self._prefill_with_prefix_reuse(
+                            req.prompt_ids,
+                            images=req.images,
+                            token_types=req.token_types,
+                            req_id=req.req_id,
+                        )
                         first_tok = sample_token(logits[0], req.params.temperature, req.params.top_p, req.gen)
                         # Copy per-sequence cache state from slot 0 to target decode slot
                         self.rt.copy_seq(0, slot_id, req_id=req.req_id)
+                        _wlog = self._slot_window_log.get(0)
+                        if _wlog is not None:
+                            self._slot_window_log[slot_id] = _wlog
+                        else:
+                            self._slot_window_log.pop(slot_id, None)
                         with getattr(self, "_slot_tokens_lock", threading.Lock()):
                             self._slot_tokens[0] = list(req.prompt_ids)
                             self._slot_tokens[slot_id] = list(req.prompt_ids)

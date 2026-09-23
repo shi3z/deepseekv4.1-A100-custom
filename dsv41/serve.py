@@ -175,11 +175,58 @@ class Handler(BaseHTTPRequestHandler):
                 return self._chat(body)
             if self.path == "/v1/completions":
                 return self._completion(body)
+            if self.path == "/v1/benchmark/prime":
+                return self._benchmark_prime(body)
+            if self.path == "/v1/benchmark/eval":
+                return self._benchmark_eval(body)
             self._json(404, {"error": "not found"})
         finally:
             if STATS_TRACKER:
                 STATS_TRACKER.client_disconnected()
 
+    def _benchmark_prime(self, body: dict):
+        eng = ENGINE
+        if not eng:
+            return self._json(500, {"error": "Engine not initialized"})
+        prompt_ids = body.get("prompt_ids")
+        if not prompt_ids:
+            text = body.get("text")
+            messages = body.get("messages")
+            if text:
+                prompt_ids = eng.tok.encode(text)
+            elif messages:
+                prompt_ids, _, _ = eng.format_chat(messages)
+        if not prompt_ids:
+            return self._json(400, {"error": "prompt_ids, text, or messages required"})
+        try:
+            res = eng.prime_benchmark_base(prompt_ids)
+            return self._json(200, res)
+        except Exception as e:
+            tb = traceback.format_exc()
+            return self._json(500, {"error": str(e), "traceback": tb})
+
+    def _benchmark_eval(self, body: dict):
+        eng = ENGINE
+        if not eng:
+            return self._json(500, {"error": "Engine not initialized"})
+        prompt_ids = body.get("prompt_ids")
+        policy = body.get("policy")
+        block_size = body.get("block_size")
+        if not prompt_ids:
+            text = body.get("text")
+            messages = body.get("messages")
+            if text:
+                prompt_ids = eng.tok.encode(text)
+            elif messages:
+                prompt_ids, _, _ = eng.format_chat(messages)
+        if not prompt_ids or not policy:
+            return self._json(400, {"error": "prompt_ids (or text/messages) and policy required"})
+        try:
+            res = eng.run_isolated_benchmark_step(prompt_ids, policy=policy, block_size=block_size)
+            return self._json(200, res)
+        except Exception as e:
+            tb = traceback.format_exc()
+            return self._json(500, {"error": str(e), "traceback": tb})
 
     # ---------------------------------------------------------------- chat
     def _chat(self, body: dict):
@@ -213,6 +260,30 @@ class Handler(BaseHTTPRequestHandler):
                 "[http-debug] prefix-cache=ON for this request",
                 flush=True,
             )
+
+        _policy_header = (
+            self.headers.get(
+                "X-DSV41-Prefill-Policy",
+                "",
+            )
+            .strip()
+            .lower()
+        )
+        if _policy_header and _policy_header not in ("auto", "default", "none"):
+            eng._forced_prefill_policy_once = _policy_header
+            print(
+                f"[http-debug] forced-prefill-policy={_policy_header} for this request",
+                flush=True,
+            )
+        elif body.get("prefill_policy"):
+            _p = str(body.get("prefill_policy")).strip().lower()
+            if _p not in ("auto", "default", "none"):
+                eng._forced_prefill_policy_once = _p
+                print(
+                    f"[http-debug] forced-prefill-policy={_p} (from body) for this request",
+                    flush=True,
+                )
+
         messages = copy.deepcopy(body.get("messages") or [])
         tools = body.get("tools")
         if tools and messages:
@@ -425,6 +496,8 @@ class Handler(BaseHTTPRequestHandler):
             out["choices"][0]["message"]["reasoning_content"] = msg["reasoning_content"]
         if isinstance(msg, dict) and msg.get("tool_calls"):
             out["choices"][0]["message"]["tool_calls"] = msg["tool_calls"]
+        if getattr(eng, "last_policy_decision", None) is not None:
+            out["prefill_policy"] = eng.last_policy_decision.to_dict()
         self._json(200, out, t0=t0, is_stream=False)
 
     # ------------------------------------------------ raw completions
