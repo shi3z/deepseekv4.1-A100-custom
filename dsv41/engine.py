@@ -1055,6 +1055,7 @@ class Engine:
         total = 0
         allocated_total = 0
         inventory = []
+        _n_seq_rows = int(getattr(self, "max_seqs", 0) or getattr(getattr(self.model, "args", None), "max_seqs", 0) or 0)
 
         for slot_no, (kind, holder, key, src) in enumerate(slots):
 
@@ -1106,6 +1107,12 @@ class Engine:
                     save_src = src[:, :rows].contiguous()
             elif src.ndim >= 2 and (key == "window_kv_cache" or (isinstance(key, str) and "window_kv" in key)) and src.shape[1] > 128:
                 save_src = src[:, :128].contiguous()
+
+            # Only sequence row 0 (the prefill scratchpad) belongs to the prefix being snapshotted.
+            # Rows 1..max_seqs-1 are the live decode slots: saving and later restoring them wrote
+            # old requests' KV over whatever was generating at restore time (prompt cross-talk).
+            if save_src.ndim >= 2 and save_src.shape[0] == _n_seq_rows and save_src.shape[0] > 1:
+                save_src = save_src[:1].contiguous()
 
             nbytes = save_src.numel() * save_src.element_size()
             total += nbytes
@@ -1169,8 +1176,9 @@ class Engine:
 
     @torch.inference_mode()
     def _restore_prefix_state(self, snap):
-        """Restore a previously captured attention-cache snapshot."""
+        """Restore a previously captured attention-cache snapshot (into sequence row 0 only)."""
         touched = set()
+        _n_seq_rows = int(getattr(self, "max_seqs", 0) or getattr(getattr(self.model, "args", None), "max_seqs", 0) or 0)
 
         try:
             for kind, holder, key, src in snap:
@@ -1229,6 +1237,14 @@ class Engine:
                         f"src={tuple(src.shape)} "
                         f"dst={tuple(dst.shape)}"
                     )
+
+                # Snapshots written before the row-0 rule (and any tmpfs entry from then) carry all
+                # sequence rows: restore only row 0, never the live decode slots.
+                if (
+                    src.ndim >= 2 and dst.ndim >= 2 and src.shape[0] > 1
+                    and dst.shape[0] == _n_seq_rows and src.shape[0] == dst.shape[0]
+                ):
+                    src = src[:1]
 
                 try:
                     if (

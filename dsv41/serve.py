@@ -254,7 +254,11 @@ class Handler(BaseHTTPRequestHandler):
                 rf_type = body.get("response_format", {}).get("type")
                 has_rf_schema = rf_type == "json_schema" and "schema" in body.get("response_format", {}).get("json_schema", {})
                 if body.get("jev") or body.get("mode") == "jev" or has_rf_schema or body.get("schema"):
-                    return self._jev(body)
+                    if os.environ.get("DSV41_JEV", "0") == "1":
+                        return self._jev(body)
+                    # Jev is disabled (its batched scoring shared cache rows with the live decode
+                    # slots): answer schema requests with ordinary generation, asking for JSON.
+                    body = self._jev_to_chat(body)
             if self.path == "/v1/chat/completions":
                 return self._chat(body)
             if self.path == "/v1/completions":
@@ -657,6 +661,28 @@ class Handler(BaseHTTPRequestHandler):
                           "usage": {"prompt_tokens": len(ids), "completion_tokens": n, "total_tokens": len(ids) + n}}, t0=t0, is_stream=False, ka=ka)
 
     # ---------------------------------------------------------------- Jev mode structured output
+    def _jev_to_chat(self, body: dict) -> dict:
+        schema = body.get("schema")
+        if not schema and isinstance(body.get("response_format"), dict):
+            schema = (body["response_format"].get("json_schema") or {}).get("schema")
+        hint = "Respond with a single JSON object only, no prose and no code fence."
+        if schema:
+            hint += " It must match this JSON schema: " + json.dumps(schema, ensure_ascii=False)
+        body = dict(body)
+        msgs = list(body.get("messages") or [])
+        if not msgs and body.get("prompt"):
+            msgs = [{"role": "user", "content": str(body["prompt"])}]
+        if msgs and msgs[0].get("role") == "system" and isinstance(msgs[0].get("content"), str):
+            msgs[0] = {"role": "system", "content": msgs[0]["content"] + "\n\n" + hint}
+        else:
+            msgs.insert(0, {"role": "system", "content": hint})
+        body["messages"] = msgs
+        body.pop("schema", None)
+        body.pop("jev", None)
+        body.pop("response_format", None)
+        print(f"[jev] disabled: schema request answered by plain generation ({len(msgs)} messages)", flush=True)
+        return body
+
     def _jev(self, body: dict):
         eng = ENGINE
         t0 = time.perf_counter()
@@ -912,7 +938,8 @@ def main():
     STATS_TRACKER = StatsTracker(active_devices=dev_list)
     ENGINE.stats_tracker = STATS_TRACKER
     try:
-        ENGINE.jev_engine.prefix_tree.init_system_prompt()
+        if os.environ.get("DSV41_JEV", "0") == "1":
+            ENGINE.jev_engine.prefix_tree.init_system_prompt()
     except Exception as e:
         print(f"[jev-init] Note: Jev system prompt prefill deferred ({e})", flush=True)
     ThreadingHTTPServer.request_queue_size = 128

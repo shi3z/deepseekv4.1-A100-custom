@@ -31,6 +31,9 @@ export DSV41_EP_COMPACT_XQ=1
 export DSV41_GPU_SLOT_CACHE=1
 export DSV41_PREFIX_DEDUP_MIRRORS=1
 export DSV41_CED=1
+# Jev structured-output engine and its external policy API are off (user decision 2026-09-25)
+export DSV41_JEV=0
+export DSV41_ENABLE_JEV_POLICY=0
 
 # Repetition & Stability Safeguards
 export DSV41_REPETITION_PENALTY=1.05
