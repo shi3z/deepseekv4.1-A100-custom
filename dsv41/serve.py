@@ -71,6 +71,56 @@ def _params(body: dict) -> GenParams:
     )
 
 
+class _KeepAlive:
+    """Writes a heartbeat to the client socket every `interval` seconds while the handler waits
+    for the engine. A queued request otherwise sends no bytes until its first token, and clients
+    behind a read timeout drop the connection while the backend is busy. All writes to the
+    socket go through write() so heartbeats never interleave with response data."""
+
+    def __init__(self, wfile, payload: bytes, interval: float):
+        self.wfile, self.payload, self.interval = wfile, payload, interval
+        self.lock = threading.Lock()
+        self.stop = threading.Event()
+        self.dead = False
+        self.beats = 0
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        if self.interval > 0:
+            self.thread.start()
+        return self
+
+    def _run(self):
+        while not self.stop.wait(self.interval):
+            with self.lock:
+                if self.stop.is_set():
+                    return
+                try:
+                    self.wfile.write(self.payload)
+                    self.wfile.flush()
+                    self.beats += 1
+                except Exception:
+                    self.dead = True
+                    return
+
+    def write(self, data: bytes):
+        with self.lock:
+            self.wfile.write(data)
+            self.wfile.flush()
+
+    def close(self):
+        self.stop.set()
+        with self.lock:  # let an in-flight heartbeat finish before the caller writes again
+            pass
+
+
+def _heartbeat_interval() -> float:
+    try:
+        return float(os.environ.get("DSV41_HTTP_HEARTBEAT_S", "5"))
+    except ValueError:
+        return 5.0
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -79,7 +129,41 @@ class Handler(BaseHTTPRequestHandler):
             return
         print(f"[{time.strftime('%H:%M:%S')}] {self.address_string()} {fmt % args}", flush=True)
 
-    def _json(self, code: int, obj: dict, t0: float | None = None, is_stream: bool = False):
+    # ---- keep-alive for blocking (non-stream) JSON responses ---------------------------
+    # The 200 header goes out immediately with chunked transfer encoding; while the engine works,
+    # a chunk holding one space is sent every few seconds (JSON parsers ignore leading whitespace),
+    # then the JSON body and the chunked terminator. Errors after that point can only be reported
+    # in the body (the status line is already sent).
+    def _begin_json_keepalive(self):
+        interval = _heartbeat_interval()
+        if interval <= 0 or os.environ.get("DSV41_HTTP_HEARTBEAT_NONSTREAM", "1") == "0":
+            return None
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return None
+        return _KeepAlive(self.wfile, b"1\r\n \r\n", interval).start()
+
+    def _end_json_keepalive(self, ka, obj: dict, t0: float | None = None):
+        data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        ka.close()
+        try:
+            ka.write(f"{len(data):x}\r\n".encode() + data + b"\r\n0\r\n\r\n")
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            elapsed_str = f" elapsed={time.perf_counter()-t0:.3f}s" if t0 is not None else ""
+            print(f"[http] client disconnected before response completed{elapsed_str} bytes={len(data)} stream=False heartbeats={ka.beats}", flush=True)
+            if STATS_TRACKER:
+                STATS_TRACKER.record_disconnect()
+        except Exception as e:
+            print(f"[http] response write error: {e}", flush=True)
+
+    def _json(self, code: int, obj: dict, t0: float | None = None, is_stream: bool = False, ka=None):
+        if ka is not None:
+            return self._end_json_keepalive(ka, obj, t0=t0)
         data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         try:
             self.send_response(code)
@@ -324,6 +408,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "close")
             self.end_headers()
+            ka = _KeepAlive(self.wfile, b": keep-alive\n\n", _heartbeat_interval()).start()
 
             if STATS_TRACKER:
                 STATS_TRACKER.record_request_start(len(ids), stream=True)
@@ -344,8 +429,7 @@ class Handler(BaseHTTPRequestHandler):
                     ],
                 }
                 payload = "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
-                self.wfile.write(payload.encode("utf-8"))
-                self.wfile.flush()
+                ka.write(payload.encode("utf-8"))
 
             in_thinking = False
             has_dsml = False
@@ -422,13 +506,12 @@ class Handler(BaseHTTPRequestHandler):
                     finish = "stop"
 
                 chunk({}, finish)
-                self.wfile.write(b"data: [DONE]\n\n")
-                self.wfile.flush()
+                ka.write(b"data: [DONE]\n\n")
                 self.close_connection = True
 
             except (BrokenPipeError, ConnectionResetError):
                 elapsed = time.perf_counter() - t0
-                print(f"[http] client disconnected during chat stream elapsed={elapsed:.3f}s tokens={n}", flush=True)
+                print(f"[http] client disconnected during chat stream elapsed={elapsed:.3f}s tokens={n} heartbeats={ka.beats}", flush=True)
                 if STATS_TRACKER:
                     STATS_TRACKER.record_disconnect()
                 return
@@ -436,8 +519,7 @@ class Handler(BaseHTTPRequestHandler):
                 torch.cuda.empty_cache()
                 try:
                     err_obj = {"error": {"message": f"CUDA out of memory: {e}", "type": "cuda_out_of_memory"}}
-                    self.wfile.write(f"data: {json.dumps(err_obj)}\n\ndata: [DONE]\n\n".encode())
-                    self.wfile.flush()
+                    ka.write(f"data: {json.dumps(err_obj)}\n\ndata: [DONE]\n\n".encode())
                 except Exception:
                     pass
                 return
@@ -450,11 +532,12 @@ class Handler(BaseHTTPRequestHandler):
                     pass
                 try:
                     err_obj = {"error": {"message": str(e), "type": "generation_error", "traceback": tb}}
-                    self.wfile.write(f"data: {json.dumps(err_obj)}\n\ndata: [DONE]\n\n".encode())
-                    self.wfile.flush()
+                    ka.write(f"data: {json.dumps(err_obj)}\n\ndata: [DONE]\n\n".encode())
                 except Exception:
                     pass
                 return
+            finally:
+                ka.close()
 
             dt_gen = time.perf_counter() - t_gen_0
             decode_tok_s = getattr(eng, "last_decode_tok_s", None) or (n / max(dt_gen, 1e-6))
@@ -468,6 +551,7 @@ class Handler(BaseHTTPRequestHandler):
         if STATS_TRACKER:
             STATS_TRACKER.record_request_start(len(ids), stream=False)
         t_gen_0 = time.perf_counter()
+        ka = self._begin_json_keepalive()
         try:
             text, n = eng.generate_text(ids, params, images=images, token_types=token_types)
         except Exception as e:
@@ -477,7 +561,7 @@ class Handler(BaseHTTPRequestHandler):
                 Path("/tmp/dsv41-last-traceback.log").write_text(tb)
             except Exception:
                 pass
-            return self._json(500, {"error": {"message": str(e), "type": "server_error", "traceback": tb}}, t0=t0, is_stream=False)
+            return self._json(500, {"error": {"message": str(e), "type": "server_error", "traceback": tb}}, t0=t0, is_stream=False, ka=ka)
         dt_gen = time.perf_counter() - t_gen_0
         decode_tok_s = getattr(eng, "last_decode_tok_s", None) or (n / max(dt_gen, 1e-6))
         print(f"[chat] END req_id={rid} tokens={n} time={dt_gen:.2f}s ({decode_tok_s:.1f} tok/s decode)", flush=True)
@@ -498,7 +582,7 @@ class Handler(BaseHTTPRequestHandler):
             out["choices"][0]["message"]["tool_calls"] = msg["tool_calls"]
         if getattr(eng, "last_policy_decision", None) is not None:
             out["prefill_policy"] = eng.last_policy_decision.to_dict()
-        self._json(200, out, t0=t0, is_stream=False)
+        self._json(200, out, t0=t0, is_stream=False, ka=ka)
 
     # ------------------------------------------------ raw completions
     def _completion(self, body: dict):
@@ -522,17 +606,16 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
+            ka = _KeepAlive(self.wfile, b": keep-alive\n\n", _heartbeat_interval()).start()
             n = 0
             t_gen_0 = time.perf_counter()
             try:
                 for _, piece in eng.generate(ids, params, images=images, token_types=token_types):
                     obj = {"id": rid, "object": "text_completion", "created": created, "model": body.get("model") or eng.model_name,
                            "choices": [{"index": 0, "text": piece, "finish_reason": None}]}
-                    self.wfile.write(f"data: {json.dumps(obj, ensure_ascii=False)}\n\n".encode())
-                    self.wfile.flush()
+                    ka.write(f"data: {json.dumps(obj, ensure_ascii=False)}\n\n".encode())
                     n += 1
-                self.wfile.write(b"data: [DONE]\n\n")
-                self.wfile.flush()
+                ka.write(b"data: [DONE]\n\n")
                 dt_gen = time.perf_counter() - t_gen_0
                 decode_tok_s = getattr(eng, "last_decode_tok_s", None) or (n / max(dt_gen, 1e-6))
                 if STATS_TRACKER and n > 0:
@@ -542,13 +625,16 @@ class Handler(BaseHTTPRequestHandler):
                     )
             except (BrokenPipeError, ConnectionResetError):
                 elapsed = time.perf_counter() - t0
-                print(f"[http] client disconnected during completion stream elapsed={elapsed:.3f}s tokens={n}", flush=True)
+                print(f"[http] client disconnected during completion stream elapsed={elapsed:.3f}s tokens={n} heartbeats={ka.beats}", flush=True)
                 if STATS_TRACKER:
                     STATS_TRACKER.record_disconnect()
+            finally:
+                ka.close()
             return
         if STATS_TRACKER:
             STATS_TRACKER.record_request_start(len(ids), stream=False)
         t_gen_0 = time.perf_counter()
+        ka = self._begin_json_keepalive()
         try:
             text, n = eng.generate_text(ids, params, images=images, token_types=token_types)
         except Exception as e:
@@ -558,7 +644,7 @@ class Handler(BaseHTTPRequestHandler):
                 Path("/tmp/dsv41-last-traceback.log").write_text(tb)
             except Exception:
                 pass
-            return self._json(500, {"error": {"message": str(e), "type": "server_error", "traceback": tb}}, t0=t0, is_stream=False)
+            return self._json(500, {"error": {"message": str(e), "type": "server_error", "traceback": tb}}, t0=t0, is_stream=False, ka=ka)
         dt_gen = time.perf_counter() - t_gen_0
         decode_tok_s = getattr(eng, "last_decode_tok_s", None) or (n / max(dt_gen, 1e-6))
         if STATS_TRACKER and n > 0:
@@ -568,7 +654,7 @@ class Handler(BaseHTTPRequestHandler):
             )
         self._json(200, {"id": rid, "object": "text_completion", "created": created, "model": body.get("model") or eng.model_name,
                           "choices": [{"index": 0, "text": text, "finish_reason": "length" if (getattr(eng, "last_finish_reason", None) == "length" or n >= params.max_new_tokens) else "stop"}],
-                          "usage": {"prompt_tokens": len(ids), "completion_tokens": n, "total_tokens": len(ids) + n}}, t0=t0, is_stream=False)
+                          "usage": {"prompt_tokens": len(ids), "completion_tokens": n, "total_tokens": len(ids) + n}}, t0=t0, is_stream=False, ka=ka)
 
     # ---------------------------------------------------------------- Jev mode structured output
     def _jev(self, body: dict):
@@ -731,12 +817,13 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         # Non-streaming response
+        ka = self._begin_json_keepalive()
         try:
             assembled, metrics = eng.jev_inference(prompt, raw_schema, max_batch=max_batch)
         except Exception as e:
             tb = traceback.format_exc()
             print(f"[jev-error] {e}\n{tb}", flush=True)
-            return self._json(500, {"error": str(e), "traceback": tb}, t0=t0, is_stream=False)
+            return self._json(500, {"error": str(e), "traceback": tb}, t0=t0, is_stream=False, ka=ka)
 
         json_content = json.dumps(assembled, ensure_ascii=False)
         dt_total = time.perf_counter() - t0
@@ -778,7 +865,7 @@ class Handler(BaseHTTPRequestHandler):
             "jev_result": assembled,
             "jev_metrics": metrics,
         }
-        return self._json(200, resp, t0=t0, is_stream=False)
+        return self._json(200, resp, t0=t0, is_stream=False, ka=ka)
 
 
 def main():

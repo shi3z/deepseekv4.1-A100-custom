@@ -430,6 +430,12 @@ class Engine:
         return self._jev_engine
 
     def jev_inference(self, prompt: str, schema: dict, max_batch: int = 32) -> tuple[dict, dict]:
+        # The Jev engine restores its request KV into cache rows 0..B-1 and scores B fields in one
+        # batched forward. Rows 1..max_seqs-1 are the live decode slots of the batched engine, so
+        # anything above one row overwrote other requests' caches mid-generation (prompt
+        # cross-talk). Score on row 0 (the prefill scratchpad) only, and forget what slot 0 held
+        # afterwards so the GPU-slot prefix reuse cannot pick up the Jev prompt's KV.
+        max_batch = max(1, min(int(max_batch), int(os.environ.get("DSV41_JEV_ROWS", "1"))))
         with self.lock:
             self.current_phase = "jev"
             try:
@@ -448,6 +454,10 @@ class Engine:
                 return assembled, metrics
             finally:
                 self.current_phase = "idle"
+                with getattr(self, "_slot_tokens_lock", threading.Lock()):
+                    if hasattr(self, "_slot_tokens"):
+                        self._slot_tokens.pop(0, None)
+                self._slot_window_log.pop(0, None)
 
     def get_cache_stats(self) -> dict:
         try:
