@@ -127,3 +127,195 @@ fp8_gemv_m1_k##KW##u##U(const __nv_bfloat16* __restrict__ X, int ldx, const uint
 DEF(1, 4) DEF(2, 4) DEF(4, 4) DEF(8, 4)
 DEF(1, 8) DEF(2, 8) DEF(4, 8) DEF(8, 8)
 DEF(1, 2) DEF(2, 2) DEF(4, 2) DEF(8, 2)
+
+// ---------------------------------------------------------------------------------------------------------------
+// Variant with the activation prologue fused (DSV41_FUSED_DENSE_CHAIN): the raw input vector x_raw (bf16 [K], the
+// previous GEMV's output) is normalized and/or fp8-fake-quantized by every block into shared memory before its
+// rows are streamed, replacing the separate `norm_quant` (q_norm before wq_b) / `fake_quant` (before wo_b) launch.
+//   MODE 1: y = bf16( x * rsqrt(mean(x^2) + eps) * w );  then per-32 fp8 fake quant   (fused2._norm_quant_kernel)
+//   MODE 2: per-32 fp8 fake quant only                                                (fused._fake_quant_kernel, MODE 0)
+// Both round exactly as the Triton kernels: amax >= 1e-4, s = 2^ceil(log2(amax / 448)), e4m3 round-to-nearest-even
+// of clamp(x / s, +-448), y = q * s -> bf16 (s and the e4m3 ulp are powers of two, so x * (1/s) == x / s exactly).
+// K <= 2048 for MODE 1 / 8192 for MODE 2 (K * 2 bytes of dynamic shared memory).
+// The prologue is replicated by every block: every lane loads all of its elements up front (one dependent memory
+// round trip) and the first U weight loads of every warp are issued before the prologue so the DRAM stream starts
+// while the block is still rounding. MODE 1 spreads the work over all 8 warps (element-parallel, amax by shuffles),
+// MODE 2 (K up to 8192) uses one lane per group; each layout measured fastest for its shape (wq_b / wo_b).
+__device__ __forceinline__ float pow2_ceil_log2_f(float a) {
+    const int bits = __float_as_int(a);
+    int e = ((bits >> 23) & 0xFF) - 127;
+    if (bits & 0x7FFFFF) e += 1;
+    return __int_as_float((e + 127) << 23);
+}
+__device__ __forceinline__ float round_e4m3_f(float v) {
+    float a = fabsf(v);
+    int e = ((__float_as_int(a) >> 23) & 0xFF) - 127;
+    e = max(e, -6);
+    const float ulp = __int_as_float((e - 3 + 127) << 23), inv_ulp = __int_as_float((3 - e + 127) << 23);
+    float r = rintf(a * inv_ulp) * ulp;
+    r = fminf(r, 448.f);
+    return v < 0.f ? -r : r;
+}
+
+template <int KW, int U, int MODE>
+__device__ __forceinline__ void fp8_gemv_m1_pre_body(const __nv_bfloat16* __restrict__ Xraw, const __nv_bfloat16* __restrict__ NW, float eps,
+        const uint8_t* __restrict__ W, const uint8_t* __restrict__ S, int N, int K, int Kc, __nv_bfloat16* __restrict__ y, float* __restrict__ yf)
+{
+    constexpr int WARPS = 8, RB = WARPS / KW;
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    __nv_bfloat16* xs = reinterpret_cast<__nv_bfloat16*>(smem_raw);   // [K] the prologue's output
+    __shared__ float red[WARPS];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int n = blockIdx.x * RB + warp / KW;
+    const int kw = warp % KW;
+    const uint8_t* wrow = W + (long long)n * K;
+    const uint8_t* srow = S + (long long)(n >> 5) * Kc;
+    const int chunks = K / 16, per = chunks / KW, c0 = kw * per, cend = c0 + per;
+    // ---- first U weight loads in flight before the prologue
+    uint4 wv[U]; int sb[U];
+    int base = c0 + lane;
+#pragma unroll
+    for (int u = 0; u < U; ++u) {
+        const int c = base + 32 * u;
+        const bool ok = n < N && c < cend;
+        wv[u] = ok ? __ldg(reinterpret_cast<const uint4*>(wrow + (long long)c * 16)) : make_uint4(0, 0, 0, 0);
+        sb[u] = ok ? __ldg(srow + (c >> 1)) : 0;
+    }
+    // ---- prologue. It is replicated by every block and the per-row GEMV work is small (K/16/32 chunks per lane), so
+    // it is issue-bound, not latency-bound (ncu, wq_b shape: 1.65M -> 4.27M instructions): keep it short.
+    if (MODE == 1) {
+        // element-parallel over all 256 lanes: warp w handles 32-groups w, w+8, ..., lane l the group's element l
+        // (one coalesced 64-byte load per warp per group, all loads in flight at once, amax by 5 shuffles per group
+        // with the GB chains interleaved). K <= 32 * 8 * GB = 2048. The block-wide sum of squares comes first.
+        constexpr int GB = 8;
+        const int ngroups = K / 32;
+        float v[GB], nw[GB];
+#pragma unroll
+        for (int i = 0; i < GB; ++i) {
+            const int g = warp + WARPS * i;
+            const bool ok = g < ngroups;
+            v[i] = ok ? __bfloat162float(Xraw[g * 32 + lane]) : 0.f;
+            nw[i] = ok ? __bfloat162float(NW[g * 32 + lane]) : 0.f;
+        }
+        float ss = 0.f;
+#pragma unroll
+        for (int i = 0; i < GB; ++i) ss = fmaf(v[i], v[i], ss);
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+        if (lane == 0) red[warp] = ss;
+        __syncthreads();
+        float tot = 0.f;
+#pragma unroll
+        for (int w = 0; w < WARPS; ++w) tot += red[w];
+        const float rs = 1.f / sqrtf(tot / (float)K + eps);
+        float amax[GB];
+#pragma unroll
+        for (int i = 0; i < GB; ++i) { v[i] = __bfloat162float(__float2bfloat16(v[i] * rs * nw[i])); amax[i] = fabsf(v[i]); }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+#pragma unroll
+            for (int i = 0; i < GB; ++i) amax[i] = fmaxf(amax[i], __shfl_xor_sync(0xffffffffu, amax[i], o));
+        }
+#pragma unroll
+        for (int i = 0; i < GB; ++i) {
+            const int g = warp + WARPS * i;
+            if (g < ngroups) {
+                const float s = pow2_ceil_log2_f(__fdiv_rn(fmaxf(amax[i], 1e-4f), 448.f));
+                const float q = round_e4m3_f(fminf(fmaxf(v[i] * (1.f / s), -448.f), 448.f));   // 1/s exact (power of two)
+                xs[g * 32 + lane] = __float2bfloat16(q * s);
+            }
+        }
+    } else {
+        // one lane per 32-group (K <= 8192): four independent 16-byte loads, amax in registers, no shuffles
+        const int g = threadIdx.x;
+        if (g < K / 32) {
+            const uint4* src = reinterpret_cast<const uint4*>(Xraw + g * 32);
+            uint4 raw[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) raw[j] = __ldg(src + j);
+            float v[32];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const uint32_t rr[4] = {raw[j].x, raw[j].y, raw[j].z, raw[j].w};
+#pragma unroll
+                for (int i = 0; i < 4; ++i) { const float2 f = bf16x2_to_float2(rr[i]); v[j * 8 + i * 2] = f.x; v[j * 8 + i * 2 + 1] = f.y; }
+            }
+            float amax = 1e-4f;
+#pragma unroll
+            for (int i = 0; i < 32; ++i) amax = fmaxf(amax, fabsf(v[i]));
+            const float s = pow2_ceil_log2_f(__fdiv_rn(amax, 448.f));
+            const float inv_s = 1.f / s;   // power of two: exact
+            uint4* dst = reinterpret_cast<uint4*>(xs + g * 32);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                uint32_t o[4];
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const float q0 = round_e4m3_f(fminf(fmaxf(v[j * 8 + i * 2] * inv_s, -448.f), 448.f));
+                    const float q1 = round_e4m3_f(fminf(fmaxf(v[j * 8 + i * 2 + 1] * inv_s, -448.f), 448.f));
+                    const __nv_bfloat162 b = __floats2bfloat162_rn(q0 * s, q1 * s);
+                    o[i] = *reinterpret_cast<const uint32_t*>(&b);
+                }
+                dst[j] = make_uint4(o[0], o[1], o[2], o[3]);
+            }
+        }
+    }
+    __syncthreads();
+    // ---- GEMV from shared memory (fp8_gemv_m1_body's loop, software-pipelined by one step)
+    float acc = 0.f;
+    if (n < N) {
+        float acc_u[U];
+#pragma unroll
+        for (int u = 0; u < U; ++u) acc_u[u] = 0.f;
+        for (; base < cend; base += 32 * U) {
+            uint4 wn[U]; int sn[U];
+            const int nb = base + 32 * U;
+#pragma unroll
+            for (int u = 0; u < U; ++u) {
+                const int c = nb + 32 * u;
+                const bool ok = c < cend;
+                wn[u] = ok ? __ldg(reinterpret_cast<const uint4*>(wrow + (long long)c * 16)) : make_uint4(0, 0, 0, 0);
+                sn[u] = ok ? __ldg(srow + (c >> 1)) : 0;
+            }
+#pragma unroll
+            for (int u = 0; u < U; ++u) {
+                const int c = base + 32 * u;
+                if (c < cend) {
+                    const uint4 xa = *reinterpret_cast<const uint4*>(xs + c * 16);
+                    const uint4 xb = *reinterpret_cast<const uint4*>(xs + c * 16 + 8);
+                    const float d = chunk_dot(wv[u], xa, xb);
+                    const float sc = (sb[u] + 120 > 0 && sb[u] + 120 < 255) ? __uint_as_float((uint32_t)(sb[u] + 120) << 23) : 0.f;
+                    acc_u[u] = fmaf(d, sc, acc_u[u]);
+                }
+            }
+#pragma unroll
+            for (int u = 0; u < U; ++u) { wv[u] = wn[u]; sb[u] = sn[u]; }
+        }
+#pragma unroll
+        for (int u = 0; u < U; ++u) acc += acc_u[u];
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+    __syncthreads();   // red[] was the prologue's reduction buffer
+    if (lane == 0) red[warp] = acc;
+    __syncthreads();
+    if (threadIdx.x < RB) {
+        const int nn = blockIdx.x * RB + threadIdx.x;
+        if (nn < N) {
+            float s = 0.f;
+#pragma unroll
+            for (int j = 0; j < KW; ++j) s += red[threadIdx.x * KW + j];
+            if (y) y[nn] = __float2bfloat16(s);
+            if (yf) yf[nn] = s;
+        }
+    }
+}
+
+#define DEFP(KW, U, MODE) \
+extern "C" __global__ void __launch_bounds__(256) \
+fp8_gemv_m1_pre##MODE##_k##KW##u##U(const __nv_bfloat16* __restrict__ Xraw, const __nv_bfloat16* __restrict__ NW, float eps, \
+                        const uint8_t* __restrict__ W, const uint8_t* __restrict__ S, int N, int K, int Kc, __nv_bfloat16* __restrict__ y, float* __restrict__ yf) \
+{ fp8_gemv_m1_pre_body<KW, U, MODE>(Xraw, NW, eps, W, S, N, K, Kc, y, yf); }
+
+DEFP(1, 4, 1) DEFP(1, 2, 1) DEFP(2, 2, 1) DEFP(4, 4, 1)
+DEFP(1, 4, 2) DEFP(1, 2, 2) DEFP(2, 2, 2) DEFP(4, 4, 2)

@@ -131,6 +131,34 @@ def fp8_gemv_m1(x: torch.Tensor, w8: torch.Tensor, s8: torch.Tensor, group_cols:
             ctypes.c_void_p(out.data_ptr()), ctypes.c_void_p(0)]
     launch(f, ((N + RB - 1) // RB, 1, 1), (256, 1, 1), args, x.device)
     return out
+FUSED_DENSE_CHAIN = int(os.environ.get("DSV41_FUSED_DENSE_CHAIN", "0"))  # 1: [wq_a; wkv] concatenated GEMV; 2: + fake-quant fused into wo_b; 3: + q_norm fused into wq_b (slower, record only)
+
+
+def fp8_gemv_m1_pre(x_raw: torch.Tensor, w8: torch.Tensor, s8: torch.Tensor, norm_w: torch.Tensor | None, eps: float, mode: int,
+                    out: torch.Tensor | None = None) -> torch.Tensor:
+    """One-row FP8 GEMV with the activation prologue fused (cuda/fp8_gemv_m1.cu, results/dense_chain_report.md):
+    mode 1 = rmsnorm(x_raw) * norm_w then per-32 fp8 fake quant (replaces fused2.norm_quant), mode 2 = fake quant
+    only (replaces fused.fake_quant_fp8); x_raw bf16 [1, K] (K <= 2048 / 8192; a row prefix view is fine), result bf16 [1, N]."""
+    K = x_raw.shape[-1]
+    N = w8.shape[0]
+    assert K % 32 == 0 and K <= (2048 if mode == 1 else 8192) and x_raw.stride(-1) == 1 and x_raw.data_ptr() % 16 == 0
+    KW = 1 if N >= 4096 else 2 if N >= 1024 else 4
+    while K % (16 * KW) != 0 and KW > 1:
+        KW //= 2
+    U = 4 if K <= 2048 else 2
+    if (KW, U) not in ((1, 4), (1, 2), (2, 2), (4, 4)):
+        KW, U = (1, 2)
+    RB = 8 // KW
+    if out is None:
+        out = torch.empty(1, N, device=x_raw.device, dtype=torch.bfloat16)
+    f = get_function("fp8_gemv_m1.cu", f"fp8_gemv_m1_pre{mode}_k{KW}u{U}", x_raw.device)
+    args = [ctypes.c_void_p(x_raw.data_ptr()), ctypes.c_void_p(norm_w.data_ptr() if norm_w is not None else 0), ctypes.c_float(float(eps)),
+            ctypes.c_void_p(w8.data_ptr()), ctypes.c_void_p(s8.data_ptr()), ctypes.c_int(N), ctypes.c_int(K), ctypes.c_int(s8.shape[1]),
+            ctypes.c_void_p(out.data_ptr()), ctypes.c_void_p(0)]
+    launch(f, ((N + RB - 1) // RB, 1, 1), (256, 1, 1), args, x_raw.device, shared=K * 2)
+    return out
+
+
 _attr_done: set = set()  # experiment: force the split-K factor
 
 

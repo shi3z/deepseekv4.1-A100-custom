@@ -231,9 +231,12 @@ if a.check_tokens:
             print(f"[check] first divergent layer {first_div}; per-layer max|dh| {[round(v, 4) for v in per_layer]}", flush=True)
             if first_hits is not None:
                 print(f"[check] replica hits per layer at step 0: {first_hits}", flush=True)
-        res["first_step_logits"] = {"max_abs_diff": diff.max().item(), "mean_abs_diff": diff.mean().item(),
+        fl = res["first_step_logits"] = {"max_abs_diff": diff.max().item(), "mean_abs_diff": diff.mean().item(), "rms_diff": diff.float().pow(2).mean().sqrt().item(),
+                                    "rms_ref": rl.float().pow(2).mean().sqrt().item(),
+                                    "cosine": torch.nn.functional.cosine_similarity(rl.float().flatten(), first_logits.float().flatten(), dim=0).item(),
                                     "ref_absmax": rl.abs().max().item(), "argmax_same": bool((rl.argmax(-1) == first_logits.argmax(-1)).all()),
                                     "top1_margin_ref": [float(v) for v in (rl.topk(2, dim=-1).values[:, 0] - rl.topk(2, dim=-1).values[:, 1])]}
+        print(f"[check] first-step logits: max|d| {fl['max_abs_diff']:.4g} rms(d) {fl['rms_diff']:.4g} rms(ref) {fl['rms_ref']:.4g} cosine {fl['cosine']:.8f} argmax_same {fl['argmax_same']}; tokens same {res['token_match']['same']} of {res['token_match']['of']} first_diff {res['token_match']['first_diff']}", flush=True)
 print(json.dumps(res, ensure_ascii=False), flush=True)
 print(f"[bench] {res['label']} S={S}: {res['tok_s']:.1f} tok/s, {ms_tok:.2f} ms/step; sample: {tok.decode(toks[0][:30]).replace(chr(10), ' ')[:120]!r}")
 os.makedirs(os.path.dirname(a.log) or ".", exist_ok=True)

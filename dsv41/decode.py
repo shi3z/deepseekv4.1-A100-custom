@@ -19,7 +19,7 @@ from .cukern import fp4_gemm_tc, fp4_gemv_pairs as cukern_fp4
 from .fused import fake_quant_fp4, fake_quant_fp8, rmsnorm, rope_dev_, sparse_attn_decode_split as sparse_attn_decode2, swiglu_quant
 from .fused2 import gate_topk, hc_mix, hc_post2_, hc_pre_norm_quant, hc_pre_norm_quant2, hc_sinkhorn, kv_write, norm_quant, sattn2
 from .model import Attention, Block, Transformer, _hc_post, _hc_pre, linear_fp8, select_candidate_blocks
-from .w8 import linear_w, oproj_a
+from .w8 import W8, linear_w, oproj_a
 
 FUSED2 = os.environ.get("DSV41_FUSED2", "1") == "1"
 INDEX_FAST = os.environ.get("DSV41_INDEX_FAST", "0") == "1"  # fused indexer score + top-k (fused3.py, results/dense_m1_report.md rank 3)
@@ -94,10 +94,30 @@ class DecodeRuntime:
         B = x.shape[0]
         pos, seq, pmax = self.pos[d], self.seq[d], self.pmax[d]
         rd, eps = self.rd, A.eps
-        qr = norm_quant(linear_w(xq, A.wq_a), A.q_norm_w, eps)  # q_norm output, already fp8-rounded for wq_b / indexer
-        q = linear_w(qr, A.wq_b).view(B, 1, A.n_heads, A.head_dim)
-        rope_dev_(q, rd, A.cos, A.sin, pos)
-        kv_write(linear_w(xq, A.wkv), A.kv_norm_w, A.cos, A.sin, pos, A.window_kv_cache, rd, eps, seq)
+        fused_chain = cukern.FUSED_DENSE_CHAIN > 0 and B == 1 and isinstance(A.wq_a, W8) and isinstance(A.wkv, W8) and isinstance(A.wq_b, W8)
+        if fused_chain:
+            # DSV41_FUSED_DENSE_CHAIN >= 1 (results/dense_chain_report.md): [wq_a; wkv] as one GEMV over the shared input
+            # (one launch instead of two, xq read once). >= 3 additionally does q_norm + fp8 rounding in wq_b's prologue
+            # (no norm_quant launch) -- measured slower at wq_b's real shape (32768 x 1280), kept for the record.
+            wqkv = getattr(A, "_wqkv", None)
+            if wqkv is None:
+                wqkv = A._wqkv = W8.cat([A.wq_a, A.wkv])
+            qk = cukern.fp8_gemv_m1(xq.contiguous(), wqkv.w8, wqkv.s8)  # bf16 [1, 1280 + 512]
+            n_q = A.wq_a.shape[0]
+            qr_raw, kv_raw = qk[:, :n_q], qk[:, n_q:]
+            if cukern.FUSED_DENSE_CHAIN >= 3:
+                q = cukern.fp8_gemv_m1_pre(qr_raw, A.wq_b.w8, A.wq_b.s8, A.q_norm_w, eps, 1).view(B, 1, A.n_heads, A.head_dim)
+                qr = norm_quant(qr_raw, A.q_norm_w, eps) if A.is_index_source else None  # the indexer's copy
+            else:
+                qr = norm_quant(qr_raw, A.q_norm_w, eps)
+                q = linear_w(qr, A.wq_b).view(B, 1, A.n_heads, A.head_dim)
+            rope_dev_(q, rd, A.cos, A.sin, pos)
+            kv_write(kv_raw, A.kv_norm_w, A.cos, A.sin, pos, A.window_kv_cache, rd, eps, seq)
+        else:
+            qr = norm_quant(linear_w(xq, A.wq_a), A.q_norm_w, eps)  # q_norm output, already fp8-rounded for wq_b / indexer
+            q = linear_w(qr, A.wq_b).view(B, 1, A.n_heads, A.head_dim)
+            rope_dev_(q, rd, A.cos, A.sin, pos)
+            kv_write(linear_w(xq, A.wkv), A.kv_norm_w, A.cos, A.sin, pos, A.window_kv_cache, rd, eps, seq)
         if A.ratio:
             ratio = A.ratio
             if DECODE_LEAN:  # the same value for every layer of the token: one pair of kernels per (device, ratio)
@@ -133,6 +153,10 @@ class DecodeRuntime:
         else:
             o = sattn2(q, A.window_kv_cache, None, None, pos, A.attn_sink, A.cos, A.sin, rd, A.softmax_scale, seq, pmax)
         o = oproj_a(o.view(B, 1, A.n_groups, -1), A.wo_a, A.n_groups, A.o_lora_rank)
+        if cukern.FUSED_DENSE_CHAIN >= 2 and B == 1 and isinstance(A.wo_b, W8):
+            # DSV41_FUSED_DENSE_CHAIN >= 2: fp8 rounding of the o-projection intermediate done in wo_b's prologue (no
+            # fake_quant launch; wo_b streams 64 KB per block so the replicated prologue is amortized)
+            return cukern.fp8_gemv_m1_pre(o.reshape(1, -1).contiguous(), A.wo_b.w8, A.wo_b.s8, None, 0.0, 2).view(B, 1, -1)
         return linear_fp8(o, A.wo_b)
 
     def attention(self, A: Attention, x: torch.Tensor, d: torch.device) -> torch.Tensor:
