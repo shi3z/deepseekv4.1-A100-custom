@@ -42,6 +42,13 @@ extern "C" __global__ void p2p_wait(volatile int* flags, int n, const int* seq_p
     __threadfence_system();
 }
 
+// same, but only the flags whose mask entry is non-zero (device-computed: peers this token does not need)
+extern "C" __global__ void p2p_wait_masked(volatile int* flags, int n, const int* seq_ptr, const int* mask) {
+    int v = *seq_ptr;
+    for (int i = 0; i < n; ++i) { if (mask[i]) { while (flags[i] < v) { } } }
+    __threadfence_system();
+}
+
 extern "C" __global__ void p2p_seq_bump(int* seq_ptr) { *seq_ptr += 1; }
 
 // one launch: copy `n16` uint4 of src into up to 8 destinations (peer inboxes); the last block to finish

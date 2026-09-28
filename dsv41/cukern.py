@@ -308,6 +308,13 @@ def p2p_wait(flags: torch.Tensor, seq: torch.Tensor, device: torch.device):
     launch(f, (1, 1, 1), (1, 1, 1), [ctypes.c_void_p(flags.data_ptr()), ctypes.c_int(flags.numel()), ctypes.c_void_p(seq.data_ptr())], device)
 
 
+def p2p_wait_masked(flags: torch.Tensor, seq: torch.Tensor, mask: torch.Tensor, device: torch.device):
+    """Spin until every flag whose mask entry (int32 [n] on `device`, device-computed) is non-zero has reached seq."""
+    f = get_function("p2p.cu", "p2p_wait_masked", device)
+    launch(f, (1, 1, 1), (1, 1, 1), [ctypes.c_void_p(flags.data_ptr()), ctypes.c_int(flags.numel()), ctypes.c_void_p(seq.data_ptr()),
+                                    ctypes.c_void_p(mask.data_ptr())], device)
+
+
 def p2p_seq_bump(seq: torch.Tensor, device: torch.device):
     f = get_function("p2p.cu", "p2p_seq_bump", device)
     launch(f, (1, 1, 1), (1, 1, 1), [ctypes.c_void_p(seq.data_ptr())], device)

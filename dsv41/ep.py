@@ -18,7 +18,7 @@ import torch.nn.functional as F
 
 import os
 
-from .cukern import fp4_gemm_tc, memcpy_async, p2p_copy, p2p_copy_row, p2p_multicast, p2p_seq_bump, p2p_signal, p2p_stamp, p2p_sum_rows, p2p_wait
+from .cukern import fp4_gemm_tc, memcpy_async, p2p_copy, p2p_copy_row, p2p_multicast, p2p_seq_bump, p2p_signal, p2p_stamp, p2p_sum_rows, p2p_wait, p2p_wait_masked
 
 # messages by copy engine (cuMemcpyAsync) instead of kernel P2P stores: the engines win for large messages
 # (B=16: 164 KB routing packets, multicast 553 -> 76 us) while kernel stores have the lower latency for small
@@ -151,6 +151,23 @@ class EPRuntime(DecodeRuntime):
         # would synchronise with the peer's default stream and deadlock against the flag waits
         self.streams = {d: torch.cuda.Stream(d) for d in self.devs}
         self.trace = {d: torch.zeros(nl, 16, dtype=torch.int64, device=d) for d in self.devs} if EP_TRACE else None
+        self.dbg_h = {d: torch.zeros(nl, B, hc, dim, dtype=torch.bfloat16, device=d) for d in self.devs} if os.environ.get("DSV41_EP_DEBUG_H", "0") == "1" else None
+        # static read-only expert replicas on the layer owners (dsv41/replica.py); off unless DSV41_EXPERT_REPLICA_CACHE=1
+        self.replica = None
+        self.replica_skip_wait = False
+        if os.environ.get("DSV41_EXPERT_REPLICA_CACHE", "0") == "1":
+            from .replica import ReplicaCache
+            gib = os.environ.get("DSV41_REPLICA_GIB", "")
+            self.replica = ReplicaCache(model, self, os.environ.get("DSV41_REPLICA_PLAN", ""), float(gib) if gib else None)
+            self.replica_skip_wait = os.environ.get("DSV41_REPLICA_SKIP_WAIT", "1") == "1"
+            # per owner device: the need mask over flag_part slots (own slot always 1) and its int32 view for the wait kernel
+            self.need_mask = {d: torch.ones(self.nd, dtype=torch.int32, device=d) for d in self.devs}
+            self.need_acc = {d: torch.zeros(self.nd + 1, dtype=torch.int32, device=d) for d in self.devs}
+            self.need_ones = {d: torch.ones(B * topk, dtype=torch.int32, device=d) for d in self.devs}
+            self.replica_debug = os.environ.get("DSV41_REPLICA_DEBUG", "0") == "1"
+            if self.replica_debug:
+                self.dbg_need = {d: torch.zeros(nl, self.nd, dtype=torch.int32, device=d) for d in self.devs}
+                self.dbg_rows = {d: torch.zeros(nl, self.nd, dtype=torch.float32, device=d) for d in self.devs}
 
         # ------------------------------------------------------------
         # Exact preallocation BEFORE CUDA graph capture.
@@ -303,11 +320,20 @@ class EPRuntime(DecodeRuntime):
 
     # ------------------------------------------------------------------ pieces
     def _experts_shard(self, d, xqp, eid, wt, moe):
-        """This GPU's experts for the B * topk (token, expert) pairs: fp32 [B * topk, dim] (rows of other shards zero)."""
+        """This GPU's experts for the B * topk (token, expert) pairs: fp32 [B * topk, dim] (rows of other shards zero).
+        With the replica cache: on the layer's owner also its local replicas; on a peer the experts replicated on the
+        owner are dropped (id -> -1) so they are computed exactly once."""
         start, n = self.shard[d]
         sh = [s for s in moe.ep if s["device"] == d][0]
+        rep = None
+        if self.replica is not None:
+            L = moe.layer_id
+            rep = self.replica.rep.get((d, L))
+            keep = self.replica.peer_keep.get((d, L))
+            if keep is not None:
+                eid = keep[eid.long()]
         return self.experts_tc(xqp, True, sh["w13"], sh["s13"], sh["w2"], sh["s2"], eid, wt, moe.inter, moe.swiglu_limit,
-                               self.B * self.topk_e, d, topk=self.topk_e, shard=(start, n))
+                               self.B * self.topk_e, d, topk=self.topk_e, shard=(start, n), replica=rep)
 
     def _push_cache_rows(self, blk: Block, d):
         """After an owner ran a KV / index source layer: mirror the written rows to the later devices."""
@@ -345,6 +371,28 @@ class EPRuntime(DecodeRuntime):
         if self.route_log:  # telemetry: keep this layer's routing (DSV41_ROUTE_LOG=1)
             self.route_eid[L].copy_(eid)
             self.route_wt[L].copy_(wt)
+        need_mask = None
+        if self.replica is not None:  # replica counters and the peers this token really needs (all device side)
+            rc = self.replica
+            e = eid.long().view(-1)
+            r = rc.rep.get((d, L))
+            if r is not None:
+                rc.hits[d][L] += (r["lut"][e] >= 0).sum()
+            pe = rc.need_lut[(d, L)][e]  # peer slot per routed expert, -1 = local (own shard or replica)
+            rc.misses[d][L] += (pe >= 0).sum()
+            rc.layer_tokens[d][L] += self.B
+            acc = self.need_acc[d]
+            acc.zero_()
+            acc.scatter_add_(0, (pe + 1).long(), self.need_ones[d])
+            need = acc[1:]
+            if self.relay:  # the relay's row carries the leaf's partial as well
+                a_, b_ = self.relay_of[d], self.partner[self.relay_of[d]]
+                need[self.idx[a_]] += need[self.idx[b_]]
+            need[self.idx[d]].fill_(1)  # a scalar assignment would be a host->device copy (not capturable)
+            rc.full_local[d][L] += ((need > 0).sum() == 1)
+            if self.replica_skip_wait:
+                need_mask = self.need_mask[d]
+                need_mask.copy_(need)
         self._stamp(d, L, 9)
         # routing + activation to every peer, then the flags
         if not self.dry:
@@ -364,6 +412,7 @@ class EPRuntime(DecodeRuntime):
         with torch.cuda.stream(side2):
             ys = self._shared_expert(moe, xq)
         y_loc = self._experts_shard(d, xqp, eid, wt, moe)
+        self._stamp(d, L, 10)  # local expert GEMMs done (own shard + replicas), before the shared-expert join
         if self.bf16_part:
             p2p_sum_rows(self.part_out[d], y_loc, d, groups=self.B)
             self.part_in[d][self.idx[d]].copy_(self.part_out[d])
@@ -373,10 +422,29 @@ class EPRuntime(DecodeRuntime):
         self._stamp(d, L, 3)
         # wait for the peers' partials (own slot is raised by a local signal so the whole row can be waited on)
         self._signal(self._own_part_ptr(L, d), d)
-        self._wait(self.flag_part[d][L], d)
+        if need_mask is not None:
+            # only the peers holding a routed, non-replicated expert; the rows of the others may be stale -> zero them
+            # (every op here also runs in the dry pass so its kernels are loaded before any device spins in a wait)
+            mode = os.environ.get("DSV41_REPLICA_MASK_MODE", "both")  # debugging: "wait" / "mul" / "both"
+            if not self.dry:
+                if mode in ("wait", "both"):
+                    p2p_wait_masked(self.flag_part[d][L], self.seqno[d], need_mask, d)
+                else:
+                    self._wait(self.flag_part[d][L], d)
+            if self.replica_debug:  # record the mask and the |row| sums the combine is about to read (graph-safe)
+                self.dbg_need[d][L].copy_(need_mask)
+                self.dbg_rows[d][L].copy_(self.part_in[d].float().abs().sum((1, 2)))
+            if mode in ("mul", "both"):
+                # need_mask holds the NUMBER of routed experts per peer (the wait only tests non-zero); the rows that
+                # were waited on must be kept as they are, the others (contribution known to be zero) zeroed
+                self.part_in[d].mul_((need_mask > 0).to(self.part_in[d].dtype).view(self.nd, 1, 1))
+        else:
+            self._wait(self.flag_part[d][L], d)
         self._stamp(d, L, 4)
         self._hc_join(side, d)
         hc_post2_(None, h, post, comb, y2=self.part_in[d], ys=ys, y2_sum_first=True)
+        if self.dbg_h is not None:  # DSV41_EP_DEBUG_H=1: the residual stream after every layer (first-divergent-layer analysis)
+            self.dbg_h[d][L].copy_(h.reshape(self.dbg_h[d][L].shape))
         self._stamp(d, L, 5)
         return pre_out
 
@@ -647,7 +715,7 @@ def trace_report(rt: "EPRuntime") -> str:
         peers = [d for d in rt.devs if d != o]
         pc = [tr[d][L, 7].item() - tr[d][L, 6].item() for d in peers]  # peer compute + push (its own clock)
         parts = {"attn+hc": t[1] - t[0], "  hc_sub2": t[8] - t[1], "  gate+topk": t[9] - t[8], "  multicast": t[2] - t[9],
-                 "own experts || shared": t[3] - t[2], "wait partials": t[4] - t[3],
+                 "own experts || shared": t[3] - t[2], "  local expert GEMMs": t[10] - t[2], "wait partials": t[4] - t[3],
                  "hc_post": t[5] - t[4], "layer": t[5] - t[0], "peer compute+push (max)": max(pc), "peer compute+push (mean)": sum(pc) / len(pc)}
         for k, v in parts.items():
             agg.setdefault(k, []).append(float(v))

@@ -311,17 +311,29 @@ class DecodeRuntime:
             t = self._tc_cache[key] = (torch.arange(n + 1, device=d, dtype=torch.int32), tok, torch.arange(n, device=d, dtype=torch.int32))
         return t
 
-    def experts_tc(self, xqp, hq_permute, w13, s13, w2, s2, eid, wt, inter, limit, n, d, topk: int = 0, shard=(0, 1 << 30)):
+    def experts_tc(self, xqp, hq_permute, w13, s13, w2, s2, eid, wt, inter, limit, n, d, topk: int = 0, shard=(0, 1 << 30), replica=None):
         """n (token, expert, weight) pairs on the tensor-core FP4 GEMM: fp32 [n, dim] in pair order (token-major).
         xqp: 8-k permuted x [B, K]; eid / wt: [B, topk] (pair p = token p // topk). With more than one token the
         pairs are bucketed by expert on the device (sorted; one weight read per distinct expert, up to B tokens per
-        group); shard = (first expert, count) restricts the work to this GPU's experts (rows of the others are zero)."""
+        group); shard = (first expert, count) restricts the work to this GPU's experts (rows of the others are zero).
+        replica: optional dict {w13, s13, w2, s2, lut} of local read-only replicas of other shards' experts
+        (dsv41/replica.py): the groups whose expert has a replica slot (lut[e] >= 0) are computed from the replica
+        tensors with the same kernels (two extra launches), the rest exactly as before."""
         B = n // topk if topk else 1
+        def rep_ids(ge):  # global expert ids (-1 = padding) -> replica slots (-1 = none)
+            return torch.where(ge >= 0, replica["lut"][ge.clamp(min=0).long()], ge)
         if B <= 1:
             starts, tok, rows = self._tc_tables(n, d, topk)
-            gu = fp4_gemm_tc(xqp, w13, s13, eid.reshape(-1), starts, tok, n, 1, shard_start=shard[0], shard_n=shard[1], zero_out=False)
+            ge = eid.reshape(-1)
+            gu = fp4_gemm_tc(xqp, w13, s13, ge, starts, tok, n, 1, shard_start=shard[0], shard_n=shard[1], zero_out=False)
+            if replica is not None:
+                gr = rep_ids(ge)
+                fp4_gemm_tc(xqp, replica["w13"], replica["s13"], gr, starts, tok, n, 1, shard_start=0, shard_n=replica["w13"].shape[0], zero_out=False, out=gu)
             hqp = swiglu_quant(gu, wt.reshape(-1), inter, limit, permute=True)
-            return fp4_gemm_tc(hqp, w2, s2, eid.reshape(-1), starts, rows, n, 1, shard_start=shard[0], shard_n=shard[1], zero_out=True)
+            y = fp4_gemm_tc(hqp, w2, s2, ge, starts, rows, n, 1, shard_start=shard[0], shard_n=shard[1], zero_out=True)
+            if replica is not None:  # after the shard pass, which zeroed these rows
+                fp4_gemm_tc(hqp, replica["w2"], replica["s2"], gr, starts, rows, n, 1, shard_start=0, shard_n=replica["w2"].shape[0], zero_out=False, out=y)
+            return y
         # ---- bucket the n pairs by expert (all static shapes; padded groups have expert -1 and are skipped)
         e = eid.reshape(-1).to(torch.int64)
         se, order = torch.sort(e, stable=True)
@@ -340,9 +352,16 @@ class DecodeRuntime:
         grp_start = torch.full((n + 1,), n, dtype=torch.int32, device=d)
         grp_start.scatter_reduce_(0, gid, torch.where(is_new, ar, torch.full_like(ar, n)).to(torch.int32), "amin")
         gu = fp4_gemm_tc(xqp, w13, s13, grp_expert, grp_start, tok_sorted, n, min(B, gmax), shard_start=shard[0], shard_n=shard[1], zero_out=False)
+        if replica is not None:
+            grp_rep = rep_ids(grp_expert)
+            fp4_gemm_tc(xqp, replica["w13"], replica["s13"], grp_rep, grp_start, tok_sorted, n, min(B, gmax), shard_start=0,
+                        shard_n=replica["w13"].shape[0], zero_out=False, out=gu)
         hqp = swiglu_quant(gu, wt_sorted, inter, limit, permute=True)
         rows = ar.to(torch.int32)
         y2s = fp4_gemm_tc(hqp, w2, s2, grp_expert, grp_start, rows, n, min(B, gmax), shard_start=shard[0], shard_n=shard[1], zero_out=True)
+        if replica is not None:
+            fp4_gemm_tc(hqp, replica["w2"], replica["s2"], grp_rep, grp_start, rows, n, min(B, gmax), shard_start=0,
+                        shard_n=replica["w2"].shape[0], zero_out=False, out=y2s)
         inv = torch.empty_like(order).scatter_(0, order, ar)
         return y2s[inv]
 

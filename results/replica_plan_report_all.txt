@@ -1,0 +1,179 @@
+profiles: ['results/expert_profile_S1.pt', 'results/expert_profile_S2.pt', 'results/expert_profile_S8.pt']
+routes: 675,840 total, 515,300 remote (76.2%), 160,540 local; layers 40, experts 384, topk 6
+per-GPU (as source/owner): layers owned, remote share of its routes
+  cuda:0: layers 20..29 (10), shard experts 192..287, routes 168,960, remote 76.8%
+  cuda:1: layers 30..39 (10), shard experts 288..383, routes 168,960, remote 75.7%
+  cuda:2: layers 0..9 (10), shard experts 0..95, routes 168,960, remote 75.1%
+  cuda:3: layers 10..19 (10), shard experts 96..191, routes 168,960, remote 77.3%
+EP timeline per layer (us, mean over layers and steps):
+  attention+hc                  256.0 us
+  gate+topk                      30.1 us
+  multicast issue                21.5 us
+  own experts || shared         188.2 us
+  wait partials                  54.7 us
+  hc_post                         5.0 us
+  layer                         568.6 us
+  peer compute+push (max)       204.9 us
+  remote dispatch (multicast + wait) 76.2 us per layer-token, 4.57 remote routes per layer-token -> 16.7 us per remote route
+bytes attributed per remote route: 3413 (one bf16/fp32 partial of 20480 B per peer / topk); note: the route packet (10288 B) is multicast to every peer regardless of routing
+
+top 50 experts globally by route count ((layer, expert), remote?, count, share of layer's routes):
+  L20 E 51 remote   1,069   6.3%
+  L18 E345 remote     993   5.9%
+  L23 E177 remote     979   5.8%
+  L 5 E 40 local      960   5.7%
+  L10 E381 remote     915   5.4%
+  L22 E184 remote     817   4.8%
+  L 4 E122 remote     784   4.6%
+  L34 E 44 remote     742   4.4%
+  L 6 E122 remote     727   4.3%
+  L 3 E153 remote     705   4.2%
+  L15 E165 local      663   3.9%
+  L35 E225 remote     644   3.8%
+  L36 E104 remote     638   3.8%
+  L13 E296 remote     635   3.8%
+  L 4 E329 remote     633   3.7%
+  L37 E 76 remote     626   3.7%
+  L 1 E 85 local      596   3.5%
+  L 2 E305 remote     587   3.5%
+  L33 E 21 remote     586   3.5%
+  L 6 E300 remote     582   3.4%
+  L32 E300 local      565   3.3%
+  L11 E334 remote     560   3.3%
+  L25 E138 remote     555   3.3%
+  L30 E183 remote     552   3.3%
+  L35 E306 local      535   3.2%
+  L28 E 13 remote     532   3.1%
+  L36 E214 remote     528   3.1%
+  L17 E195 remote     527   3.1%
+  L34 E354 local      526   3.1%
+  L17 E116 local      524   3.1%
+  L38 E171 remote     522   3.1%
+  L22 E237 local      521   3.1%
+  L35 E 78 remote     520   3.1%
+  L29 E232 local      518   3.1%
+  L 8 E265 remote     516   3.1%
+  L 6 E244 remote     509   3.0%
+  L29 E332 remote     508   3.0%
+  L39 E374 local      507   3.0%
+  L15 E323 remote     507   3.0%
+  L28 E 55 remote     503   3.0%
+  L25 E169 remote     503   3.0%
+  L13 E377 remote     501   3.0%
+  L10 E276 remote     497   2.9%
+  L31 E335 local      496   2.9%
+  L10 E342 remote     496   2.9%
+  L34 E 19 remote     495   2.9%
+  L17 E275 remote     492   2.9%
+  L26 E  8 remote     491   2.9%
+  L29 E383 remote     486   2.9%
+  L22 E 48 remote     486   2.9%
+top 20 expert ids summed over layers: E122=3138, E345=3078, E323=3072, E51=3033, E148=3022, E40=2985, E335=2843, E291=2809, E275=2803, E200=2799, E288=2694, E300=2650, E162=2649, E72=2637, E265=2634, E168=2632, E177=2617, E1=2606, E13=2548, E44=2542
+
+top 20 replica candidates per GPU (by remote route count; score = count * bytes_saved * P2P us/route):
+  cuda:0:
+    L20 E 51 count   1,069  score     60.809
+    L23 E177 count     979  score     55.689
+    L22 E184 count     817  score     46.474
+    L25 E138 count     555  score     31.570
+    L28 E 13 count     532  score     30.262
+    L29 E332 count     508  score     28.897
+    L28 E 55 count     503  score     28.612
+    L25 E169 count     503  score     28.612
+    L26 E  8 count     491  score     27.930
+    L29 E383 count     486  score     27.645
+    L22 E 48 count     486  score     27.645
+    L20 E346 count     483  score     27.475
+    L27 E145 count     482  score     27.418
+    L24 E 64 count     482  score     27.418
+    L24 E 26 count     474  score     26.963
+    L27 E339 count     448  score     25.484
+    L20 E100 count     439  score     24.972
+    L21 E 61 count     432  score     24.574
+    L23 E105 count     424  score     24.119
+    L20 E354 count     423  score     24.062
+  cuda:1:
+    L34 E 44 count     742  score     42.208
+    L35 E225 count     644  score     36.633
+    L36 E104 count     638  score     36.292
+    L37 E 76 count     626  score     35.609
+    L33 E 21 count     586  score     33.334
+    L30 E183 count     552  score     31.400
+    L36 E214 count     528  score     30.035
+    L38 E171 count     522  score     29.693
+    L35 E 78 count     520  score     29.579
+    L34 E 19 count     495  score     28.157
+    L39 E152 count     485  score     27.589
+    L32 E257 count     485  score     27.589
+    L38 E162 count     478  score     27.190
+    L36 E240 count     467  score     26.565
+    L33 E200 count     460  score     26.166
+    L37 E247 count     442  score     25.143
+    L37 E283 count     430  score     24.460
+    L33 E 43 count     383  score     21.786
+    L34 E275 count     381  score     21.673
+    L33 E142 count     379  score     21.559
+  cuda:2:
+    L 4 E122 count     784  score     44.597
+    L 6 E122 count     727  score     41.354
+    L 3 E153 count     705  score     40.103
+    L 4 E329 count     633  score     36.007
+    L 2 E305 count     587  score     33.391
+    L 6 E300 count     582  score     33.106
+    L 8 E265 count     516  score     29.352
+    L 6 E244 count     509  score     28.954
+    L 7 E245 count     481  score     27.361
+    L 4 E162 count     477  score     27.133
+    L 8 E210 count     472  score     26.849
+    L 2 E303 count     458  score     26.053
+    L 2 E272 count     455  score     25.882
+    L 1 E207 count     448  score     25.484
+    L 6 E257 count     446  score     25.370
+    L 9 E202 count     409  score     23.265
+    L 7 E178 count     389  score     22.128
+    L 3 E382 count     388  score     22.071
+    L 2 E131 count     381  score     21.673
+    L 9 E300 count     378  score     21.502
+  cuda:3:
+    L18 E345 count     993  score     56.485
+    L10 E381 count     915  score     52.049
+    L13 E296 count     635  score     36.121
+    L11 E334 count     560  score     31.855
+    L17 E195 count     527  score     29.978
+    L15 E323 count     507  score     28.840
+    L13 E377 count     501  score     28.499
+    L10 E276 count     497  score     28.271
+    L10 E342 count     496  score     28.214
+    L17 E275 count     492  score     27.987
+    L19 E377 count     483  score     27.475
+    L10 E357 count     480  score     27.304
+    L14 E  1 count     477  score     27.133
+    L16 E325 count     471  score     26.792
+    L14 E 70 count     471  score     26.792
+    L14 E371 count     464  score     26.394
+    L16 E345 count     455  score     25.882
+    L16 E369 count     444  score     25.256
+    L11 E 24 count     439  score     24.972
+    L18 E192 count     422  score     24.005
+
+replica budget coverage (bytes per expert 17.93 MiB):
+   GiB/GPU slots/GPU  remote routes covered  layer-tokens fully local  tokens fully local (all layers)
+       1.0        57                  17.2%                      0.3%                             0.0%
+       2.0       114                  27.3%                      1.0%                             0.0%
+       4.0       228                  41.0%                      3.3%                             0.0%
+       8.0       456                  57.7%                     11.2%                             0.0%
+  (no replicas: 0.0% of layer-tokens have all 6 experts on the owner)
+
+routing locality (P(E_L+1 | E_L)), 33,033 held-out events:
+    k precision@k (cond)  recall@k (cond) precision@k (marginal)  recall@k (marginal)
+    1              70.5%            11.7%                  27.9%                 4.6%
+    2              61.0%            20.3%                  25.3%                 8.4%
+    4              46.6%            31.0%                  20.8%                13.9%
+    8              32.2%            42.9%                  16.1%                21.5%
+
+routing locality (P(E_t+1,L | E_t,L)), 33,440 held-out events:
+    k precision@k (cond)  recall@k (cond) precision@k (marginal)  recall@k (marginal)
+    1              67.1%            11.2%                  27.8%                 4.6%
+    2              57.6%            19.2%                  25.2%                 8.4%
+    4              43.4%            28.9%                  20.6%                13.7%
+    8              29.3%            39.1%                  16.0%                21.3%
