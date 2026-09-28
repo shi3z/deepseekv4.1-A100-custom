@@ -319,3 +319,64 @@ fp8_gemv_m1_pre##MODE##_k##KW##u##U(const __nv_bfloat16* __restrict__ Xraw, cons
 
 DEFP(1, 4, 1) DEFP(1, 2, 1) DEFP(2, 2, 1) DEFP(4, 4, 1)
 DEFP(1, 4, 2) DEFP(1, 2, 2) DEFP(2, 2, 2) DEFP(4, 4, 2)
+
+// ---------------------------------------------------------------------------------------------------------------
+// Experiment (lossless tiling, results/lossless_ceiling_report.md): R consecutive rows per warp streamed as one flat
+// chunk range (rows are contiguous in memory), so short-K rows (wq_b: 1,280 B) fill every lane's U loads; and 4-warp
+// blocks (finer tail). Same per-chunk arithmetic as fp8_gemv_m1_body; only the accumulation grouping changes.
+template <int WARPS, int R, int U>
+__device__ __forceinline__ void fp8_gemv_m1_rows_body(const __nv_bfloat16* __restrict__ X,
+        const uint8_t* __restrict__ W, const uint8_t* __restrict__ S, int N, int K, int Kc, __nv_bfloat16* __restrict__ y)
+{
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int n0 = (blockIdx.x * WARPS + warp) * R;
+    if (n0 >= N) return;
+    const int cpr = K / 16;                       // chunks per row
+    const uint8_t* wbase = W + (long long)n0 * K;
+    const uint8_t* srow = S + (long long)(n0 >> 5) * Kc;   // valid for the whole range when (n0 % 32) + R <= 32
+    const int total = cpr * R;
+    float acc[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) acc[r] = 0.f;
+    for (int base = lane; base < total; base += 32 * U) {
+        uint4 wv[U]; int sb[U]; int rr[U]; int cc[U];
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const int c = base + 32 * u;
+            const bool ok = c < total;
+            int r = 0, ci = c;                    // row within the R-row range: at most R-1 compare/subtract steps
+#pragma unroll
+            for (int q = 1; q < R; ++q) { if (ci >= cpr) { ci -= cpr; ++r; } }
+            rr[u] = r; cc[u] = ci;
+            wv[u] = ok ? __ldg(reinterpret_cast<const uint4*>(wbase + (long long)c * 16)) : make_uint4(0, 0, 0, 0);
+            sb[u] = ok ? __ldg(srow + (ci >> 1)) : 0;   // rows n0..n0+R-1 share one scale row (n0 % 32 == 0, R <= 32)
+        }
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const int c = base + 32 * u;
+            if (c < total) {
+                const uint4 xa = *reinterpret_cast<const uint4*>(X + cc[u] * 16);
+                const uint4 xb = *reinterpret_cast<const uint4*>(X + cc[u] * 16 + 8);
+                const float d = chunk_dot(wv[u], xa, xb);
+                const float sc = (sb[u] + 120 > 0 && sb[u] + 120 < 255) ? __uint_as_float((uint32_t)(sb[u] + 120) << 23) : 0.f;
+                const float v = d * sc;
+#pragma unroll
+                for (int r = 0; r < R; ++r) acc[r] += (rr[u] == r) ? v : 0.f;
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        float a = acc[r];
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+        if (lane == 0 && n0 + r < N) y[n0 + r] = __float2bfloat16(a);
+    }
+}
+#define DEFR(WARPS, R, U) \
+extern "C" __global__ void __launch_bounds__(WARPS * 32) \
+fp8_gemv_m1_w##WARPS##r##R##u##U(const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__ W, const uint8_t* __restrict__ S, \
+                        int N, int K, int Kc, __nv_bfloat16* __restrict__ y) \
+{ fp8_gemv_m1_rows_body<WARPS, R, U>(X, W, S, N, K, Kc, y); }
+DEFR(8, 1, 2) DEFR(8, 1, 4) DEFR(4, 1, 2) DEFR(4, 1, 4)
+DEFR(8, 2, 4) DEFR(8, 2, 8) DEFR(8, 4, 4) DEFR(8, 4, 8) DEFR(4, 2, 4) DEFR(4, 4, 4) DEFR(4, 4, 8) DEFR(8, 8, 8)
