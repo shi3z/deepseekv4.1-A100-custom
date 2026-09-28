@@ -18,6 +18,7 @@ import torch.nn.functional as F
 
 import os
 
+from . import cukern
 from .cukern import fp4_gemm_tc, memcpy_async, p2p_copy, p2p_copy_row, p2p_multicast, p2p_seq_bump, p2p_signal, p2p_stamp, p2p_sum_rows, p2p_wait, p2p_wait_masked
 
 # messages by copy engine (cuMemcpyAsync) instead of kernel P2P stores: the engines win for large messages
@@ -151,6 +152,7 @@ class EPRuntime(DecodeRuntime):
         # would synchronise with the peer's default stream and deadlock against the flag waits
         self.streams = {d: torch.cuda.Stream(d) for d in self.devs}
         self.trace = {d: torch.zeros(nl, 16, dtype=torch.int64, device=d) for d in self.devs} if EP_TRACE else None
+        self.ys_buf = {d: torch.zeros(B, dim, dtype=torch.bfloat16, device=d) for d in self.devs}  # shared-expert output of the fused chain
         self.dbg_h = {d: torch.zeros(nl, B, hc, dim, dtype=torch.bfloat16, device=d) for d in self.devs} if os.environ.get("DSV41_EP_DEBUG_H", "0") == "1" else None
         # static read-only expert replicas on the layer owners (dsv41/replica.py); off unless DSV41_EXPERT_REPLICA_CACHE=1
         self.replica = None
@@ -405,20 +407,30 @@ class EPRuntime(DecodeRuntime):
                 p2p_multicast(self.sig_inbox[d], self.outbox[d], self.sig_route[L], self.seqno[d], d, counter=self.mcast_counter[d])
         self._stamp(d, L, 2)
         xqp = self.xqp_out[d]
-        # own shard and, on a second stream, the shared expert, while the peers work
-        main = torch.cuda.current_stream(d)
-        side2 = self._side_stream2(d)
-        side2.wait_stream(main)
-        with torch.cuda.stream(side2):
-            ys = self._shared_expert(moe, xq)
-        y_loc = self._experts_shard(d, xqp, eid, wt, moe)
-        self._stamp(d, L, 10)  # local expert GEMMs done (own shard + replicas), before the shared-expert join
-        if self.bf16_part:
-            p2p_sum_rows(self.part_out[d], y_loc, d, groups=self.B)
-            self.part_in[d][self.idx[d]].copy_(self.part_out[d])
+        if self._fused_chain_ok(moe):
+            # DSV41_PERSISTENT_EXPERT: routed experts + shared expert in one fused chain (2 launches, or 1 persistent)
+            ys = self.ys_buf[d]
+            dst = self.part_out[d] if self.bf16_part else self.part_in[d][self.idx[d]]
+            sh = [s for s in moe.ep if s["device"] == d][0]
+            cukern.expert_chain(xqp[0], xq[0], eid[0], wt[0], self.shard[d], sh, moe, dst.view(-1), ys.view(-1))
+            self._stamp(d, L, 10)
+            if self.bf16_part:
+                self.part_in[d][self.idx[d]].copy_(self.part_out[d])
         else:
-            p2p_sum_rows(self.part_in[d][self.idx[d]], y_loc, d, groups=self.B)
-        main.wait_stream(side2)
+            # own shard and, on a second stream, the shared expert, while the peers work
+            main = torch.cuda.current_stream(d)
+            side2 = self._side_stream2(d)
+            side2.wait_stream(main)
+            with torch.cuda.stream(side2):
+                ys = self._shared_expert(moe, xq)
+            y_loc = self._experts_shard(d, xqp, eid, wt, moe)
+            self._stamp(d, L, 10)  # local expert GEMMs done (own shard + replicas), before the shared-expert join
+            if self.bf16_part:
+                p2p_sum_rows(self.part_out[d], y_loc, d, groups=self.B)
+                self.part_in[d][self.idx[d]].copy_(self.part_out[d])
+            else:
+                p2p_sum_rows(self.part_in[d][self.idx[d]], y_loc, d, groups=self.B)
+            main.wait_stream(side2)
         self._stamp(d, L, 3)
         # wait for the peers' partials (own slot is raised by a local signal so the whole row can be waited on)
         self._signal(self._own_part_ptr(L, d), d)
@@ -451,6 +463,10 @@ class EPRuntime(DecodeRuntime):
     def _own_part_ptr(self, L, d):
         return self._ptrs[("own", L, d)]
 
+    def _fused_chain_ok(self, moe) -> bool:
+        """DSV41_PERSISTENT_EXPERT: single-row steps without replicas (the fused chain handles one token)."""
+        return cukern.PERSISTENT_EXPERT > 0 and self.B == 1 and self.replica is None and moe.ep is not None
+
     def _side_stream2(self, d):
         ss = getattr(self, "_side2", None)
         if ss is None:
@@ -477,9 +493,16 @@ class EPRuntime(DecodeRuntime):
         if role == "relay" and not self.dry:  # forward the route packet to the leaf over NVLink
             memcpy_async(self.inbox[self.partner[d]], self.inbox[d], d)
             p2p_signal(self.sig_fwd[L], self.seqno[d], d)
-        y = self._experts_shard(d, self.inbox_x[d], self.inbox_eid[d], self.inbox_wt[d], blk.ffn)
+        fused = self._fused_chain_ok(blk.ffn)
+        if fused:  # routed experts of the shard in the fused chain, the partial written where p2p_sum_rows would put it
+            sh = [s for s in blk.ffn.ep if s["device"] == d][0]
+            dst = self.part_out[d] if self.dma_part else self.part_in[o][self.idx[d]]
+            cukern.expert_chain(self.inbox_x[d][0], self.inbox_x[d][0], self.inbox_eid[d][0], self.inbox_wt[d][0], self.shard[d], sh, blk.ffn, dst.view(-1), None)
+        else:
+            y = self._experts_shard(d, self.inbox_x[d], self.inbox_eid[d], self.inbox_wt[d], blk.ffn)
         if self.dma_part:
-            p2p_sum_rows(self.part_out[d], y, d, groups=self.B)
+            if not fused:
+                p2p_sum_rows(self.part_out[d], y, d, groups=self.B)
             if role == "leaf":  # into the relay partner, which adds it to its own partial
                 if self.bf16_part:
                     self.part_out16[d].copy_(self.part_out[d])
@@ -493,7 +516,7 @@ class EPRuntime(DecodeRuntime):
             if self.bf16_part:
                 self.part_out16[d].copy_(self.part_out[d])
             memcpy_async(self.part_in[o][self.idx[d]], self.part_out16[d], d)
-        else:
+        elif not fused:
             p2p_sum_rows(self.part_in[o][self.idx[d]], y, d, groups=self.B)  # straight into the owner's inbox row
         self._signal(self.sig_part[(L, d)], d)
         self._stamp(d, L, 7)

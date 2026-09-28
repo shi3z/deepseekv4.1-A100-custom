@@ -426,3 +426,94 @@ def hit_mask_select(eid: torch.Tensor, eid_rem: torch.Tensor, spec_gu: torch.Ten
     ]
     launch(fn, (1, 1, 1), (256, 1, 1), args, dev)
 
+
+
+# --------------------------------------------------------------------------- persistent fused expert chain (S = 1)
+PERSISTENT_EXPERT = int(os.environ.get("DSV41_PERSISTENT_EXPERT", "0"))  # 1: two-launch fused chain, 2: single persistent launch
+
+
+class _ChainArgs(ctypes.Structure):
+    _fields_ = [("xqp", ctypes.c_void_p), ("xq", ctypes.c_void_p), ("eid", ctypes.c_void_p), ("wt", ctypes.c_void_p),
+                ("topk", ctypes.c_int), ("shard_start", ctypes.c_int), ("shard_n", ctypes.c_int),
+                ("w13", ctypes.c_void_p), ("w13_stride", ctypes.c_longlong), ("s13", ctypes.c_void_p), ("s13_stride", ctypes.c_longlong),
+                ("w2", ctypes.c_void_p), ("w2_stride", ctypes.c_longlong), ("s2", ctypes.c_void_p), ("s2_stride", ctypes.c_longlong),
+                ("sh_w13", ctypes.c_void_p), ("sh_s13", ctypes.c_void_p), ("sh_s13_cols", ctypes.c_int),
+                ("sh_w2", ctypes.c_void_p), ("sh_s2", ctypes.c_void_p), ("sh_s2_cols", ctypes.c_int),
+                ("has_shared", ctypes.c_int), ("limit", ctypes.c_float),
+                ("gu", ctypes.c_void_p), ("part", ctypes.c_void_p), ("ys", ctypes.c_void_p), ("ctrs", ctypes.c_void_p),
+                ("dim", ctypes.c_int), ("inter", ctypes.c_int)]
+
+
+class _ChainArgs2(ctypes.Structure):
+    _fields_ = [("a", _ChainArgs), ("h", ctypes.c_void_p), ("done", ctypes.c_void_p)]
+
+
+_chain_state: dict = {}  # per device: scratch buffers and the resident grid size
+
+
+def _chain_state_for(device: torch.device, inter: int):
+    st = _chain_state.get(device.index)
+    if st is None:
+        f = get_function("expert_chain.cu", "expert_chain_5120_2304", device)
+        nb = ctypes.c_int()
+        _check(_cuda.cuOccupancyMaxActiveBlocksPerMultiprocessor(ctypes.byref(nb), f, ctypes.c_int(256), ctypes.c_size_t(0)),
+               "cuOccupancyMaxActiveBlocksPerMultiprocessor")
+        sms = torch.cuda.get_device_properties(device).multi_processor_count
+        grid = int(os.environ.get("DSV41_PERSISTENT_GRID", "0")) or max(1, nb.value) * sms
+        st = _chain_state[device.index] = {
+            "f": f, "grid": grid,
+            "f1": get_function("expert_chain.cu", "expert_chain_p1_5120_2304", device),
+            "f2": get_function("expert_chain.cu", "expert_chain_p2_5120_2304", device),
+            "gu": torch.zeros(7, 2 * inter, device=device, dtype=torch.float32),
+            "h": torch.zeros(7, inter, device=device, dtype=torch.bfloat16),
+            "ctrs": torch.zeros(5, device=device, dtype=torch.int32),
+            "done": torch.zeros(8, device=device, dtype=torch.int32),
+        }
+        print(f"[expert-chain] {device}: {nb.value} resident blocks/SM x {sms} SMs -> grid {grid}", flush=True)
+    return st
+
+
+def expert_chain(xqp: torch.Tensor, xq: torch.Tensor, eid: torch.Tensor, wt: torch.Tensor, shard: tuple, sh: dict, moe,
+                 part: torch.Tensor, ys: torch.Tensor | None, mode: int | None = None) -> None:
+    """One launch for the whole expert phase of one token on this GPU (cuda/expert_chain.cu): the routed experts of
+    the shard [shard_start, shard_start + n) among the topk (eid, wt) pairs, and, when ys is given, the shared expert
+    (moe.sh_w13 / moe.sh_w2 as W8). part: fp32 [dim] (routed sum, routing weights applied), ys: bf16 [dim]."""
+    dim = xqp.shape[-1]
+    inter = moe.inter
+    mode = mode or PERSISTENT_EXPERT or 1
+    assert dim == 5120 and inter == 2304, (dim, inter)  # the compiled instantiation
+    st = _chain_state_for(xqp.device, inter)
+    a = _ChainArgs()
+    a.xqp, a.xq = xqp.data_ptr(), xq.data_ptr()
+    a.eid, a.wt = eid.data_ptr(), wt.data_ptr()
+    a.topk, a.shard_start, a.shard_n = eid.numel(), shard[0], shard[1]
+    a.w13, a.w13_stride = sh["w13"].data_ptr(), sh["w13"].stride(0)
+    a.s13, a.s13_stride = sh["s13"].data_ptr(), sh["s13"].stride(0)
+    a.w2, a.w2_stride = sh["w2"].data_ptr(), sh["w2"].stride(0)
+    a.s2, a.s2_stride = sh["s2"].data_ptr(), sh["s2"].stride(0)
+    if ys is not None:
+        w13, w2 = moe.sh_w13, moe.sh_w2
+        a.sh_w13, a.sh_s13, a.sh_s13_cols = w13.w8.data_ptr(), w13.s8.data_ptr(), w13.s8.shape[1]
+        a.sh_w2, a.sh_s2, a.sh_s2_cols = w2.w8.data_ptr(), w2.s8.data_ptr(), w2.s8.shape[1]
+        a.has_shared = 1
+        a.ys = ys.data_ptr()
+    else:
+        a.sh_w13 = a.sh_s13 = a.sh_w2 = a.sh_s2 = 0
+        a.sh_s13_cols = a.sh_s2_cols = 0
+        a.has_shared = 0
+        a.ys = 0
+    a.limit = float(moe.swiglu_limit)
+    a.gu, a.part, a.ctrs = st["gu"].data_ptr(), part.data_ptr(), st["ctrs"].data_ptr()
+    a.dim, a.inter = dim, inter
+    if mode == 2:  # single persistent launch (grid barrier)
+        launch(st["f"], (st["grid"], 1, 1), (256, 1, 1), [a], xqp.device)
+        return
+    b = _ChainArgs2()
+    b.a = a
+    b.h, b.done = st["h"].data_ptr(), st["done"].data_ptr()
+    # phase 1: one block per 8-row item; the number of local experts is only known on the device, so the grid covers
+    # the maximum (topk routed slots + shared) and surplus blocks exit at once
+    n1 = (eid.numel() + (1 if ys is not None else 0)) * (2 * inter // 8)
+    n2 = (dim // 8) * (2 if ys is not None else 1)
+    launch(st["f1"], (n1, 1, 1), (256, 1, 1), [b], xqp.device)
+    launch(st["f2"], (n2, 1, 1), (256, 1, 1), [b], xqp.device)

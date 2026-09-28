@@ -1,0 +1,3105 @@
+{
+ "S": 1,
+ "host_step_us": 20761.675899848342,
+ "host_sample_us": 92.85006672143936,
+ "layers": [
+  {
+   "layer": 0,
+   "dev": 2,
+   "phases": {
+    "attention+hc (0->1)": {
+     "wall": 149.6337890625,
+     "kernel": 162.946,
+     "overlap": 15.614945312499998,
+     "idle": 2.302734375
+    },
+    "hc_sub2 (1->8)": {
+     "wall": 9.18359375,
+     "kernel": 21.504,
+     "overlap": 7.487398437500001,
+     "idle": -4.8330078125
+    },
+    "gate+topk (8->9)": {
+     "wall": 17.9521484375,
+     "kernel": 15.488,
+     "overlap": -0.00028125000000045475,
+     "idle": 2.4638671875
+    },
+    "multicast issue (9->2)": {
+     "wall": 13.759765625,
+     "kernel": 12.352,
+     "overlap": 0.00043750000000031264,
+     "idle": 1.408203125
+    },
+    "local expert GEMMs (2->10)": {
+     "wall": 68.2568359375,
+     "kernel": 99.202,
+     "overlap": 32.321140625,
+     "idle": 1.3759765625
+    },
+    "shared-expert join (10->3)": {
+     "wall": 3.904296875,
+     "kernel": 2.56,
+     "overlap": 0.0004296875000000533,
+     "idle": 1.3447265625
+    },
+    "wait partials (3->4)": {
+     "wall": 3316.6728515625,
+     "kernel": 3315.201,
+     "overlap": -0.00017187499997817213,
+     "idle": 1.4716796875
+    },
+    "combine (4->5)": {
+     "wall": 4.224609375,
+     "kernel": 3.008,
+     "overlap": 0.0001875000000000071,
+     "idle": 1.216796875
+    }
+   },
+   "layer_wall": 3583.587890625,
+   "peer_windows": {
+    "3": {
+     "wall": 56.064453125,
+     "kernel": 54.111999999999995,
+     "route_arrival_after_owner_gate": 1025.123046875
+    },
+    "0": {
+     "wall": 90.7841796875,
+     "kernel": 88.768,
+     "route_arrival_after_owner_gate": 2229.7001953125
+    },
+    "1": {
+     "wall": 51.0087890625,
+     "kernel": 48.577,
+     "route_arrival_after_owner_gate": 3350.98828125
+    }
+   }
+  },
+  {
+   "layer": 1,
+   "dev": 2,
+   "phases": {
+    "attention+hc (0->1)": {
+     "wall": 299.04296875,
+     "kernel": 311.587,
+     "overlap": 15.649499999999989,
+     "idle": 3.10546875
+    },
+    "hc_sub2 (1->8)": {
+     "wall": 9.1201171875,
+     "kernel": 21.536,
+     "overlap": 7.552601562500001,
+     "idle": -4.86328125
+    },
+    "gate+topk (8->9)": {
+     "wall": 18.240234375,
+     "kernel": 15.424,
+     "overlap": 0.0001718749999994884,
+     "idle": 2.81640625
+    },
+    "multicast issue (9->2)": {
+     "wall": 13.537109375,
+     "kernel": 12.097,
+     "overlap": 0.00032031249999953104,
+     "idle": 1.4404296875
+    },
+    "local expert GEMMs (2->10)": {
+     "wall": 85.087890625,
+     "kernel": 109.952,
+     "overlap": 26.272312499999998,
+     "idle": 1.408203125
+    },
+    "shared-expert join (10->3)": {
+     "wall": 3.8720703125,
+     "kernel": 2.528,
+     "overlap": -0.00032031249999997513,
+     "idle": 1.34375
+    },
+    "wait partials (3->4)": {
+     "wall": 12.607421875,
+     "kernel": 11.136,
+     "overlap": 0.0002578124999992326,
+     "idle": 1.4716796875
+    },
+    "combine (4->5)": {
+     "wall": 4.0966796875,
+     "kernel": 3.072,
+     "overlap": -0.00026562499999993605,
+     "idle": 1.0244140625
+    }
+   },
+   "layer_wall": 445.6044921875,
+   "peer_windows": {
+    "3": {
+     "wall": 68.6396484375,
+     "kernel": 67.19999999999999,
+     "route_arrival_after_owner_gate": 13.1181640625
+    },
+    "0": {
+     "wall": 66.625,
+     "kernel": 65.28,
+     "route_arrival_after_owner_gate": 13.578125
+    },
+    "1": {
+     "wall": 23.4248046875,
+     "kernel": 21.953,
+     "route_arrival_after_owner_gate": 13.8662109375
+    }
+   }
+  },
+  {
+   "layer": 2,
+   "dev": 2,
+   "phases": {
+    "attention+hc (0->1)": {
+     "wall": 337.4443359375,
+     "kernel": 347.5240000000001,
+     "overlap": 15.264234375000115,
+     "idle": 5.1845703125
+    },
+    "hc_sub2 (1->8)": {
+     "wall": 9.18359375,
+     "kernel": 21.472,
+     "overlap": 7.647781250000001,
+     "idle": -4.640625
+    },
+    "gate+topk (8->9)": {
+     "wall": 18.0478515625,
+     "kernel": 15.456,
+     "overlap": -5.468750000048317e-05,
+     "idle": 2.591796875
+    },
+    "multicast issue (9->2)": {
+     "wall": 13.6005859375,
+     "kernel": 12.192,
+     "overlap": -0.00038281249999982947,
+     "idle": 1.408203125
+    },
+    "local expert GEMMs (2->10)": {
+     "wall": 38.5927734375,
+     "kernel": 74.946,
+     "overlap": 37.6969765625,
+     "idle": 1.34375
+    },
+    "shared-expert join (10->3)": {
+     "wall": 3.87109375,
+     "kernel": 2.527,
+     "overlap": -0.000343749999999865,
+     "idle": 1.34375
+    },
+    "wait partials (3->4)": {
+     "wall": 45.8564453125,
+     "kernel": 44.481,
+     "overlap": 0.0005312500000016485,
+     "idle": 1.3759765625
+    },
+    "combine (4->5)": {
+     "wall": 4.064453125,
+     "kernel": 2.912,
+     "overlap": -0.00010937500000007816,
+     "idle": 1.15234375
+    }
+   },
+   "layer_wall": 470.6611328125,
+   "peer_windows": {
+    "3": {
+     "wall": 69.439453125,
+     "kernel": 68.0,
+     "route_arrival_after_owner_gate": 13.2734375
+    },
+    "0": {
+     "wall": 86.880859375,
+     "kernel": 85.729,
+     "route_arrival_after_owner_gate": 13.640625
+    },
+    "1": {
+     "wall": 50.3037109375,
+     "kernel": 48.831999999999994,
+     "route_arrival_after_owner_gate": 13.7373046875
+    }
+   }
+  },
+  {
+   "layer": 3,
+   "dev": 2,
+   "phases": {
+    "attention+hc (0->1)": {
+     "wall": 147.009765625,
+     "kernel": 160.38599999999997,
+     "overlap": 15.390882812499967,
+     "idle": 2.0146484375
+    },
+    "hc_sub2 (1->8)": {
+     "wall": 9.3427734375,
+     "kernel": 21.535,
+     "overlap": 7.6785546875,
+     "idle": -4.513671875
+    },
+    "gate+topk (8->9)": {
+     "wall": 18.625,
+     "kernel": 15.712,
+     "overlap": 8.59374999997442e-05,
+     "idle": 2.9130859375
+    },
+    "multicast issue (9->2)": {
+     "wall": 13.9521484375,
+     "kernel": 12.512,
+     "overlap": 0.00028125000000045475,
+     "idle": 1.4404296875
+    },
+    "local expert GEMMs (2->10)": {
+     "wall": 67.873046875,
+     "kernel": 99.745,
+     "overlap": 33.280156250000005,
+     "idle": 1.408203125
+    },
+    "shared-expert join (10->3)": {
+     "wall": 3.9033203125,
+     "kernel": 2.528,
+     "overlap": -0.00032031249999997513,
+     "idle": 1.375
+    },
+    "wait partials (3->4)": {
+     "wall": 12.1923828125,
+     "kernel": 10.752,
+     "overlap": 4.687500000066791e-05,
+     "idle": 1.4404296875
+    },
+    "combine (4->5)": {
+     "wall": 4.2236328125,
+     "kernel": 3.072,
+     "overlap": -0.00026562499999993605,
+     "idle": 1.1513671875
+    }
+   },
+   "layer_wall": 277.1220703125,
+   "peer_windows": {
+    "3": {
+     "wall": 70.015625,
+     "kernel": 68.544,
+     "route_arrival_after_owner_gate": 13.494140625
+    },
+    "0": {
+     "wall": 67.6171875,
+     "kernel": 66.112,
+     "route_arrival_after_owner_gate": 14.21484375
+    },
+    "1": {
+     "wall": 48.416015625,
+     "kernel": 46.912,
+     "route_arrival_after_owner_gate": 14.2802734375
+    }
+   }
+  },
+  {
+   "layer": 4,
+   "dev": 2,
+   "phases": {
+    "attention+hc (0->1)": {
+     "wall": 146.2744140625,
+     "kernel": 159.778,
+     "overlap": 15.294601562499992,
+     "idle": 1.791015625
+    },
+    "hc_sub2 (1->8)": {
+     "wall": 9.2470703125,
+     "kernel": 21.281,
+     "overlap": 7.711664062499999,
+     "idle": -4.322265625
+    },
+    "gate+topk (8->9)": {
+     "wall": 18.0478515625,
+     "kernel": 15.552,
+     "overlap": 0.0002421874999996021,
+     "idle": 2.49609375
+    },
+    "multicast issue (9->2)": {
+     "wall": 13.28125,
+     "kernel": 11.873,
+     "overlap": -4.687500000066791e-05,
+     "idle": 1.408203125
+    },
+    "local expert GEMMs (2->10)": {
+     "wall": 117.5048828125,
+     "kernel": 156.45,
+     "overlap": 40.16093749999999,
+     "idle": 1.2158203125
+    },
+    "shared-expert join (10->3)": {
+     "wall": 4.255859375,
+     "kernel": 2.912,
+     "overlap": -0.00010937500000007816,
+     "idle": 1.34375
+    },
+    "wait partials (3->4)": {
+     "wall": 12.3515625,
+     "kernel": 10.911999999999999,
+     "overlap": -0.00010937500000096634,
+     "idle": 1.439453125
+    },
+    "combine (4->5)": {
+     "wall": 4.224609375,
+     "kernel": 3.008,
+     "overlap": 0.0001875000000000071,
+     "idle": 1.216796875
+    }
+   },
+   "layer_wall": 325.1875,
+   "peer_windows": {
+    "3": {
+     "wall": 48.576171875,
+     "kernel": 46.976,
+     "route_arrival_after_owner_gate": 12.8837890625
+    },
+    "0": {
+     "wall": 50.240234375,
+     "kernel": 48.608,
+     "route_arrival_after_owner_gate": 13.5439453125
+    },
+    "1": {
+     "wall": 23.392578125,
+     "kernel": 21.759999999999998,
+     "route_arrival_after_owner_gate": 13.4794921875
+    }
+   }
+  },
+  {
+   "layer": 5,
+   "dev": 2,
+   "phases": {
+    "attention+hc (0->1)": {
+     "wall": 149.4423828125,
+     "kernel": 162.14699999999996,
+     "overlap": 14.752468749999963,
+     "idle": 2.0478515625
+    },
+    "hc_sub2 (1->8)": {
+     "wall": 9.1201171875,
+     "kernel": 21.408,
+     "overlap": 7.551554687500001,
+     "idle": -4.736328125
+    },
+    "gate+topk (8->9)": {
+     "wall": 18.080078125,
+     "kernel": 15.648,
+     "overlap": -0.00043750000000031264,
+     "idle": 2.431640625
+    },
+    "multicast issue (9->2)": {
+     "wall": 15.0400390625,
+     "kernel": 13.664,
+     "overlap": -6.250000000029843e-05,
+     "idle": 1.3759765625
+    },
+    "local expert GEMMs (2->10)": {
+     "wall": 38.880859375,
+     "kernel": 71.682,
+     "overlap": 34.144890625,
+     "idle": 1.34375
+    },
+    "shared-expert join (10->3)": {
+     "wall": 3.90234375,
+     "kernel": 2.592,
+     "overlap": 0.0002031250000000817,
+     "idle": 1.310546875
+    },
+    "wait partials (3->4)": {
+     "wall": 44.76953125,
+     "kernel": 43.361,
+     "overlap": -0.000328125000002899,
+     "idle": 1.408203125
+    },
+    "combine (4->5)": {
+     "wall": 4.0634765625,
+     "kernel": 2.944,
+     "overlap": -0.00033593750000004974,
+     "idle": 1.119140625
+    }
+   },
+   "layer_wall": 283.298828125,
+   "peer_windows": {
+    "3": {
+     "wall": 86.4306640625,
+     "kernel": 85.151,
+     "route_arrival_after_owner_gate": 14.5439453125
+    },
+    "0": {
+     "wall": 85.50390625,
+     "kernel": 84.12800000000001,
+     "route_arrival_after_owner_gate": 15.26953125
+    },
+    "1": {
+     "wall": 23.4248046875,
+     "kernel": 21.793,
+     "route_arrival_after_owner_gate": 15.2373046875
+    }
+   }
+  },
+  {
+   "layer": 6,
+   "dev": 2,
+   "phases": {
+    "attention+hc (0->1)": {
+     "wall": 147.009765625,
+     "kernel": 159.90599999999995,
+     "overlap": 14.751703124999949,
+     "idle": 1.85546875
+    },
+    "hc_sub2 (1->8)": {
+     "wall": 9.7587890625,
+     "kernel": 21.215,
+     "overlap": 8.127109375,
+     "idle": -3.3291015625
+    },
+    "gate+topk (8->9)": {
+     "wall": 18.015625,
+     "kernel": 15.424,
+     "overlap": 0.0001718749999994884,
+     "idle": 2.591796875
+    },
+    "multicast issue (9->2)": {
+     "wall": 14.0498046875,
+     "kernel": 12.64,
+     "overlap": 0.00035156250000056843,
+     "idle": 1.41015625
+    },
+    "local expert GEMMs (2->10)": {
+     "wall": 86.81640625,
+     "kernel": 112.96100000000001,
+     "overlap": 27.551820312500013,
+     "idle": 1.4072265625
+    },
+    "shared-expert join (10->3)": {
+     "wall": 3.904296875,
+     "kernel": 2.56,
+     "overlap": 0.0004296875000000533,
+     "idle": 1.3447265625
+    },
+    "wait partials (3->4)": {
+     "wall": 12.576171875,
+     "kernel": 11.136,
+     "overlap": -0.0007187500000007674,
+     "idle": 1.439453125
+    },
+    "combine (4->5)": {
+     "wall": 4.255859375,
+     "kernel": 3.072,
+     "overlap": -0.00026562499999993605,
+     "idle": 1.18359375
+    }
+   },
+   "layer_wall": 296.38671875,
+   "peer_windows": {
+    "3": {
+     "wall": 23.232421875,
+     "kernel": 21.6,
+     "route_arrival_after_owner_gate": 13.646484375
+    },
+    "0": {
+     "wall": 69.087890625,
+     "kernel": 67.36,
+     "route_arrival_after_owner_gate": 14.310546875
+    },
+    "1": {
+     "wall": 67.6484375,
+     "kernel": 65.984,
+     "route_arrival_after_owner_gate": 14.375
+    }
+   }
+  },
+  {
+   "layer": 7,
+   "dev": 2,
+   "phases": {
+    "attention+hc (0->1)": {
+     "wall": 145.4423828125,
+     "kernel": 160.80299999999997,
+     "overlap": 17.15260937499997,
+     "idle": 1.7919921875
+    },
+    "hc_sub2 (1->8)": {
+     "wall": 9.279296875,
+     "kernel": 22.366999999999997,
+     "overlap": 7.742976562499997,
+     "idle": -5.3447265625
+    },
+    "gate+topk (8->9)": {
+     "wall": 18.2080078125,
+     "kernel": 15.712,
+     "overlap": 8.59374999997442e-05,
+     "idle": 2.49609375
+    },
+    "multicast issue (9->2)": {
+     "wall": 14.0810546875,
+     "kernel": 12.705,
+     "overlap": -7.812499999992895e-05,
+     "idle": 1.3759765625
+    },
+    "local expert GEMMs (2->10)": {
+     "wall": 63.935546875,
+     "kernel": 90.528,
+     "overlap": 27.967453125000006,
+     "idle": 1.375
+    },
+    "shared-expert join (10->3)": {
+     "wall": 3.873046875,
+     "kernel": 2.529,
+     "overlap": -0.00029687500000008527,
+     "idle": 1.34375
+    },
+    "wait partials (3->4)": {
+     "wall": 20.48046875,
+     "kernel": 19.008000000000003,
+     "overlap": 0.00018750000000267164,
+     "idle": 1.47265625
+    },
+    "combine (4->5)": {
+     "wall": 4.1591796875,
+     "kernel": 2.976,
+     "overlap": 0.0004140624999999787,
+     "idle": 1.18359375
+    }
+   },
+   "layer_wall": 279.458984375,
+   "peer_windows": {
+    "3": {
+     "wall": 87.0400390625,
+     "kernel": 85.792,
+     "route_arrival_after_owner_gate": 13.70703125
+    },
+    "0": {
+     "wall": 52.3212890625,
+     "kernel": 50.593,
+     "route_arrival_after_owner_gate": 14.1162109375
+    },
+    "1": {
+     "wall": 49.3759765625,
+     "kernel": 47.67999999999999,
+     "route_arrival_after_owner_gate": 14.3740234375
+    }
+   }
+  },
+  {
+   "layer": 8,
+   "dev": 2,
+   "phases": {
+    "attention+hc (0->1)": {
+     "wall": 331.619140625,
+     "kernel": 341.2190000000001,
+     "overlap": 14.947515625000108,
+     "idle": 5.34765625
+    },
+    "hc_sub2 (1->8)": {
+     "wall": 9.5361328125,
+     "kernel": 21.376,
+     "overlap": 7.872093750000001,
+     "idle": -3.9677734375
+    },
+    "gate+topk (8->9)": {
+     "wall": 18.015625,
+     "kernel": 15.328,
+     "overlap": -0.00012500000000059686,
+     "idle": 2.6875
+    },
+    "multicast issue (9->2)": {
+     "wall": 14.1123046875,
+     "kernel": 12.672,
+     "overlap": 0.00012500000000059686,
+     "idle": 1.4404296875
+    },
+    "local expert GEMMs (2->10)": {
+     "wall": 67.712890625,
+     "kernel": 97.697,
+     "overlap": 31.360085937500003,
+     "idle": 1.3759765625
+    },
+    "shared-expert join (10->3)": {
+     "wall": 3.8720703125,
+     "kernel": 2.528,
+     "overlap": -0.00032031249999997513,
+     "idle": 1.34375
+    },
+    "wait partials (3->4)": {
+     "wall": 12.3837890625,
+     "kernel": 10.943999999999999,
+     "overlap": -0.0003359375000009379,
+     "idle": 1.439453125
+    },
+    "combine (4->5)": {
+     "wall": 4.16015625,
+     "kernel": 2.976,
+     "overlap": 0.0004140624999999787,
+     "idle": 1.1845703125
+    }
+   },
+   "layer_wall": 461.412109375,
+   "peer_windows": {
+    "3": {
+     "wall": 47.2001953125,
+     "kernel": 45.727999999999994,
+     "route_arrival_after_owner_gate": 13.7646484375
+    },
+    "0": {
+     "wall": 52.0654296875,
+     "kernel": 50.561,
+     "route_arrival_after_owner_gate": 14.3388671875
+    },
+    "1": {
+     "wall": 81.953125,
+     "kernel": 80.801,
+     "route_arrival_after_owner_gate": 14.244140625
+    }
+   }
+  },
+  {
+   "layer": 9,
+   "dev": 2,
+   "phases": {
+    "attention+hc (0->1)": {
+     "wall": 145.986328125,
+     "kernel": 158.435,
+     "overlap": 14.657656250000002,
+     "idle": 2.208984375
+    },
+    "hc_sub2 (1->8)": {
+     "wall": 9.3759765625,
+     "kernel": 22.112000000000002,
+     "overlap": 7.808289062500002,
+     "idle": -4.927734375
+    },
+    "gate+topk (8->9)": {
+     "wall": 17.0556640625,
+     "kernel": 15.584,
+     "overlap": 1.5624999999630518e-05,
+     "idle": 1.4716796875
+    },
+    "multicast issue (9->2)": {
+     "wall": 13.984375,
+     "kernel": 12.576,
+     "overlap": -0.0001718749999994884,
+     "idle": 1.408203125
+    },
+    "local expert GEMMs (2->10)": {
+     "wall": 80.4169921875,
+     "kernel": 119.074,
+     "overlap": 40.001734375,
+     "idle": 1.3447265625
+    },
+    "shared-expert join (10->3)": {
+     "wall": 3.83984375,
+     "kernel": 2.528,
+     "overlap": -0.00032031249999997513,
+     "idle": 1.3115234375
+    },
+    "wait partials (3->4)": {
+     "wall": 20.255859375,
+     "kernel": 18.880000000000003,
+     "overlap": 0.00011718750000255795,
+     "idle": 1.3759765625
+    },
+    "combine (4->5)": {
+     "wall": 4.7041015625,
+     "kernel": 2.848,
+     "overlap": 0.000343749999999865,
+     "idle": 1.8564453125
+    }
+   },
+   "layer_wall": 295.619140625,
+   "peer_windows": {
+    "3": {
+     "wall": 23.3603515625,
+     "kernel": 21.951999999999998,
+     "route_arrival_after_owner_gate": 13.6337890625
+    },
+    "0": {
+     "wall": 103.0732421875,
+     "kernel": 102.33699999999999,
+     "route_arrival_after_owner_gate": 14.2099609375
+    },
+    "1": {
+     "wall": 23.4560546875,
+     "kernel": 21.953,
+     "route_arrival_after_owner_gate": 14.0517578125
+    }
+   }
+  },
+  {
+   "layer": 10,
+   "dev": 3,
+   "phases": {
+    "attention+hc (0->1)": {
+     "wall": 148.1591796875,
+     "kernel": 161.34199999999998,
+     "overlap": 15.327351562499985,
+     "idle": 2.14453125
+    },
+    "hc_sub2 (1->8)": {
+     "wall": 9.2490234375,
+     "kernel": 21.698,
+     "overlap": 7.680421875,
+     "idle": -4.7685546875
+    },
+    "gate+topk (8->9)": {
+     "wall": 18.1435546875,
+     "kernel": 15.551,
+     "overlap": 0.00021875000000015632,
+     "idle": 2.5927734375
+    },
+    "multicast issue (9->2)": {
+     "wall": 14.8798828125,
+     "kernel": 13.6,
+     "overlap": 0.00039062499999964473,
+     "idle": 1.2802734375
+    },
+    "local expert GEMMs (2->10)": {
+     "wall": 66.4326171875,
+     "kernel": 97.827,
+     "overlap": 32.6736796875,
+     "idle": 1.279296875
+    },
+    "shared-expert join (10->3)": {
+     "wall": 3.8388671875,
+     "kernel": 2.56,
+     "overlap": 0.0004296875000000533,
+     "idle": 1.279296875
+    },
+    "wait partials (3->4)": {
+     "wall": 12.44921875,
+     "kernel": 11.105,
+     "overlap": 0.0005078125000004263,
+     "idle": 1.3447265625
+    },
+    "combine (4->5)": {
+     "wall": 4.0634765625,
+     "kernel": 2.976,
+     "overlap": 0.0004140624999999787,
+     "idle": 1.087890625
+    }
+   },
+   "layer_wall": 277.2158203125,
+   "peer_windows": {
+    "2": {
+     "wall": 49.9853515625,
+     "kernel": 48.352999999999994,
+     "route_arrival_after_owner_gate": 14.81640625
+    },
+    "0": {
+     "wall": 68.640625,
+     "kernel": 67.168,
+     "route_arrival_after_owner_gate": 15.2978515625
+    },
+    "1": {
+     "wall": 70.431640625,
+     "kernel": 68.928,
+     "route_arrival_after_owner_gate": 15.267578125
+    }
+   }
+  },
+  {
+   "layer": 11,
+   "dev": 3,
+   "phases": {
+    "attention+hc (0->1)": {
+     "wall": 145.9501953125,
+     "kernel": 161.27799999999996,
+     "overlap": 17.024093749999963,
+     "idle": 1.6962890625
+    },
+    "hc_sub2 (1->8)": {
+     "wall": 8.9296875,
+     "kernel": 21.154,
+     "overlap": 7.456734375,
+     "idle": -4.767578125
+    },
+    "gate+topk (8->9)": {
+     "wall": 17.88671875,
+     "kernel": 15.487,
+     "overlap": -0.0003046874999999005,
+     "idle": 2.3994140625
+    },
+    "multicast issue (9->2)": {
+     "wall": 14.3359375,
+     "kernel": 13.023,
+     "overlap": -0.00043750000000031264,
+     "idle": 1.3125
+    },
+    "local expert GEMMs (2->10)": {
+     "wall": 105.537109375,
+     "kernel": 137.538,
+     "overlap": 33.08878125000001,
+     "idle": 1.087890625
+    },
+    "shared-expert join (10->3)": {
+     "wall": 3.7763671875,
+     "kernel": 2.528,
+     "overlap": -0.00032031249999997513,
+     "idle": 1.248046875
+    },
+    "wait partials (3->4)": {
+     "wall": 12.4150390625,
+     "kernel": 11.007000000000001,
+     "overlap": 0.0001640625000014495,
+     "idle": 1.408203125
+    },
+    "combine (4->5)": {
+     "wall": 4.064453125,
+     "kernel": 2.945,
+     "overlap": -0.00031250000000015987,
+     "idle": 1.119140625
+    }
+   },
+   "layer_wall": 312.8955078125,
+   "peer_windows": {
+    "2": {
+     "wall": 53.6015625,
+     "kernel": 51.905,
+     "route_arrival_after_owner_gate": 14.33984375
+    },
+    "0": {
+     "wall": 52.576171875,
+     "kernel": 51.104000000000006,
+     "route_arrival_after_owner_gate": 14.5966796875
+    },
+    "1": {
+     "wall": 48.6396484375,
+     "kernel": 47.104000000000006,
+     "route_arrival_after_owner_gate": 14.6943359375
+    }
+   }
+  },
+  {
+   "layer": 12,
+   "dev": 3,
+   "phases": {
+    "attention+hc (0->1)": {
+     "wall": 146.3662109375,
+     "kernel": 159.294,
+     "overlap": 14.974664062500011,
+     "idle": 2.046875
+    },
+    "hc_sub2 (1->8)": {
+     "wall": 8.9599609375,
+     "kernel": 21.377,
+     "overlap": 7.422898437499999,
+     "idle": -4.994140625
+    },
+    "gate+topk (8->9)": {
+     "wall": 17.8564453125,
+     "kernel": 15.455,
+     "overlap": -7.812499999992895e-05,
+     "idle": 2.4013671875
+    },
+    "multicast issue (9->2)": {
+     "wall": 14.560546875,
+     "kernel": 13.281,
+     "overlap": -0.00024999999999941735,
+     "idle": 1.279296875
+    },
+    "local expert GEMMs (2->10)": {
+     "wall": 82.7509765625,
+     "kernel": 109.792,
+     "overlap": 28.25684375,
+     "idle": 1.2158203125
+    },
+    "shared-expert join (10->3)": {
+     "wall": 3.77734375,
+     "kernel": 2.56,
+     "overlap": 0.0004296875000000533,
+     "idle": 1.2177734375
+    },
+    "wait partials (3->4)": {
+     "wall": 12.3515625,
+     "kernel": 11.039,
+     "overlap": -6.250000000029843e-05,
+     "idle": 1.3125
+    },
+    "combine (4->5)": {
+     "wall": 4.0634765625,
+     "kernel": 3.008,
+     "overlap": 0.0001875000000000071,
+     "idle": 1.0556640625
+    }
+   },
+   "layer_wall": 290.6865234375,
+   "peer_windows": {
+    "2": {
+     "wall": 54.048828125,
+     "kernel": 52.385,
+     "route_arrival_after_owner_gate": 14.8232421875
+    },
+    "0": {
+     "wall": 50.2080078125,
+     "kernel": 48.512,
+     "route_arrival_after_owner_gate": 14.9833984375
+    },
+    "1": {
+     "wall": 69.5673828125,
+     "kernel": 68.0,
+     "route_arrival_after_owner_gate": 14.82421875
+    }
+   }
+  },
+  {
+   "layer": 13,
+   "dev": 3,
+   "phases": {
+    "attention+hc (0->1)": {
+     "wall": 145.6337890625,
+     "kernel": 159.393,
+     "overlap": 15.55315625,
+     "idle": 1.7939453125
+    },
+    "hc_sub2 (1->8)": {
+     "wall": 9.21484375,
+     "kernel": 21.534000000000002,
+     "overlap": 7.6472812500000025,
+     "idle": -4.671875
+    },
+    "gate+topk (8->9)": {
+     "wall": 18.015625,
+     "kernel": 15.424,
+     "overlap": 0.0001718749999994884,
+     "idle": 2.591796875
+    },
+    "multicast issue (9->2)": {
+     "wall": 14.017578125,
+     "kernel": 12.705,
+     "overlap": -7.812499999992895e-05,
+     "idle": 1.3125
+    },
+    "local expert GEMMs (2->10)": {
+     "wall": 39.6142578125,
+     "kernel": 72.63799999999999,
+     "overlap": 34.30303906249999,
+     "idle": 1.279296875
+    },
+    "shared-expert join (10->3)": {
+     "wall": 3.744140625,
+     "kernel": 2.528,
+     "overlap": -0.00032031249999997513,
+     "idle": 1.2158203125
+    },
+    "wait partials (3->4)": {
+     "wall": 46.3056640625,
+     "kernel": 44.928000000000004,
+     "overlap": 0.00026562500000437694,
+     "idle": 1.3779296875
+    },
+    "combine (4->5)": {
+     "wall": 4.0,
+     "kernel": 2.88,
+     "overlap": 0.00011718749999989342,
+     "idle": 1.1201171875
+    }
+   },
+   "layer_wall": 280.5458984375,
+   "peer_windows": {
+    "2": {
+     "wall": 49.8251953125,
+     "kernel": 48.193000000000005,
+     "route_arrival_after_owner_gate": 14.2177734375
+    },
+    "0": {
+     "wall": 69.44140625,
+     "kernel": 67.713,
+     "route_arrival_after_owner_gate": 14.5048828125
+    },
+    "1": {
+     "wall": 88.2568359375,
+     "kernel": 87.168,
+     "route_arrival_after_owner_gate": 14.5068359375
+    }
+   }
+  },
+  {
+   "layer": 14,
+   "dev": 3,
+   "phases": {
+    "attention+hc (0->1)": {
+     "wall": 488.9912109375,
+     "kernel": 498.94200000000006,
+     "overlap": 16.769148437500064,
+     "idle": 6.818359375
+    },
+    "hc_sub2 (1->8)": {
+     "wall": 9.376953125,
+     "kernel": 21.153,
+     "overlap": 7.777023437499999,
+     "idle": -3.9990234375
+    },
+    "gate+topk (8->9)": {
+     "wall": 18.1435546875,
+     "kernel": 15.487,
+     "overlap": -0.0003046874999999005,
+     "idle": 2.65625
+    },
+    "multicast issue (9->2)": {
+     "wall": 14.6552734375,
+     "kernel": 13.216,
+     "overlap": 0.00017968749999930367,
+     "idle": 1.439453125
+    },
+    "local expert GEMMs (2->10)": {
+     "wall": 86.912109375,
+     "kernel": 114.048,
+     "overlap": 28.512843750000002,
+     "idle": 1.376953125
+    },
+    "shared-expert join (10->3)": {
+     "wall": 3.8720703125,
+     "kernel": 2.528,
+     "overlap": -0.00032031249999997513,
+     "idle": 1.34375
+    },
+    "wait partials (3->4)": {
+     "wall": 12.1923828125,
+     "kernel": 10.688,
+     "overlap": -0.00047656249999938893,
+     "idle": 1.50390625
+    },
+    "combine (4->5)": {
+     "wall": 4.1611328125,
+     "kernel": 2.944,
+     "overlap": -0.00033593750000004974,
+     "idle": 1.216796875
+    }
+   },
+   "layer_wall": 638.3046875,
+   "peer_windows": {
+    "2": {
+     "wall": 65.3447265625,
+     "kernel": 63.713,
+     "route_arrival_after_owner_gate": 14.51171875
+    },
+    "0": {
+     "wall": 23.4248046875,
+     "kernel": 21.728,
+     "route_arrival_after_owner_gate": 14.8291015625
+    },
+    "1": {
+     "wall": 66.49609375,
+     "kernel": 64.89500000000001,
+     "route_arrival_after_owner_gate": 14.89453125
+    }
+   }
+  },
+  {
+   "layer": 15,
+   "dev": 3,
+   "phases": {
+    "attention+hc (0->1)": {
+     "wall": 147.966796875,
+     "kernel": 160.96000000000004,
+     "overlap": 14.912148437500036,
+     "idle": 1.9189453125
+    },
+    "hc_sub2 (1->8)": {
+     "wall": 9.28125,
+     "kernel": 21.825000000000003,
+     "overlap": 7.744921875000003,
+     "idle": -4.798828125
+    },
+    "gate+topk (8->9)": {
+     "wall": 18.2392578125,
+     "kernel": 15.487,
+     "overlap": -0.0003046874999999005,
+     "idle": 2.751953125
+    },
+    "multicast issue (9->2)": {
+     "wall": 13.439453125,
+     "kernel": 12.032,
+     "overlap": -0.00022656249999997158,
+     "idle": 1.4072265625
+    },
+    "local expert GEMMs (2->10)": {
+     "wall": 78.8798828125,
+     "kernel": 118.945,
+     "overlap": 41.40886718749999,
+     "idle": 1.34375
+    },
+    "shared-expert join (10->3)": {
+     "wall": 3.9375,
+     "kernel": 2.593,
+     "overlap": 0.00022656249999997158,
+     "idle": 1.3447265625
+    },
+    "wait partials (3->4)": {
+     "wall": 12.3505859375,
+     "kernel": 10.943,
+     "overlap": 0.0006171874999996163,
+     "idle": 1.408203125
+    },
+    "combine (4->5)": {
+     "wall": 4.16015625,
+     "kernel": 3.008,
+     "overlap": 0.0001875000000000071,
+     "idle": 1.15234375
+    }
+   },
+   "layer_wall": 288.2548828125,
+   "peer_windows": {
+    "2": {
+     "wall": 23.392578125,
+     "kernel": 21.951999999999998,
+     "route_arrival_after_owner_gate": 13.3623046875
+    },
+    "0": {
+     "wall": 87.16796875,
+     "kernel": 85.824,
+     "route_arrival_after_owner_gate": 13.8720703125
+    },
+    "1": {
+     "wall": 50.6884765625,
+     "kernel": 49.057,
+     "route_arrival_after_owner_gate": 13.8408203125
+    }
+   }
+  },
+  {
+   "layer": 16,
+   "dev": 3,
+   "phases": {
+    "attention+hc (0->1)": {
+     "wall": 146.3994140625,
+     "kernel": 159.48800000000003,
+     "overlap": 15.104210937500028,
+     "idle": 2.015625
+    },
+    "hc_sub2 (1->8)": {
+     "wall": 9.408203125,
+     "kernel": 21.984,
+     "overlap": 7.872671875000002,
+     "idle": -4.703125
+    },
+    "gate+topk (8->9)": {
+     "wall": 18.3359375,
+     "kernel": 15.616,
+     "overlap": 0.0007656249999996589,
+     "idle": 2.720703125
+    },
+    "multicast issue (9->2)": {
+     "wall": 14.3046875,
+     "kernel": 12.865,
+     "overlap": -0.00023437499999978684,
+     "idle": 1.439453125
+    },
+    "local expert GEMMs (2->10)": {
+     "wall": 97.087890625,
+     "kernel": 137.249,
+     "overlap": 41.344703124999995,
+     "idle": 1.18359375
+    },
+    "shared-expert join (10->3)": {
+     "wall": 4.0,
+     "kernel": 2.656,
+     "overlap": -0.00024999999999986144,
+     "idle": 1.34375
+    },
+    "wait partials (3->4)": {
+     "wall": 12.4482421875,
+     "kernel": 11.009,
+     "overlap": 0.00021093750000034106,
+     "idle": 1.439453125
+    },
+    "combine (4->5)": {
+     "wall": 4.1591796875,
+     "kernel": 3.008,
+     "overlap": 0.0001875000000000071,
+     "idle": 1.1513671875
+    }
+   },
+   "layer_wall": 306.1435546875,
+   "peer_windows": {
+    "2": {
+     "wall": 49.0888671875,
+     "kernel": 47.583999999999996,
+     "route_arrival_after_owner_gate": 14.26171875
+    },
+    "0": {
+     "wall": 23.4560546875,
+     "kernel": 21.92,
+     "route_arrival_after_owner_gate": 14.513671875
+    },
+    "1": {
+     "wall": 70.1767578125,
+     "kernel": 69.08900000000001,
+     "route_arrival_after_owner_gate": 14.5478515625
+    }
+   }
+  },
+  {
+   "layer": 17,
+   "dev": 3,
+   "phases": {
+    "attention+hc (0->1)": {
+     "wall": 146.271484375,
+     "kernel": 159.39300000000003,
+     "overlap": 15.008234375000029,
+     "idle": 1.88671875
+    },
+    "hc_sub2 (1->8)": {
+     "wall": 9.056640625,
+     "kernel": 21.504,
+     "overlap": 7.520601562500001,
+     "idle": -4.9267578125
+    },
+    "gate+topk (8->9)": {
+     "wall": 18.20703125,
+     "kernel": 15.552,
+     "overlap": 0.0002421874999996021,
+     "idle": 2.6552734375
+    },
+    "multicast issue (9->2)": {
+     "wall": 13.568359375,
+     "kernel": 12.128,
+     "overlap": 7.031250000011369e-05,
+     "idle": 1.4404296875
+    },
+    "local expert GEMMs (2->10)": {
+     "wall": 68.9921875,
+     "kernel": 98.43199999999999,
+     "overlap": 30.848015624999988,
+     "idle": 1.408203125
+    },
+    "shared-expert join (10->3)": {
+     "wall": 3.8720703125,
+     "kernel": 2.528,
+     "overlap": -0.00032031249999997513,
+     "idle": 1.34375
+    },
+    "wait partials (3->4)": {
+     "wall": 12.416015625,
+     "kernel": 10.943999999999999,
+     "overlap": 0.0006406249999990621,
+     "idle": 1.47265625
+    },
+    "combine (4->5)": {
+     "wall": 4.16015625,
+     "kernel": 3.008,
+     "overlap": 0.0001875000000000071,
+     "idle": 1.15234375
+    }
+   },
+   "layer_wall": 276.5439453125,
+   "peer_windows": {
+    "2": {
+     "wall": 69.28125,
+     "kernel": 68.09700000000001,
+     "route_arrival_after_owner_gate": 13.9775390625
+    },
+    "0": {
+     "wall": 52.0966796875,
+     "kernel": 50.529,
+     "route_arrival_after_owner_gate": 13.8125
+    },
+    "1": {
+     "wall": 67.359375,
+     "kernel": 65.92,
+     "route_arrival_after_owner_gate": 13.8466796875
+    }
+   }
+  },
+  {
+   "layer": 18,
+   "dev": 3,
+   "phases": {
+    "attention+hc (0->1)": {
+     "wall": 146.9443359375,
+     "kernel": 161.18500000000003,
+     "overlap": 16.16156250000003,
+     "idle": 1.9208984375
+    },
+    "hc_sub2 (1->8)": {
+     "wall": 9.248046875,
+     "kernel": 22.016,
+     "overlap": 7.840218749999998,
+     "idle": -4.927734375
+    },
+    "gate+topk (8->9)": {
+     "wall": 18.65625,
+     "kernel": 15.808,
+     "overlap": 0.00038281249999982947,
+     "idle": 2.8486328125
+    },
+    "multicast issue (9->2)": {
+     "wall": 13.759765625,
+     "kernel": 12.416,
+     "overlap": -1.5624999999630518e-05,
+     "idle": 1.34375
+    },
+    "local expert GEMMs (2->10)": {
+     "wall": 64.6396484375,
+     "kernel": 88.76799999999999,
+     "overlap": 25.408624999999986,
+     "idle": 1.2802734375
+    },
+    "shared-expert join (10->3)": {
+     "wall": 3.7763671875,
+     "kernel": 2.496,
+     "overlap": -9.375000000000355e-05,
+     "idle": 1.2802734375
+    },
+    "wait partials (3->4)": {
+     "wall": 12.255859375,
+     "kernel": 10.945,
+     "overlap": -0.0003124999999997158,
+     "idle": 1.310546875
+    },
+    "combine (4->5)": {
+     "wall": 4.16015625,
+     "kernel": 3.008,
+     "overlap": 0.0001875000000000071,
+     "idle": 1.15234375
+    }
+   },
+   "layer_wall": 273.4404296875,
+   "peer_windows": {
+    "2": {
+     "wall": 71.7451171875,
+     "kernel": 70.177,
+     "route_arrival_after_owner_gate": 13.8193359375
+    },
+    "0": {
+     "wall": 67.9365234375,
+     "kernel": 66.721,
+     "route_arrival_after_owner_gate": 14.2939453125
+    },
+    "1": {
+     "wall": 50.1435546875,
+     "kernel": 48.767999999999994,
+     "route_arrival_after_owner_gate": 14.1357421875
+    }
+   }
+  },
+  {
+   "layer": 19,
+   "dev": 3,
+   "phases": {
+    "attention+hc (0->1)": {
+     "wall": 146.400390625,
+     "kernel": 161.376,
+     "overlap": 16.735375000000005,
+     "idle": 1.759765625
+    },
+    "hc_sub2 (1->8)": {
+     "wall": 9.34375,
+     "kernel": 22.624000000000002,
+     "overlap": 8.064429687500002,
+     "idle": -5.2158203125
+    },
+    "gate+topk (8->9)": {
+     "wall": 16.767578125,
+     "kernel": 15.296,
+     "overlap": 0.00010156249999937472,
+     "idle": 1.4716796875
+    },
+    "multicast issue (9->2)": {
+     "wall": 15.072265625,
+     "kernel": 13.76,
+     "overlap": 0.00023437499999978684,
+     "idle": 1.3125
+    },
+    "local expert GEMMs (2->10)": {
+     "wall": 82.8486328125,
+     "kernel": 106.816,
+     "overlap": 25.247640625000003,
+     "idle": 1.2802734375
+    },
+    "shared-expert join (10->3)": {
+     "wall": 3.775390625,
+     "kernel": 2.528,
+     "overlap": -0.00032031249999997513,
+     "idle": 1.2470703125
+    },
+    "wait partials (3->4)": {
+     "wall": 12.255859375,
+     "kernel": 10.912,
+     "overlap": -0.00010937499999918998,
+     "idle": 1.34375
+    },
+    "combine (4->5)": {
+     "wall": 4.640625,
+     "kernel": 2.848,
+     "overlap": 0.000343749999999865,
+     "idle": 1.79296875
+    }
+   },
+   "layer_wall": 291.1044921875,
+   "peer_windows": {
+    "2": {
+     "wall": 52.9599609375,
+     "kernel": 51.297,
+     "route_arrival_after_owner_gate": 14.9755859375
+    },
+    "0": {
+     "wall": 23.4560546875,
+     "kernel": 21.92,
+     "route_arrival_after_owner_gate": 15.2880859375
+    },
+    "1": {
+     "wall": 87.6806640625,
+     "kernel": 86.59299999999999,
+     "route_arrival_after_owner_gate": 15.482421875
+    }
+   }
+  },
+  {
+   "layer": 20,
+   "dev": 0,
+   "phases": {
+    "attention+hc (0->1)": {
+     "wall": 474.5322265625,
+     "kernel": 484.77099999999996,
+     "overlap": 16.449710937499958,
+     "idle": 6.2109375
+    },
+    "hc_sub2 (1->8)": {
+     "wall": 9.2783203125,
+     "kernel": 21.63,
+     "overlap": 7.647578124999999,
+     "idle": -4.7041015625
+    },
+    "gate+topk (8->9)": {
+     "wall": 18.529296875,
+     "kernel": 15.457,
+     "overlap": -3.1249999999261036e-05,
+     "idle": 3.072265625
+    },
+    "multicast issue (9->2)": {
+     "wall": 13.1201171875,
+     "kernel": 11.712,
+     "overlap": 8.59374999997442e-05,
+     "idle": 1.408203125
+    },
+    "local expert GEMMs (2->10)": {
+     "wall": 103.2314453125,
+     "kernel": 131.04,
+     "overlap": 28.992148437499992,
+     "idle": 1.18359375
+    },
+    "shared-expert join (10->3)": {
+     "wall": 3.8720703125,
+     "kernel": 2.56,
+     "overlap": 0.0004296875000000533,
+     "idle": 1.3125
+    },
+    "wait partials (3->4)": {
+     "wall": 12.2890625,
+     "kernel": 10.881,
+     "overlap": 0.00014062500000022737,
+     "idle": 1.408203125
+    },
+    "combine (4->5)": {
+     "wall": 4.4482421875,
+     "kernel": 3.264,
+     "overlap": 0.0003281249999997904,
+     "idle": 1.1845703125
+    }
+   },
+   "layer_wall": 639.30078125,
+   "peer_windows": {
+    "2": {
+     "wall": 71.10546875,
+     "kernel": 69.473,
+     "route_arrival_after_owner_gate": 13.4794921875
+    },
+    "3": {
+     "wall": 23.8720703125,
+     "kernel": 22.336,
+     "route_arrival_after_owner_gate": 13.2509765625
+    },
+    "1": {
+     "wall": 49.0244140625,
+     "kernel": 47.488,
+     "route_arrival_after_owner_gate": 12.9296875
+    }
+   }
+  },
+  {
+   "layer": 21,
+   "dev": 0,
+   "phases": {
+    "attention+hc (0->1)": {
+     "wall": 148.9619140625,
+     "kernel": 162.851,
+     "overlap": 15.712328124999999,
+     "idle": 1.8232421875
+    },
+    "hc_sub2 (1->8)": {
+     "wall": 9.279296875,
+     "kernel": 21.056,
+     "overlap": 7.647796875000001,
+     "idle": -4.12890625
+    },
+    "gate+topk (8->9)": {
+     "wall": 18.591796875,
+     "kernel": 15.712,
+     "overlap": 8.59374999997442e-05,
+     "idle": 2.8798828125
+    },
+    "multicast issue (9->2)": {
+     "wall": 15.13671875,
+     "kernel": 13.728,
+     "overlap": 0.0004609374999997584,
+     "idle": 1.4091796875
+    },
+    "local expert GEMMs (2->10)": {
+     "wall": 113.12109375,
+     "kernel": 153.025,
+     "overlap": 41.119726562500006,
+     "idle": 1.2158203125
+    },
+    "shared-expert join (10->3)": {
+     "wall": 3.935546875,
+     "kernel": 2.56,
+     "overlap": 0.0004296875000000533,
+     "idle": 1.3759765625
+    },
+    "wait partials (3->4)": {
+     "wall": 12.1923828125,
+     "kernel": 10.72,
+     "overlap": -0.0007031249999993605,
+     "idle": 1.4716796875
+    },
+    "combine (4->5)": {
+     "wall": 4.255859375,
+     "kernel": 3.04,
+     "overlap": -3.906249999996447e-05,
+     "idle": 1.2158203125
+    }
+   },
+   "layer_wall": 325.474609375,
+   "peer_windows": {
+    "2": {
+     "wall": 51.328125,
+     "kernel": 49.696999999999996,
+     "route_arrival_after_owner_gate": 15.337890625
+    },
+    "3": {
+     "wall": 23.3603515625,
+     "kernel": 21.792,
+     "route_arrival_after_owner_gate": 15.2333984375
+    },
+    "1": {
+     "wall": 53.056640625,
+     "kernel": 51.521,
+     "route_arrival_after_owner_gate": 14.978515625
+    }
+   }
+  },
+  {
+   "layer": 22,
+   "dev": 0,
+   "phases": {
+    "attention+hc (0->1)": {
+     "wall": 146.625,
+     "kernel": 159.873,
+     "overlap": 14.97651562499999,
+     "idle": 1.728515625
+    },
+    "hc_sub2 (1->8)": {
+     "wall": 9.1845703125,
+     "kernel": 21.92,
+     "overlap": 7.679765625000002,
+     "idle": -5.0556640625
+    },
+    "gate+topk (8->9)": {
+     "wall": 18.5283203125,
+     "kernel": 15.681000000000001,
+     "overlap": 0.0003359375000009379,
+     "idle": 2.84765625
+    },
+    "multicast issue (9->2)": {
+     "wall": 15.1669921875,
+     "kernel": 13.792,
+     "overlap": 7.812499999815259e-06,
+     "idle": 1.375
+    },
+    "local expert GEMMs (2->10)": {
+     "wall": 85.2490234375,
+     "kernel": 112.256,
+     "overlap": 28.41615625,
+     "idle": 1.4091796875
+    },
+    "shared-expert join (10->3)": {
+     "wall": 3.904296875,
+     "kernel": 2.56,
+     "overlap": 0.0004296875000000533,
+     "idle": 1.3447265625
+    },
+    "wait partials (3->4)": {
+     "wall": 12.3203125,
+     "kernel": 10.848,
+     "overlap": 0.0003437500000007532,
+     "idle": 1.47265625
+    },
+    "combine (4->5)": {
+     "wall": 4.16015625,
+     "kernel": 2.976,
+     "overlap": 0.0004140624999999787,
+     "idle": 1.1845703125
+    }
+   },
+   "layer_wall": 295.138671875,
+   "peer_windows": {
+    "2": {
+     "wall": 48.9921875,
+     "kernel": 47.391999999999996,
+     "route_arrival_after_owner_gate": 15.40234375
+    },
+    "3": {
+     "wall": 68.767578125,
+     "kernel": 67.872,
+     "route_arrival_after_owner_gate": 15.2626953125
+    },
+    "1": {
+     "wall": 49.919921875,
+     "kernel": 48.288000000000004,
+     "route_arrival_after_owner_gate": 15.1708984375
+    }
+   }
+  },
+  {
+   "layer": 23,
+   "dev": 0,
+   "phases": {
+    "attention+hc (0->1)": {
+     "wall": 145.4736328125,
+     "kernel": 160.225,
+     "overlap": 16.641992187499994,
+     "idle": 1.890625
+    },
+    "hc_sub2 (1->8)": {
+     "wall": 9.2158203125,
+     "kernel": 21.344,
+     "overlap": 7.616460937500001,
+     "idle": -4.51171875
+    },
+    "gate+topk (8->9)": {
+     "wall": 18.048828125,
+     "kernel": 15.233,
+     "overlap": 0.00057812500000054,
+     "idle": 2.81640625
+    },
+    "multicast issue (9->2)": {
+     "wall": 14.7197265625,
+     "kernel": 13.312,
+     "overlap": 0.00047656249999938893,
+     "idle": 1.408203125
+    },
+    "local expert GEMMs (2->10)": {
+     "wall": 58.3359375,
+     "kernel": 96.64,
+     "overlap": 39.6487890625,
+     "idle": 1.3447265625
+    },
+    "shared-expert join (10->3)": {
+     "wall": 3.904296875,
+     "kernel": 2.56,
+     "overlap": 0.0004296875000000533,
+     "idle": 1.3447265625
+    },
+    "wait partials (3->4)": {
+     "wall": 25.7919921875,
+     "kernel": 24.384,
+     "overlap": -0.0007656249999996589,
+     "idle": 1.4072265625
+    },
+    "combine (4->5)": {
+     "wall": 4.095703125,
+     "kernel": 2.944,
+     "overlap": -0.00033593750000004974,
+     "idle": 1.1513671875
+    }
+   },
+   "layer_wall": 279.5859375,
+   "peer_windows": {
+    "2": {
+     "wall": 23.5849609375,
+     "kernel": 22.048999999999996,
+     "route_arrival_after_owner_gate": 15.017578125
+    },
+    "3": {
+     "wall": 86.080078125,
+     "kernel": 85.024,
+     "route_arrival_after_owner_gate": 14.7158203125
+    },
+    "1": {
+     "wall": 66.6240234375,
+     "kernel": 65.088,
+     "route_arrival_after_owner_gate": 14.6259765625
+    }
+   }
+  },
+  {
+   "layer": 24,
+   "dev": 0,
+   "phases": {
+    "attention+hc (0->1)": {
+     "wall": 221.41015625,
+     "kernel": 233.60199999999995,
+     "overlap": 15.297312499999947,
+     "idle": 3.10546875
+    },
+    "hc_sub2 (1->8)": {
+     "wall": 9.248046875,
+     "kernel": 21.408,
+     "overlap": 7.616984375000001,
+     "idle": -4.54296875
+    },
+    "gate+topk (8->9)": {
+     "wall": 18.5283203125,
+     "kernel": 15.488,
+     "overlap": -0.00028125000000045475,
+     "idle": 3.0400390625
+    },
+    "multicast issue (9->2)": {
+     "wall": 13.82421875,
+     "kernel": 12.416,
+     "overlap": -1.5624999999630518e-05,
+     "idle": 1.408203125
+    },
+    "local expert GEMMs (2->10)": {
+     "wall": 57.3447265625,
+     "kernel": 95.457,
+     "overlap": 39.487273437499994,
+     "idle": 1.375
+    },
+    "shared-expert join (10->3)": {
+     "wall": 3.8720703125,
+     "kernel": 2.56,
+     "overlap": 0.0004296875000000533,
+     "idle": 1.3125
+    },
+    "wait partials (3->4)": {
+     "wall": 25.50390625,
+     "kernel": 24.128,
+     "overlap": 7.031250000011369e-05,
+     "idle": 1.3759765625
+    },
+    "combine (4->5)": {
+     "wall": 4.1279296875,
+     "kernel": 2.976,
+     "overlap": 0.0004140624999999787,
+     "idle": 1.15234375
+    }
+   },
+   "layer_wall": 353.859375,
+   "peer_windows": {
+    "2": {
+     "wall": 50.6875,
+     "kernel": 49.151999999999994,
+     "route_arrival_after_owner_gate": 14.0283203125
+    },
+    "3": {
+     "wall": 53.2802734375,
+     "kernel": 51.93600000000001,
+     "route_arrival_after_owner_gate": 13.9140625
+    },
+    "1": {
+     "wall": 85.984375,
+     "kernel": 84.961,
+     "route_arrival_after_owner_gate": 13.6982421875
+    }
+   }
+  },
+  {
+   "layer": 25,
+   "dev": 0,
+   "phases": {
+    "attention+hc (0->1)": {
+     "wall": 148.1923828125,
+     "kernel": 162.59300000000002,
+     "overlap": 16.158429687500018,
+     "idle": 1.7578125
+    },
+    "hc_sub2 (1->8)": {
+     "wall": 9.3447265625,
+     "kernel": 22.144000000000002,
+     "overlap": 7.808062500000002,
+     "idle": -4.9912109375
+    },
+    "gate+topk (8->9)": {
+     "wall": 18.49609375,
+     "kernel": 15.552,
+     "overlap": -0.0007343750000003979,
+     "idle": 2.943359375
+    },
+    "multicast issue (9->2)": {
+     "wall": 13.4072265625,
+     "kernel": 11.968,
+     "overlap": 0.00022656249999997158,
+     "idle": 1.439453125
+    },
+    "local expert GEMMs (2->10)": {
+     "wall": 67.9375,
+     "kernel": 97.12100000000001,
+     "overlap": 30.52822656250001,
+     "idle": 1.3447265625
+    },
+    "shared-expert join (10->3)": {
+     "wall": 3.904296875,
+     "kernel": 2.496,
+     "overlap": -9.375000000000355e-05,
+     "idle": 1.408203125
+    },
+    "wait partials (3->4)": {
+     "wall": 13.18359375,
+     "kernel": 11.776,
+     "overlap": -0.00036718750000019895,
+     "idle": 1.4072265625
+    },
+    "combine (4->5)": {
+     "wall": 4.1923828125,
+     "kernel": 3.008,
+     "overlap": 0.0001875000000000071,
+     "idle": 1.1845703125
+    }
+   },
+   "layer_wall": 278.658203125,
+   "peer_windows": {
+    "2": {
+     "wall": 48.5439453125,
+     "kernel": 47.072,
+     "route_arrival_after_owner_gate": 13.8046875
+    },
+    "3": {
+     "wall": 53.279296875,
+     "kernel": 51.808,
+     "route_arrival_after_owner_gate": 13.4638671875
+    },
+    "1": {
+     "wall": 84.255859375,
+     "kernel": 83.32800000000002,
+     "route_arrival_after_owner_gate": 13.21875
+    }
+   }
+  },
+  {
+   "layer": 26,
+   "dev": 0,
+   "phases": {
+    "attention+hc (0->1)": {
+     "wall": 145.025390625,
+     "kernel": 158.817,
+     "overlap": 15.681257812500007,
+     "idle": 1.8896484375
+    },
+    "hc_sub2 (1->8)": {
+     "wall": 9.3115234375,
+     "kernel": 21.152,
+     "overlap": 7.712546875000001,
+     "idle": -4.1279296875
+    },
+    "gate+topk (8->9)": {
+     "wall": 18.5927734375,
+     "kernel": 15.424,
+     "overlap": 0.0001718749999994884,
+     "idle": 3.1689453125
+    },
+    "multicast issue (9->2)": {
+     "wall": 16.0,
+     "kernel": 14.56,
+     "overlap": 0.0004296875000004974,
+     "idle": 1.4404296875
+    },
+    "local expert GEMMs (2->10)": {
+     "wall": 86.65625,
+     "kernel": 113.057,
+     "overlap": 27.807976562500002,
+     "idle": 1.4072265625
+    },
+    "shared-expert join (10->3)": {
+     "wall": 3.8720703125,
+     "kernel": 2.528,
+     "overlap": -0.00032031249999997513,
+     "idle": 1.34375
+    },
+    "wait partials (3->4)": {
+     "wall": 12.3525390625,
+     "kernel": 10.911999999999999,
+     "overlap": -0.00010937500000096634,
+     "idle": 1.4404296875
+    },
+    "combine (4->5)": {
+     "wall": 4.19140625,
+     "kernel": 3.008,
+     "overlap": 0.0001875000000000071,
+     "idle": 1.18359375
+    }
+   },
+   "layer_wall": 296.001953125,
+   "peer_windows": {
+    "2": {
+     "wall": 50.4326171875,
+     "kernel": 48.8,
+     "route_arrival_after_owner_gate": 16.2373046875
+    },
+    "3": {
+     "wall": 47.904296875,
+     "kernel": 46.272,
+     "route_arrival_after_owner_gate": 16.181640625
+    },
+    "1": {
+     "wall": 73.0234375,
+     "kernel": 72.0,
+     "route_arrival_after_owner_gate": 15.8427734375
+    }
+   }
+  },
+  {
+   "layer": 27,
+   "dev": 0,
+   "phases": {
+    "attention+hc (0->1)": {
+     "wall": 146.400390625,
+     "kernel": 161.825,
+     "overlap": 17.12089843749999,
+     "idle": 1.6962890625
+    },
+    "hc_sub2 (1->8)": {
+     "wall": 9.2802734375,
+     "kernel": 21.504,
+     "overlap": 7.904390625000001,
+     "idle": -4.3193359375
+    },
+    "gate+topk (8->9)": {
+     "wall": 18.49609375,
+     "kernel": 15.712,
+     "overlap": 8.59374999997442e-05,
+     "idle": 2.7841796875
+    },
+    "multicast issue (9->2)": {
+     "wall": 13.12109375,
+     "kernel": 11.745,
+     "overlap": -0.0001171875000007816,
+     "idle": 1.3759765625
+    },
+    "local expert GEMMs (2->10)": {
+     "wall": 75.1025390625,
+     "kernel": 112.734,
+     "overlap": 38.815054687499995,
+     "idle": 1.18359375
+    },
+    "shared-expert join (10->3)": {
+     "wall": 3.904296875,
+     "kernel": 2.592,
+     "overlap": 0.0002031250000000817,
+     "idle": 1.3125
+    },
+    "wait partials (3->4)": {
+     "wall": 12.193359375,
+     "kernel": 10.753,
+     "overlap": 7.031250000011369e-05,
+     "idle": 1.4404296875
+    },
+    "combine (4->5)": {
+     "wall": 3.9990234375,
+     "kernel": 2.815,
+     "overlap": -0.0004296875000000533,
+     "idle": 1.18359375
+    }
+   },
+   "layer_wall": 282.4970703125,
+   "peer_windows": {
+    "2": {
+     "wall": 52.6083984375,
+     "kernel": 50.912,
+     "route_arrival_after_owner_gate": 13.3271484375
+    },
+    "3": {
+     "wall": 51.16796875,
+     "kernel": 49.536,
+     "route_arrival_after_owner_gate": 13.2041015625
+    },
+    "1": {
+     "wall": 70.048828125,
+     "kernel": 68.673,
+     "route_arrival_after_owner_gate": 12.9951171875
+    }
+   }
+  },
+  {
+   "layer": 28,
+   "dev": 0,
+   "phases": {
+    "attention+hc (0->1)": {
+     "wall": 221.826171875,
+     "kernel": 233.76299999999992,
+     "overlap": 15.10577343749992,
+     "idle": 3.1689453125
+    },
+    "hc_sub2 (1->8)": {
+     "wall": 9.408203125,
+     "kernel": 21.568,
+     "overlap": 7.871710937500001,
+     "idle": -4.2880859375
+    },
+    "gate+topk (8->9)": {
+     "wall": 18.3994140625,
+     "kernel": 15.488,
+     "overlap": -0.00028125000000045475,
+     "idle": 2.9111328125
+    },
+    "multicast issue (9->2)": {
+     "wall": 14.5615234375,
+     "kernel": 13.185,
+     "overlap": 0.0004296875000004974,
+     "idle": 1.376953125
+    },
+    "local expert GEMMs (2->10)": {
+     "wall": 87.16796875,
+     "kernel": 114.816,
+     "overlap": 29.024007812500003,
+     "idle": 1.3759765625
+    },
+    "shared-expert join (10->3)": {
+     "wall": 3.8720703125,
+     "kernel": 2.528,
+     "overlap": -0.00032031249999997513,
+     "idle": 1.34375
+    },
+    "wait partials (3->4)": {
+     "wall": 12.1279296875,
+     "kernel": 10.752,
+     "overlap": 4.687500000066791e-05,
+     "idle": 1.3759765625
+    },
+    "combine (4->5)": {
+     "wall": 4.064453125,
+     "kernel": 2.912,
+     "overlap": -0.00010937500000007816,
+     "idle": 1.15234375
+    }
+   },
+   "layer_wall": 371.427734375,
+   "peer_windows": {
+    "2": {
+     "wall": 23.48828125,
+     "kernel": 21.823999999999998,
+     "route_arrival_after_owner_gate": 14.7685546875
+    },
+    "3": {
+     "wall": 51.1357421875,
+     "kernel": 49.599999999999994,
+     "route_arrival_after_owner_gate": 14.642578125
+    },
+    "1": {
+     "wall": 87.16796875,
+     "kernel": 85.952,
+     "route_arrival_after_owner_gate": 14.4365234375
+    }
+   }
+  },
+  {
+   "layer": 29,
+   "dev": 0,
+   "phases": {
+    "attention+hc (0->1)": {
+     "wall": 144.7685546875,
+     "kernel": 157.21699999999998,
+     "overlap": 14.464070312499985,
+     "idle": 2.015625
+    },
+    "hc_sub2 (1->8)": {
+     "wall": 9.3447265625,
+     "kernel": 22.750000000000004,
+     "overlap": 7.7431640625000036,
+     "idle": -5.662109375
+    },
+    "gate+topk (8->9)": {
+     "wall": 17.3447265625,
+     "kernel": 15.457,
+     "overlap": -3.1249999999261036e-05,
+     "idle": 1.8876953125
+    },
+    "multicast issue (9->2)": {
+     "wall": 14.7197265625,
+     "kernel": 13.281,
+     "overlap": -0.00024999999999941735,
+     "idle": 1.4384765625
+    },
+    "local expert GEMMs (2->10)": {
+     "wall": 100.9599609375,
+     "kernel": 128.96,
+     "overlap": 29.215859375000008,
+     "idle": 1.2158203125
+    },
+    "shared-expert join (10->3)": {
+     "wall": 3.83984375,
+     "kernel": 2.496,
+     "overlap": -9.375000000000355e-05,
+     "idle": 1.34375
+    },
+    "wait partials (3->4)": {
+     "wall": 11.9375,
+     "kernel": 10.593,
+     "overlap": 0.00022656249999997158,
+     "idle": 1.3447265625
+    },
+    "combine (4->5)": {
+     "wall": 4.7998046875,
+     "kernel": 2.912,
+     "overlap": -0.00010937500000007816,
+     "idle": 1.8876953125
+    }
+   },
+   "layer_wall": 307.71484375,
+   "peer_windows": {
+    "2": {
+     "wall": 54.3994140625,
+     "kernel": 52.704,
+     "route_arrival_after_owner_gate": 14.896484375
+    },
+    "3": {
+     "wall": 52.6416015625,
+     "kernel": 50.976,
+     "route_arrival_after_owner_gate": 14.765625
+    },
+    "1": {
+     "wall": 48.1279296875,
+     "kernel": 46.495999999999995,
+     "route_arrival_after_owner_gate": 14.4990234375
+    }
+   }
+  },
+  {
+   "layer": 30,
+   "dev": 1,
+   "phases": {
+    "attention+hc (0->1)": {
+     "wall": 149.537109375,
+     "kernel": 164.385,
+     "overlap": 16.89574218749999,
+     "idle": 2.0478515625
+    },
+    "hc_sub2 (1->8)": {
+     "wall": 8.9921875,
+     "kernel": 21.088,
+     "overlap": 7.551867187500001,
+     "idle": -4.5439453125
+    },
+    "gate+topk (8->9)": {
+     "wall": 18.3994140625,
+     "kernel": 15.68,
+     "overlap": 0.0003124999999997158,
+     "idle": 2.7197265625
+    },
+    "multicast issue (9->2)": {
+     "wall": 12.83203125,
+     "kernel": 11.52,
+     "overlap": 0.0004687499999995737,
+     "idle": 1.3125
+    },
+    "local expert GEMMs (2->10)": {
+     "wall": 96.513671875,
+     "kernel": 135.778,
+     "overlap": 40.22526562499999,
+     "idle": 0.9609375
+    },
+    "shared-expert join (10->3)": {
+     "wall": 3.8076171875,
+     "kernel": 2.56,
+     "overlap": 0.0004296875000000533,
+     "idle": 1.248046875
+    },
+    "wait partials (3->4)": {
+     "wall": 11.6796875,
+     "kernel": 10.4,
+     "overlap": -0.00039062499999964473,
+     "idle": 1.279296875
+    },
+    "combine (4->5)": {
+     "wall": 4.12890625,
+     "kernel": 3.072,
+     "overlap": -0.00026562499999993605,
+     "idle": 1.056640625
+    }
+   },
+   "layer_wall": 305.890625,
+   "peer_windows": {
+    "2": {
+     "wall": 69.3125,
+     "kernel": 67.681,
+     "route_arrival_after_owner_gate": 13.1025390625
+    },
+    "3": {
+     "wall": 23.583984375,
+     "kernel": 22.176,
+     "route_arrival_after_owner_gate": 12.90625
+    },
+    "0": {
+     "wall": 50.8486328125,
+     "kernel": 49.344,
+     "route_arrival_after_owner_gate": 12.701171875
+    }
+   }
+  },
+  {
+   "layer": 31,
+   "dev": 1,
+   "phases": {
+    "attention+hc (0->1)": {
+     "wall": 146.5927734375,
+     "kernel": 159.841,
+     "overlap": 15.232601562500008,
+     "idle": 1.984375
+    },
+    "hc_sub2 (1->8)": {
+     "wall": 8.927734375,
+     "kernel": 21.407999999999998,
+     "overlap": 7.455851562499998,
+     "idle": -5.0244140625
+    },
+    "gate+topk (8->9)": {
+     "wall": 18.2724609375,
+     "kernel": 15.456,
+     "overlap": -5.468750000048317e-05,
+     "idle": 2.81640625
+    },
+    "multicast issue (9->2)": {
+     "wall": 13.0244140625,
+     "kernel": 11.712,
+     "overlap": 8.59374999997442e-05,
+     "idle": 1.3125
+    },
+    "local expert GEMMs (2->10)": {
+     "wall": 87.296875,
+     "kernel": 117.02499999999999,
+     "overlap": 30.97617187499999,
+     "idle": 1.248046875
+    },
+    "shared-expert join (10->3)": {
+     "wall": 3.8076171875,
+     "kernel": 2.592,
+     "overlap": 0.0002031250000000817,
+     "idle": 1.2158203125
+    },
+    "wait partials (3->4)": {
+     "wall": 11.83984375,
+     "kernel": 10.56,
+     "overlap": -0.0005468749999995026,
+     "idle": 1.279296875
+    },
+    "combine (4->5)": {
+     "wall": 4.16015625,
+     "kernel": 3.104,
+     "overlap": 0.00048437500000009237,
+     "idle": 1.056640625
+    }
+   },
+   "layer_wall": 293.921875,
+   "peer_windows": {
+    "2": {
+     "wall": 23.4560546875,
+     "kernel": 21.92,
+     "route_arrival_after_owner_gate": 13.1025390625
+    },
+    "3": {
+     "wall": 85.0244140625,
+     "kernel": 84.06500000000001,
+     "route_arrival_after_owner_gate": 12.9033203125
+    },
+    "0": {
+     "wall": 48.6396484375,
+     "kernel": 47.135999999999996,
+     "route_arrival_after_owner_gate": 12.861328125
+    }
+   }
+  },
+  {
+   "layer": 32,
+   "dev": 1,
+   "phases": {
+    "attention+hc (0->1)": {
+     "wall": 220.73828125,
+     "kernel": 233.603,
+     "overlap": 16.00046093750001,
+     "idle": 3.1357421875
+    },
+    "hc_sub2 (1->8)": {
+     "wall": 9.4404296875,
+     "kernel": 20.896,
+     "overlap": 7.871585937500001,
+     "idle": -3.583984375
+    },
+    "gate+topk (8->9)": {
+     "wall": 18.3037109375,
+     "kernel": 15.648,
+     "overlap": -0.00043750000000031264,
+     "idle": 2.6552734375
+    },
+    "multicast issue (9->2)": {
+     "wall": 12.927734375,
+     "kernel": 11.584,
+     "overlap": 1.5624999999630518e-05,
+     "idle": 1.34375
+    },
+    "local expert GEMMs (2->10)": {
+     "wall": 83.9052734375,
+     "kernel": 110.625,
+     "overlap": 28.1279296875,
+     "idle": 1.408203125
+    },
+    "shared-expert join (10->3)": {
+     "wall": 3.904296875,
+     "kernel": 2.56,
+     "overlap": 0.0004296875000000533,
+     "idle": 1.3447265625
+    },
+    "wait partials (3->4)": {
+     "wall": 12.2880859375,
+     "kernel": 10.847999999999999,
+     "overlap": 0.0003437499999989768,
+     "idle": 1.4404296875
+    },
+    "combine (4->5)": {
+     "wall": 4.0634765625,
+     "kernel": 3.008,
+     "overlap": 0.0001875000000000071,
+     "idle": 1.0556640625
+    }
+   },
+   "layer_wall": 365.5712890625,
+   "peer_windows": {
+    "2": {
+     "wall": 52.6728515625,
+     "kernel": 51.201,
+     "route_arrival_after_owner_gate": 13.0712890625
+    },
+    "3": {
+     "wall": 71.2314453125,
+     "kernel": 69.85600000000001,
+     "route_arrival_after_owner_gate": 12.8681640625
+    },
+    "0": {
+     "wall": 48.576171875,
+     "kernel": 47.007999999999996,
+     "route_arrival_after_owner_gate": 12.6689453125
+    }
+   }
+  },
+  {
+   "layer": 33,
+   "dev": 1,
+   "phases": {
+    "attention+hc (0->1)": {
+     "wall": 145.12109375,
+     "kernel": 160.449,
+     "overlap": 17.153101562500012,
+     "idle": 1.8251953125
+    },
+    "hc_sub2 (1->8)": {
+     "wall": 9.4716796875,
+     "kernel": 22.400000000000002,
+     "overlap": 7.903906250000002,
+     "idle": -5.0244140625
+    },
+    "gate+topk (8->9)": {
+     "wall": 18.3681640625,
+     "kernel": 15.712,
+     "overlap": 8.59374999997442e-05,
+     "idle": 2.65625
+    },
+    "multicast issue (9->2)": {
+     "wall": 13.3759765625,
+     "kernel": 11.968,
+     "overlap": 0.00022656249999997158,
+     "idle": 1.408203125
+    },
+    "local expert GEMMs (2->10)": {
+     "wall": 39.6474609375,
+     "kernel": 72.737,
+     "overlap": 34.496765624999995,
+     "idle": 1.4072265625
+    },
+    "shared-expert join (10->3)": {
+     "wall": 3.9052734375,
+     "kernel": 2.56,
+     "overlap": 0.0004296875000000533,
+     "idle": 1.345703125
+    },
+    "wait partials (3->4)": {
+     "wall": 59.744140625,
+     "kernel": 58.336,
+     "overlap": 6.249999999852207e-05,
+     "idle": 1.408203125
+    },
+    "combine (4->5)": {
+     "wall": 4.3203125,
+     "kernel": 3.104,
+     "overlap": 0.00048437500000009237,
+     "idle": 1.216796875
+    }
+   },
+   "layer_wall": 293.9541015625,
+   "peer_windows": {
+    "2": {
+     "wall": 48.0009765625,
+     "kernel": 46.528999999999996,
+     "route_arrival_after_owner_gate": 13.775390625
+    },
+    "3": {
+     "wall": 51.935546875,
+     "kernel": 50.592,
+     "route_arrival_after_owner_gate": 13.2822265625
+    },
+    "0": {
+     "wall": 102.208984375,
+     "kernel": 100.833,
+     "route_arrival_after_owner_gate": 13.212890625
+    }
+   }
+  },
+  {
+   "layer": 34,
+   "dev": 1,
+   "phases": {
+    "attention+hc (0->1)": {
+     "wall": 144.9287109375,
+     "kernel": 157.69600000000003,
+     "overlap": 14.815140625000026,
+     "idle": 2.0478515625
+    },
+    "hc_sub2 (1->8)": {
+     "wall": 9.2177734375,
+     "kernel": 21.921,
+     "overlap": 7.586039062499999,
+     "idle": -5.1171875
+    },
+    "gate+topk (8->9)": {
+     "wall": 18.1435546875,
+     "kernel": 15.68,
+     "overlap": 0.0003124999999997158,
+     "idle": 2.4638671875
+    },
+    "multicast issue (9->2)": {
+     "wall": 13.375,
+     "kernel": 11.999,
+     "overlap": -2.3437499999445777e-05,
+     "idle": 1.3759765625
+    },
+    "local expert GEMMs (2->10)": {
+     "wall": 67.4892578125,
+     "kernel": 98.27199999999999,
+     "overlap": 32.12844531249999,
+     "idle": 1.345703125
+    },
+    "shared-expert join (10->3)": {
+     "wall": 3.9033203125,
+     "kernel": 2.56,
+     "overlap": 0.0004296875000000533,
+     "idle": 1.34375
+    },
+    "wait partials (3->4)": {
+     "wall": 30.2080078125,
+     "kernel": 28.799999999999997,
+     "overlap": 0.00019531249999715783,
+     "idle": 1.408203125
+    },
+    "combine (4->5)": {
+     "wall": 4.193359375,
+     "kernel": 3.04,
+     "overlap": -3.906249999996447e-05,
+     "idle": 1.1533203125
+    }
+   },
+   "layer_wall": 291.458984375,
+   "peer_windows": {
+    "2": {
+     "wall": 99.712890625,
+     "kernel": 98.497,
+     "route_arrival_after_owner_gate": 13.328125
+    },
+    "3": {
+     "wall": 53.6318359375,
+     "kernel": 52.064,
+     "route_arrival_after_owner_gate": 13.119140625
+    },
+    "0": {
+     "wall": 23.552734375,
+     "kernel": 21.888,
+     "route_arrival_after_owner_gate": 13.1796875
+    }
+   }
+  },
+  {
+   "layer": 35,
+   "dev": 1,
+   "phases": {
+    "attention+hc (0->1)": {
+     "wall": 146.52734375,
+     "kernel": 161.826,
+     "overlap": 17.121898437499993,
+     "idle": 1.8232421875
+    },
+    "hc_sub2 (1->8)": {
+     "wall": 9.216796875,
+     "kernel": 21.441,
+     "overlap": 7.585531249999999,
+     "idle": -4.638671875
+    },
+    "gate+topk (8->9)": {
+     "wall": 18.1123046875,
+     "kernel": 15.456,
+     "overlap": -5.468750000048317e-05,
+     "idle": 2.65625
+    },
+    "multicast issue (9->2)": {
+     "wall": 13.3125,
+     "kernel": 11.936,
+     "overlap": 0.00045312499999994316,
+     "idle": 1.376953125
+    },
+    "local expert GEMMs (2->10)": {
+     "wall": 68.51171875,
+     "kernel": 96.22300000000001,
+     "overlap": 29.087257812500013,
+     "idle": 1.3759765625
+    },
+    "shared-expert join (10->3)": {
+     "wall": 3.935546875,
+     "kernel": 2.528,
+     "overlap": -0.00032031249999997513,
+     "idle": 1.4072265625
+    },
+    "wait partials (3->4)": {
+     "wall": 15.80859375,
+     "kernel": 14.336,
+     "overlap": -0.0009140624999997016,
+     "idle": 1.4716796875
+    },
+    "combine (4->5)": {
+     "wall": 4.1279296875,
+     "kernel": 2.976,
+     "overlap": 0.0004140624999999787,
+     "idle": 1.15234375
+    }
+   },
+   "layer_wall": 279.552734375,
+   "peer_windows": {
+    "2": {
+     "wall": 52.1611328125,
+     "kernel": 50.464999999999996,
+     "route_arrival_after_owner_gate": 13.5849609375
+    },
+    "3": {
+     "wall": 86.14453125,
+     "kernel": 84.896,
+     "route_arrival_after_owner_gate": 13.373046875
+    },
+    "0": {
+     "wall": 48.8017578125,
+     "kernel": 47.073,
+     "route_arrival_after_owner_gate": 13.1796875
+    }
+   }
+  },
+  {
+   "layer": 36,
+   "dev": 1,
+   "phases": {
+    "attention+hc (0->1)": {
+     "wall": 218.5302734375,
+     "kernel": 231.80999999999995,
+     "overlap": 16.669374999999945,
+     "idle": 3.3896484375
+    },
+    "hc_sub2 (1->8)": {
+     "wall": 9.3125,
+     "kernel": 21.440000000000005,
+     "overlap": 7.743710937500005,
+     "idle": -4.3837890625
+    },
+    "gate+topk (8->9)": {
+     "wall": 17.919921875,
+     "kernel": 15.456,
+     "overlap": -5.468750000048317e-05,
+     "idle": 2.4638671875
+    },
+    "multicast issue (9->2)": {
+     "wall": 12.86328125,
+     "kernel": 11.488,
+     "overlap": -0.00028125000000045475,
+     "idle": 1.375
+    },
+    "local expert GEMMs (2->10)": {
+     "wall": 67.8095703125,
+     "kernel": 100.06500000000001,
+     "overlap": 33.63140625000001,
+     "idle": 1.3759765625
+    },
+    "shared-expert join (10->3)": {
+     "wall": 3.8720703125,
+     "kernel": 2.56,
+     "overlap": 0.0004296875000000533,
+     "idle": 1.3125
+    },
+    "wait partials (3->4)": {
+     "wall": 34.111328125,
+     "kernel": 32.736,
+     "overlap": -0.000328125000002899,
+     "idle": 1.375
+    },
+    "combine (4->5)": {
+     "wall": 4.16015625,
+     "kernel": 3.008,
+     "overlap": 0.0001875000000000071,
+     "idle": 1.15234375
+    }
+   },
+   "layer_wall": 368.5791015625,
+   "peer_windows": {
+    "2": {
+     "wall": 23.6162109375,
+     "kernel": 21.951999999999998,
+     "route_arrival_after_owner_gate": 13.07421875
+    },
+    "3": {
+     "wall": 50.271484375,
+     "kernel": 48.70399999999999,
+     "route_arrival_after_owner_gate": 12.794921875
+    },
+    "0": {
+     "wall": 104.9921875,
+     "kernel": 104.095,
+     "route_arrival_after_owner_gate": 12.6044921875
+    }
+   }
+  },
+  {
+   "layer": 37,
+   "dev": 1,
+   "phases": {
+    "attention+hc (0->1)": {
+     "wall": 153.47265625,
+     "kernel": 165.921,
+     "overlap": 14.498148437499992,
+     "idle": 2.0498046875
+    },
+    "hc_sub2 (1->8)": {
+     "wall": 9.18359375,
+     "kernel": 21.024,
+     "overlap": 7.584546875000001,
+     "idle": -4.255859375
+    },
+    "gate+topk (8->9)": {
+     "wall": 18.2724609375,
+     "kernel": 15.424,
+     "overlap": 0.0001718749999994884,
+     "idle": 2.8486328125
+    },
+    "multicast issue (9->2)": {
+     "wall": 13.4404296875,
+     "kernel": 12.064,
+     "overlap": -0.00045312499999994316,
+     "idle": 1.3759765625
+    },
+    "local expert GEMMs (2->10)": {
+     "wall": 40.224609375,
+     "kernel": 73.95400000000001,
+     "overlap": 35.10439062500001,
+     "idle": 1.375
+    },
+    "shared-expert join (10->3)": {
+     "wall": 3.904296875,
+     "kernel": 2.528,
+     "overlap": -0.00032031249999997513,
+     "idle": 1.3759765625
+    },
+    "wait partials (3->4)": {
+     "wall": 39.935546875,
+     "kernel": 38.464999999999996,
+     "overlap": 0.00015624999999630518,
+     "idle": 1.470703125
+    },
+    "combine (4->5)": {
+     "wall": 4.1279296875,
+     "kernel": 2.976,
+     "overlap": 0.0004140624999999787,
+     "idle": 1.15234375
+    }
+   },
+   "layer_wall": 282.5615234375,
+   "peer_windows": {
+    "2": {
+     "wall": 70.080078125,
+     "kernel": 68.447,
+     "route_arrival_after_owner_gate": 13.3642578125
+    },
+    "3": {
+     "wall": 52.1923828125,
+     "kernel": 50.592,
+     "route_arrival_after_owner_gate": 13.3369140625
+    },
+    "0": {
+     "wall": 83.13671875,
+     "kernel": 81.98499999999999,
+     "route_arrival_after_owner_gate": 13.2451171875
+    }
+   }
+  },
+  {
+   "layer": 38,
+   "dev": 1,
+   "phases": {
+    "attention+hc (0->1)": {
+     "wall": 151.45703125,
+     "kernel": 166.177,
+     "overlap": 16.545164062499992,
+     "idle": 1.8251953125
+    },
+    "hc_sub2 (1->8)": {
+     "wall": 9.568359375,
+     "kernel": 21.44,
+     "overlap": 8.224179687500001,
+     "idle": -3.6474609375
+    },
+    "gate+topk (8->9)": {
+     "wall": 18.3359375,
+     "kernel": 15.648,
+     "overlap": -0.00043750000000031264,
+     "idle": 2.6875
+    },
+    "multicast issue (9->2)": {
+     "wall": 12.7998046875,
+     "kernel": 11.52,
+     "overlap": 0.0004687499999995737,
+     "idle": 1.2802734375
+    },
+    "local expert GEMMs (2->10)": {
+     "wall": 39.3916015625,
+     "kernel": 63.938,
+     "overlap": 23.008312500000002,
+     "idle": -1.5380859375
+    },
+    "shared-expert join (10->3)": {
+     "wall": 5.1533203125,
+     "kernel": 2.528,
+     "overlap": -0.00032031249999997513,
+     "idle": 2.625
+    },
+    "wait partials (3->4)": {
+     "wall": 62.3681640625,
+     "kernel": 60.992,
+     "overlap": -0.00018750000000267164,
+     "idle": 1.3759765625
+    },
+    "combine (4->5)": {
+     "wall": 4.03125,
+     "kernel": 3.04,
+     "overlap": -3.906249999996447e-05,
+     "idle": 0.9912109375
+    }
+   },
+   "layer_wall": 303.10546875,
+   "peer_windows": {
+    "2": {
+     "wall": 104.576171875,
+     "kernel": 103.77600000000001,
+     "route_arrival_after_owner_gate": 13.140625
+    },
+    "3": {
+     "wall": 68.2568359375,
+     "kernel": 67.36,
+     "route_arrival_after_owner_gate": 12.5341796875
+    },
+    "0": {
+     "wall": 23.6162109375,
+     "kernel": 22.112000000000002,
+     "route_arrival_after_owner_gate": 12.6044921875
+    }
+   }
+  },
+  {
+   "layer": 39,
+   "dev": 1,
+   "phases": {
+    "attention+hc (0->1)": {
+     "wall": 152.2890625,
+     "kernel": 166.049,
+     "overlap": 15.743335937500007,
+     "idle": 1.9833984375
+    },
+    "hc_sub2 (1->8)": {
+     "wall": 9.50390625,
+     "kernel": 22.209,
+     "overlap": 8.06446875,
+     "idle": -4.640625
+    },
+    "gate+topk (8->9)": {
+     "wall": 17.1201171875,
+     "kernel": 15.648,
+     "overlap": 0.0005390624999996874,
+     "idle": 1.47265625
+    },
+    "multicast issue (9->2)": {
+     "wall": 13.3125,
+     "kernel": 12.001,
+     "overlap": 2.3437499999445777e-05,
+     "idle": 1.3115234375
+    },
+    "local expert GEMMs (2->10)": {
+     "wall": 64.9599609375,
+     "kernel": 91.776,
+     "overlap": 28.031859374999996,
+     "idle": 1.2158203125
+    },
+    "shared-expert join (10->3)": {
+     "wall": 3.80859375,
+     "kernel": 2.592,
+     "overlap": 0.0002031250000000817,
+     "idle": 1.216796875
+    },
+    "wait partials (3->4)": {
+     "wall": 12.3837890625,
+     "kernel": 11.072,
+     "overlap": -0.00026562500000082423,
+     "idle": 1.3115234375
+    },
+    "combine (4->5)": {
+     "wall": 4.6396484375,
+     "kernel": 2.848,
+     "overlap": 0.000343749999999865,
+     "idle": 1.7919921875
+    }
+   },
+   "layer_wall": 278.017578125,
+   "peer_windows": {
+    "2": {
+     "wall": 67.13671875,
+     "kernel": 65.632,
+     "route_arrival_after_owner_gate": 13.525390625
+    },
+    "3": {
+     "wall": 50.9755859375,
+     "kernel": 49.536,
+     "route_arrival_after_owner_gate": 13.0771484375
+    },
+    "0": {
+     "wall": 71.041015625,
+     "kernel": 69.505,
+     "route_arrival_after_owner_gate": 13.0205078125
+    }
+   }
+  }
+ ],
+ "phases": {
+  "attention+hc (0->1)": {
+   "wall": 7380.3984375,
+   "kernel": 7910.675999999999,
+   "overlap": 629.3293203124986,
+   "idle": 99.0517578125
+  },
+  "hc_sub2 (1->8)": {
+   "wall": 370.9462890625,
+   "kernel": 864.4180000000002,
+   "overlap": 309.02737500000023,
+   "idle": -184.4443359375
+  },
+  "gate+topk (8->9)": {
+   "wall": 725.34375,
+   "kernel": 621.5029999999999,
+   "overlap": 0.0010468749999290594,
+   "idle": 103.841796875
+  },
+  "multicast issue (9->2)": {
+   "wall": 557.033203125,
+   "kernel": 501.8,
+   "overlap": 0.0031250000000113687,
+   "idle": 55.236328125
+  },
+  "local expert GEMMs (2->10)": {
+   "wall": 2979.6298828125,
+   "kernel": 4229.788999999999,
+   "overlap": 1299.7235703124989,
+   "idle": 49.564453125
+  },
+  "shared-expert join (10->3)": {
+   "wall": 156.451171875,
+   "kernel": 102.30500000000004,
+   "overlap": 0.001289062500035243,
+   "idle": 54.1474609375
+  },
+  "wait partials (3->4)": {
+   "wall": 4107.8466796875,
+   "kernel": 4051.6229999999996,
+   "overlap": -0.0020000000004074536,
+   "idle": 56.2216796875
+  },
+  "combine (4->5)": {
+   "wall": 168.09765625,
+   "kernel": 119.55200000000002,
+   "overlap": 0.004148437500020918,
+   "idle": 48.5498046875
+  }
+ },
+ "categories": {
+  "FP8 dense GEMV (attention proj / shared expert / gate)": {
+   "attention+hc (0->1)": 4479.686999999997,
+   "local expert GEMMs (2->10)": 1332.483
+  },
+  "peer: other GEMM (cuBLAS)": {
+   "peer compute+push (6->7)": 5475.932000000003
+  },
+  "P2P wait (spin)": {
+   "wait partials (3->4)": 3797.284000000001
+  },
+  "other GEMM (cuBLAS)": {
+   "gate+topk (8->9)": 382.625,
+   "local expert GEMMs (2->10)": 2531.1190000000006,
+   "attention+hc (0->1)": 147.425
+  },
+  "P2P send/signal": {
+   "multicast issue (9->2)": 501.8,
+   "wait partials (3->4)": 254.33899999999994,
+   "attention+hc (0->1)": 30.46300000000001
+  },
+  "hyper-connection mixes": {
+   "attention+hc (0->1)": 388.516,
+   "hc_sub2 (1->8)": 391.03700000000003
+  },
+  "other: _sinkhorn_only_kernel": {
+   "attention+hc (0->1)": 369.474,
+   "hc_sub2 (1->8)": 305.474
+  },
+  "peer: P2P send/signal": {
+   "peer compute+push (6->7)": 674.1480000000006
+  },
+  "attention core": {
+   "attention+hc (0->1)": 633.827
+  },
+  "RMSNorm": {
+   "attention+hc (0->1)": 416.51400000000007,
+   "hc_sub2 (1->8)": 167.90700000000004
+  },
+  "router top-k": {
+   "gate+topk (8->9)": 238.87800000000001,
+   "attention+hc (0->1)": 331.906
+  },
+  "torch elementwise / copies": {
+   "attention+hc (0->1)": 370.23900000000003
+  },
+  "SwiGLU + FP8 round": {
+   "local expert GEMMs (2->10)": 366.187
+  },
+  "peer: SwiGLU + FP8 round": {
+   "peer compute+push (6->7)": 314.1789999999999
+  },
+  "peer: partial sum (pairs -> partial)": {
+   "peer compute+push (6->7)": 295.77599999999995
+  },
+  "attention: indexer/compressor/rope": {
+   "attention+hc (0->1)": 275.7410000000001
+  },
+  "combine (hc_post)": {
+   "attention+hc (0->1)": 106.62800000000004,
+   "combine (4->5)": 119.55200000000002
+  },
+  "other: _fake_quant_kernel": {
+   "attention+hc (0->1)": 132.92899999999997
+  },
+  "other: _kv_write_kernel": {
+   "attention+hc (0->1)": 112.511
+  },
+  "partial sum (pairs -> partial)": {
+   "shared-expert join (10->3)": 102.30500000000004
+  },
+  "bucketing (sort/scan/scatter)": {
+   "attention+hc (0->1)": 57.92
+  },
+  "other: memcpy32_post": {
+   "attention+hc (0->1)": 51.583999999999996
+  },
+  "engram / gathers": {
+   "attention+hc (0->1)": 3.52
+  },
+  "other: memcpy_post_faster": {
+   "attention+hc (0->1)": 1.792
+  }
+ },
+ "devices": {
+  "0": {
+   "kernel": 14516.256999999981,
+   "busy_union": 13909.4013671875,
+   "span": 14112.93359375,
+   "wait_spin": 8846.015000000001,
+   "n_kernels": 613
+  },
+  "1": {
+   "kernel": 14170.313999999997,
+   "busy_union": 13581.5361328125,
+   "span": 13006.6884765625,
+   "wait_spin": 8331.904999999997,
+   "n_kernels": 550
+  },
+  "2": {
+   "kernel": 16916.397999999994,
+   "busy_union": 16318.978515625,
+   "span": 16516.00390625,
+   "wait_spin": 11539.378000000002,
+   "n_kernels": 661
+  },
+  "3": {
+   "kernel": 15701.924,
+   "busy_union": 15107.353515625,
+   "span": 15297.501953125,
+   "wait_spin": 10400.321000000002,
+   "n_kernels": 600
+  }
+ },
+ "critical_path": {
+  "layers_wall": 16445.7470703125,
+  "gaps": 88.69921875,
+  "hop_gaps": [
+   1.3115234375,
+   1.3115234375,
+   1.3125,
+   1.2802734375,
+   1.3115234375,
+   1.3447265625,
+   1.3115234375,
+   1.3125,
+   1.3115234375,
+   14.0498046875,
+   1.216796875,
+   1.1845703125,
+   1.18359375,
+   1.279296875,
+   1.3115234375,
+   1.3125,
+   1.3125,
+   1.3115234375,
+   1.18359375,
+   14.296875,
+   1.3115234375,
+   1.3115234375,
+   1.3115234375,
+   1.34375,
+   1.2802734375,
+   1.279296875,
+   1.3125,
+   1.3115234375,
+   1.3115234375,
+   14.0830078125,
+   1.18359375,
+   1.18359375,
+   1.3125,
+   1.3115234375,
+   1.3125,
+   1.3115234375,
+   1.3125,
+   1.2802734375,
+   1.1845703125
+  ],
+  "token_span": 16534.4462890625,
+  "host_step": 20761.675899848342,
+  "host_sample": 92.85006672143936,
+  "head_kernels_us": 766.886
+ },
+ "bounds": {
+  "no_peer_waits": 60.04625043166752,
+  "free_p2p": 62.288350687517394,
+  "expert_phase_us": 3136.0810546875
+ }
+}
