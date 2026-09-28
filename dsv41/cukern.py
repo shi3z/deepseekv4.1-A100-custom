@@ -110,6 +110,27 @@ FP8_G_LAYOUT = os.environ.get("DSV41_FP8_G", "1") == "1"  # tiled kernel for > 6
 FP8_W_SPLITS = int(os.environ.get("DSV41_FP8_W_SPLITS", "0"))
 FP8_W_STAGES = int(os.environ.get("DSV41_FP8_W_STAGES", "3"))  # x stages in shared memory
 FP8_W_MW = int(os.environ.get("DSV41_FP8_W_MW", "1"))  # warps along M per block (1, 2 or 4 for 64 rows; 1 or 2 for 32)
+FP8_M1 = os.environ.get("DSV41_FP8_M1", "0") == "1"  # dedicated M=1 GEMV (cuda/fp8_gemv_m1.cu) for single-row calls
+
+
+def fp8_gemv_m1(x: torch.Tensor, w8: torch.Tensor, s8: torch.Tensor, group_cols: int = 0, out: torch.Tensor | None = None) -> torch.Tensor:
+    """One-row FP8 GEMV (results/dense_m1_report.md, Strategy A): x bf16 [1, K] (or [N/group_cols, K] block-diagonal),
+    w8 / s8 as fp8_gemm_tc -> bf16 [1, N]. 8-warp blocks, KW warps per output row, U 16-byte loads in flight per lane."""
+    K = x.shape[1]
+    N = w8.shape[0]
+    KW = 1 if N >= 4096 else 2 if N >= 1024 else 4
+    while K % (16 * KW) != 0 and KW > 1:
+        KW //= 2
+    U = 4 if K <= 2048 else 2
+    RB = 8 // KW
+    if out is None:
+        out = torch.empty(1, N, device=x.device, dtype=torch.bfloat16)
+    f = get_function("fp8_gemv_m1.cu", f"fp8_gemv_m1_k{KW}u{U}", x.device)
+    args = [ctypes.c_void_p(x.data_ptr()), ctypes.c_int(x.stride(0)), ctypes.c_void_p(w8.data_ptr()), ctypes.c_void_p(s8.data_ptr()),
+            ctypes.c_int(N), ctypes.c_int(K), ctypes.c_int(s8.shape[1]), ctypes.c_int(group_cols),
+            ctypes.c_void_p(out.data_ptr()), ctypes.c_void_p(0)]
+    launch(f, ((N + RB - 1) // RB, 1, 1), (256, 1, 1), args, x.device)
+    return out
 _attr_done: set = set()  # experiment: force the split-K factor
 
 
@@ -123,6 +144,8 @@ def fp8_gemm_tc(x: torch.Tensor, w8: torch.Tensor, s8: torch.Tensor, group_cols:
     assert x.dtype == torch.bfloat16 and x.is_contiguous() and w8.is_contiguous() and s8.is_contiguous()
     assert K % 64 == 0 and N % 8 == 0 and (group_cols == 0 or group_cols % 8 == 0 and N % group_cols == 0)
     Mo = M // (N // group_cols) if group_cols else M
+    if FP8_M1 and Mo == 1 and out_dtype == torch.bfloat16 and K % 16 == 0 and N % 8 == 0:
+        return fp8_gemv_m1(x, w8, s8, group_cols)
     tiled = FP8_G_LAYOUT and Mo > 64 and N % 128 == 0 and K % 128 == 0 and (group_cols == 0 or group_cols % 128 == 0)
     if tiled:  # many rows: CUTLASS-style tiles (fp8_tcg.cu), any M
         return _fp8_gemm_tcg(x, w8, s8, Mo, N, K, group_cols, out_dtype)
@@ -226,9 +249,38 @@ FP4_W_LAYOUT = os.environ.get("DSV41_FP4_W", "1") == "1"
 FP4_W_MAX = 64  # tokens per group the second layout handles (groups are split at this size)
 
 
+FP4_M1 = os.environ.get("DSV41_FP4_M1", "0") == "1"  # one-token groups on cuda/fp4_gemv_m1.cu (results/dense_m1_report.md rank 1)
+FP4_M1_KW = int(os.environ.get("DSV41_FP4_M1_KW", "1"))
+FP4_M1_U = int(os.environ.get("DSV41_FP4_M1_U", "2"))
+FP4_M1_MIXED = os.environ.get("DSV41_FP4_M1_MIXED", "0") == "1"  # also split bucketed (B > 1) steps between the two kernels
+
+
+def fp4_gemv_m1(xp: torch.Tensor, w: torch.Tensor, s: torch.Tensor, grp_expert: torch.Tensor, grp_start: torch.Tensor,
+                pair_tok: torch.Tensor, n_pairs: int, shard_start: int = 0, shard_n: int = 1 << 30,
+                zero_out: bool = False, out: torch.Tensor | None = None, kw: int | None = None, u: int | None = None) -> torch.Tensor:
+    """The one-token groups of a grouped expert GEMM (same arguments as fp4_gemm_tc; groups with != 1 pair are ignored)."""
+    E, N, Kh = w.shape
+    K = Kh * 2
+    G = grp_expert.numel()
+    KW, U = kw or FP4_M1_KW, u or FP4_M1_U
+    while K % (32 * KW) != 0 and KW > 1:
+        KW //= 2
+    RB = 8 // KW
+    if out is None:
+        out = torch.empty(n_pairs, N, device=xp.device, dtype=torch.float32)
+    f = get_function("fp4_gemv_m1.cu", f"fp4_gemv_m1_k{KW}u{U}", xp.device)
+    args = [ctypes.c_void_p(xp.data_ptr()), ctypes.c_int(xp.stride(0)),
+            ctypes.c_void_p(w.data_ptr()), ctypes.c_longlong(w.stride(0)), ctypes.c_void_p(s.data_ptr()), ctypes.c_longlong(s.stride(0)),
+            ctypes.c_void_p(grp_expert.data_ptr()), ctypes.c_void_p(grp_start.data_ptr()), ctypes.c_void_p(pair_tok.data_ptr()),
+            ctypes.c_void_p(out.data_ptr()), ctypes.c_int(N), ctypes.c_int(N), ctypes.c_int(K),
+            ctypes.c_int(shard_start), ctypes.c_int(min(shard_n, E)), ctypes.c_int(1 if zero_out else 0)]
+    launch(f, ((N + RB - 1) // RB, G, 1), (256, 1, 1), args, xp.device)
+    return out
+
+
 def fp4_gemm_tc(xp: torch.Tensor, w: torch.Tensor, s: torch.Tensor, grp_expert: torch.Tensor, grp_start: torch.Tensor,
                 pair_tok: torch.Tensor, n_pairs: int, max_tokens: int, shard_start: int = 0, shard_n: int = 1 << 30,
-                zero_out: bool = False, out: torch.Tensor | None = None) -> torch.Tensor:
+                zero_out: bool = False, out: torch.Tensor | None = None, min_tokens: int = 0) -> torch.Tensor:
     """xp: permuted bf16 [rows, K]; w: uint8 [E, N, K/2]; s: uint8 [E, N, K/32]; groups g: expert grp_expert[g] with pairs
     grp_start[g]..grp_start[g+1]-1 (<= max_tokens each), pair p uses x row pair_tok[p]. Returns fp32 [n_pairs, N].
     Groups of <= 8 tokens run on fp4_tc.cu (x as the mma A operand); larger groups (up to 64) on fp4_tcw.cu, which
@@ -251,8 +303,9 @@ def fp4_gemm_tc(xp: torch.Tensor, w: torch.Tensor, s: torch.Tensor, grp_expert: 
               ctypes.c_void_p(out.data_ptr()), ctypes.c_int(N), ctypes.c_int(N), ctypes.c_int(K),
               ctypes.c_int(shard_start), ctypes.c_int(min(shard_n, E)), ctypes.c_int(1 if zero_out else 0)]
     small_max = 8 if (big or max_tokens <= 8) else 16
-    f = get_function("fp4_tc.cu", "fp4_gemm_tc8" if small_max <= 8 else "fp4_gemm_tc16", xp.device)
-    launch(f, ((N // 8 + WARPS - 1) // WARPS, G, 1), (WARPS * 32, 1, 1), common + [ctypes.c_int(0), ctypes.c_int(small_max)], xp.device)
+    if min_tokens <= small_max:  # (min_tokens > 0: the one-token groups were handled by fp4_gemv_m1)
+        f = get_function("fp4_tc.cu", "fp4_gemm_tc8" if small_max <= 8 else "fp4_gemm_tc16", xp.device)
+        launch(f, ((N // 8 + WARPS - 1) // WARPS, G, 1), (WARPS * 32, 1, 1), common + [ctypes.c_int(min_tokens), ctypes.c_int(small_max)], xp.device)
     if big:
         f = get_function("fp4_tcw.cu", "fp4_gemm_tcw", xp.device)
         shared = 3 * 64 * 256

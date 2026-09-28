@@ -210,6 +210,10 @@ def _norm_quant2_kernel(Y, SS, W, YN, YQ, YF, YQP, eps, D: tl.constexpr, NB: tl.
         tl.store(YQP + _perm8(offs), yq, mask=mask)
 
 
+_LEAN = os.environ.get("DSV41_DECODE_LEAN", "0") == "1"
+_ss_static: dict = {}
+
+
 def hc_pre_norm_quant2(x, pre_in, w, eps, want_f32=False, out=None, want_perm=False):
     """Same outputs as hc_pre_norm_quant without the split (y, yq, yf, yqp: [B, d]), as two multi-CTA kernels
     (~3 us each instead of one ~13 us single-CTA kernel). x: [B, 1, hc, d]; pre_in: [B, hc] (or [hc] for B = 1)."""
@@ -221,13 +225,19 @@ def hc_pre_norm_quant2(x, pre_in, w, eps, want_f32=False, out=None, want_perm=Fa
     nb = triton.cdiv(d, BLOCK)
     NB = triton.next_power_of_2(nb)
     ytmp = torch.empty(B, d, device=dev, dtype=torch.bfloat16)
-    ss = torch.empty(B, NB, device=dev, dtype=torch.float32)
+    if _LEAN:  # only the first nb of the NB partial slots are ever written: keep one zeroed buffer per shape
+        key = (B, NB, dev)
+        ss = _ss_static.get(key)
+        if ss is None:
+            ss = _ss_static[key] = torch.zeros(B, NB, device=dev, dtype=torch.float32)
+    else:
+        ss = torch.empty(B, NB, device=dev, dtype=torch.float32)
     y = out.get("y") if out.get("y") is not None else torch.empty(B, d, device=dev, dtype=torch.bfloat16)
     yq = out.get("yq") if out.get("yq") is not None else torch.empty(B, d, device=dev, dtype=torch.bfloat16)
     yf = (out.get("yf") if out.get("yf") is not None else torch.empty(B, d, device=dev, dtype=torch.float32)) if want_f32 else y
     yqp = (out.get("yqp") if out.get("yqp") is not None else torch.empty(B, d, device=dev, dtype=torch.bfloat16)) if want_perm else y
     with torch.cuda.device(dev):
-        if NB > nb:
+        if NB > nb and not _LEAN:
             ss.zero_()
         _hc_pre2_kernel[(nb, B)](x, pre_in, ytmp, ss, D=d, HC=hc, BLOCK=BLOCK, NB=NB, num_warps=4)
         _norm_quant2_kernel[(nb, B)](ytmp, ss, w, y, yq, yf, yqp, eps, D=d, NB=NB, BLOCK=BLOCK, WRITE_YF=want_f32, WRITE_YQP=want_perm, num_warps=4)

@@ -22,6 +22,8 @@ from .model import Attention, Block, Transformer, _hc_post, _hc_pre, linear_fp8,
 from .w8 import linear_w, oproj_a
 
 FUSED2 = os.environ.get("DSV41_FUSED2", "1") == "1"
+INDEX_FAST = os.environ.get("DSV41_INDEX_FAST", "0") == "1"  # fused indexer score + top-k (fused3.py, results/dense_m1_report.md rank 3)
+DECODE_LEAN = os.environ.get("DSV41_DECODE_LEAN", "0") == "1"  # compress_len once per token, no per-layer scalar kernels
 _CPU_DEBUG = os.environ.get("DSV41_CPU_DEBUG") is not None
 FP4_TC = os.environ.get("DSV41_FP4_TC", "1") == "1"  # expert GEMM on tensor cores (cuda/fp4_tc.cu) instead of the GEMV
 HC_FORK = os.environ.get("DSV41_HC_FORK", "1") == "1"  # hyper-connection mixes + sinkhorn on a side stream (a parallel graph branch)
@@ -98,7 +100,14 @@ class DecodeRuntime:
         kv_write(linear_w(xq, A.wkv), A.kv_norm_w, A.cos, A.sin, pos, A.window_kv_cache, rd, eps, seq)
         if A.ratio:
             ratio = A.ratio
-            compress_len = torch.div(pos + 1, ratio, rounding_mode="floor")  # [B]
+            if DECODE_LEAN:  # the same value for every layer of the token: one pair of kernels per (device, ratio)
+                key = (d, ratio)
+                clc = self.__dict__.setdefault("_clen_cache", {})
+                compress_len = clc.get(key)
+                if compress_len is None:
+                    compress_len = clc[key] = torch.div(pos + 1, ratio, rounding_mode="floor")
+            else:
+                compress_len = torch.div(pos + 1, ratio, rounding_mode="floor")  # [B]
             latent = None
             x3 = x.view(B, 1, -1)
             if A.is_kv_source:
@@ -229,9 +238,15 @@ class DecodeRuntime:
         rope_dev_(q, rd, I.cos, I.sin, pos)
         q = fake_quant_fp4(q, 32)
         index_k = self.m.shared.index_k[(self.index_owner, d)]  # [S, max_c + 1, 128] (last row = dummy)
+        weights = F.linear(x, I.weights_proj) * (I.softmax_scale * I.n_heads**-0.5)
+        if INDEX_FAST and FUSED2 and not I.is_candidate_source:
+            from .fused3 import index_score, topk_indices
+            cl = compress_len.view(-1)
+            cand = self.cand_buf[d] if I.uses_candidates else None
+            score = index_score(q, index_k, weights, self.seq[d], cl, cand)
+            return topk_indices(score, self.topk, cl)
         if FUSED2:
             index_k = index_k.index_select(0, self.seq[d])  # the row's sequence
-        weights = F.linear(x, I.weights_proj) * (I.softmax_scale * I.n_heads**-0.5)
         score = torch.einsum("bshd,btd->bsht", q.float(), index_k.float())
         score = (score.relu_() * weights.float().unsqueeze(-1)).sum(dim=2)  # [B, 1, max_c + 1]
         n_pos = score.shape[-1]
@@ -322,17 +337,26 @@ class DecodeRuntime:
         B = n // topk if topk else 1
         def rep_ids(ge):  # global expert ids (-1 = padding) -> replica slots (-1 = none)
             return torch.where(ge >= 0, replica["lut"][ge.clamp(min=0).long()], ge)
+        def gemm(x_, w_, s_, ge_, starts_, tok_, max_tok, sh, zero_out, out=None):
+            # DSV41_FP4_M1: one-token groups on the dedicated GEMV, the rest (>= 2 tokens) on the tensor-core kernels
+            if cukern.FP4_M1:
+                if max_tok <= 1:
+                    return cukern.fp4_gemv_m1(x_, w_, s_, ge_, starts_, tok_, n, shard_start=sh[0], shard_n=sh[1], zero_out=zero_out, out=out)
+                if cukern.FP4_M1_MIXED:  # bucketed steps: one-token groups on the GEMV, the rest on the tensor-core kernel (measured slower at S=8)
+                    out = fp4_gemm_tc(x_, w_, s_, ge_, starts_, tok_, n, max_tok, shard_start=sh[0], shard_n=sh[1], zero_out=zero_out, out=out, min_tokens=2)
+                    return cukern.fp4_gemv_m1(x_, w_, s_, ge_, starts_, tok_, n, shard_start=sh[0], shard_n=sh[1], zero_out=zero_out, out=out)
+            return fp4_gemm_tc(x_, w_, s_, ge_, starts_, tok_, n, max_tok, shard_start=sh[0], shard_n=sh[1], zero_out=zero_out, out=out)
         if B <= 1:
             starts, tok, rows = self._tc_tables(n, d, topk)
             ge = eid.reshape(-1)
-            gu = fp4_gemm_tc(xqp, w13, s13, ge, starts, tok, n, 1, shard_start=shard[0], shard_n=shard[1], zero_out=False)
+            gu = gemm(xqp, w13, s13, ge, starts, tok, 1, shard, False)
             if replica is not None:
                 gr = rep_ids(ge)
-                fp4_gemm_tc(xqp, replica["w13"], replica["s13"], gr, starts, tok, n, 1, shard_start=0, shard_n=replica["w13"].shape[0], zero_out=False, out=gu)
+                gemm(xqp, replica["w13"], replica["s13"], gr, starts, tok, 1, (0, replica["w13"].shape[0]), False, out=gu)
             hqp = swiglu_quant(gu, wt.reshape(-1), inter, limit, permute=True)
-            y = fp4_gemm_tc(hqp, w2, s2, ge, starts, rows, n, 1, shard_start=shard[0], shard_n=shard[1], zero_out=True)
+            y = gemm(hqp, w2, s2, ge, starts, rows, 1, shard, True)
             if replica is not None:  # after the shard pass, which zeroed these rows
-                fp4_gemm_tc(hqp, replica["w2"], replica["s2"], gr, starts, rows, n, 1, shard_start=0, shard_n=replica["w2"].shape[0], zero_out=False, out=y)
+                gemm(hqp, replica["w2"], replica["s2"], gr, starts, rows, 1, (0, replica["w2"].shape[0]), False, out=y)
             return y
         # ---- bucket the n pairs by expert (all static shapes; padded groups have expert -1 and are skipped)
         e = eid.reshape(-1).to(torch.int64)
@@ -351,17 +375,15 @@ class DecodeRuntime:
         grp_expert = torch.full((n,), -1, dtype=torch.int32, device=d).scatter_(0, gid, se.to(torch.int32))
         grp_start = torch.full((n + 1,), n, dtype=torch.int32, device=d)
         grp_start.scatter_reduce_(0, gid, torch.where(is_new, ar, torch.full_like(ar, n)).to(torch.int32), "amin")
-        gu = fp4_gemm_tc(xqp, w13, s13, grp_expert, grp_start, tok_sorted, n, min(B, gmax), shard_start=shard[0], shard_n=shard[1], zero_out=False)
+        gu = gemm(xqp, w13, s13, grp_expert, grp_start, tok_sorted, min(B, gmax), shard, False)
         if replica is not None:
             grp_rep = rep_ids(grp_expert)
-            fp4_gemm_tc(xqp, replica["w13"], replica["s13"], grp_rep, grp_start, tok_sorted, n, min(B, gmax), shard_start=0,
-                        shard_n=replica["w13"].shape[0], zero_out=False, out=gu)
+            gemm(xqp, replica["w13"], replica["s13"], grp_rep, grp_start, tok_sorted, min(B, gmax), (0, replica["w13"].shape[0]), False, out=gu)
         hqp = swiglu_quant(gu, wt_sorted, inter, limit, permute=True)
         rows = ar.to(torch.int32)
-        y2s = fp4_gemm_tc(hqp, w2, s2, grp_expert, grp_start, rows, n, min(B, gmax), shard_start=shard[0], shard_n=shard[1], zero_out=True)
+        y2s = gemm(hqp, w2, s2, grp_expert, grp_start, rows, min(B, gmax), shard, True)
         if replica is not None:
-            fp4_gemm_tc(hqp, replica["w2"], replica["s2"], grp_rep, grp_start, rows, n, min(B, gmax), shard_start=0,
-                        shard_n=replica["w2"].shape[0], zero_out=False, out=y2s)
+            gemm(hqp, replica["w2"], replica["s2"], grp_rep, grp_start, rows, min(B, gmax), (0, replica["w2"].shape[0]), False, out=y2s)
         inv = torch.empty_like(order).scatter_(0, order, ar)
         return y2s[inv]
 
@@ -601,6 +623,7 @@ class DecodeRuntime:
     def set_rows(self, token, pos, seq=None, pmax=None):
         """Fill the row tables: token(s), position(s), sequence id per row (default 0..B-1) and the newest position
         written to each row's sequence this step (default: the row's own position). Ints are broadcast."""
+        self._clen_cache = {}  # DECODE_LEAN: compress_len per (device, ratio) is recomputed once per token
         B = self.B
         as_rows = lambda v, dt: torch.full((B,), int(v), dtype=dt) if isinstance(v, int) else torch.as_tensor(v, dtype=dt).view(-1)
         tok = as_rows(token, torch.int64)

@@ -499,6 +499,7 @@ class EPRuntime(DecodeRuntime):
         self._stamp(d, L, 7)
 
     def token_begin(self, d):
+        self._clen_cache = {}  # DECODE_LEAN: compress_len per (device, ratio) is recomputed once per token (inside the graph)
         hc = self.cfg["hc_mult"]
         if d == self.devs[0]:
             with torch.cuda.device(d):
