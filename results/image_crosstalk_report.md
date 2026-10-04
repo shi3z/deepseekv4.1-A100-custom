@@ -97,3 +97,17 @@ documented in §3–4.
 * Options if the CED prefill speed is needed back: raise `DSV41_CED_ENCODER_LAST_LAYER` (fewer skipped layers; still
   approximate), or make the stage-2 window mask refuse positions before the tail (removes the cross-request
   contamination but keeps the approximation that already fails on tail images). Neither is exact; not implemented.
+
+## 7. Follow-up (same day): keep CED for text, never for images
+
+Per the user's decision the run scripts are back on `DSV41_CED=1`, with two code changes in `dsv41/model.py`:
+image prompts (`images is not None`) always take the exact prefill in both the sequential and the pipelined path,
+and before a CED tail / last-chunk pass the decoder-side (layers > `DSV41_CED_ENCODER_LAST_LAYER`) window rings of
+the prefill row are zeroed, so the tail attends to zero keys/values at the positions it never processed instead of to
+the previous request's kv. CED remains an approximation for the last 128 tokens of a text prompt (documented in the
+README); it no longer carries another request's data.
+
+Verification after the restart (`DSV41_CED=1`, new code): the six previously failing image-last prompts (2,055 /
+2,295 / 3,975–4,095 tokens) read the image correctly 6/6 at exact-prefill speed (440–470 tok/s at 4K); text needles
+in the tail and questions about the far start of a 1.5K / 3.4K / 5.3K prompt all correct under CED; randomized
+4-user audit seed 3: 0/120 leaks, 5/120 strict mismatches (OCR near-misses), 0 errors.
