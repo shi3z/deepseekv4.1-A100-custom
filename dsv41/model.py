@@ -2367,7 +2367,11 @@ class Transformer:
         enc_last_id = int(os.environ.get("DSV41_CED_ENCODER_LAST_LAYER", "20"))
         win_size = int(self.args.cfg.get("window_size", 128))
         min_ced_tokens = int(os.environ.get("DSV41_CED_MIN_TOKENS", "2048"))
-        use_ced = os.environ.get("DSV41_CED", "1") != "0" and S >= min_ced_tokens and S > win_size
+        # CED is an approximation (results/image_crosstalk_report.md): layers > enc_last_id only run over the tail, whose
+        # window reaches positions those layers never processed for this prompt. Image prompts are always exact (an
+        # image ending near the tail became unreadable), and the decoder-side rings of the prefill row are cleared so
+        # the tail attends to zeros there rather than to the previous request's kv.
+        use_ced = os.environ.get("DSV41_CED", "1") != "0" and S >= min_ced_tokens and S > win_size and images is None
 
         if use_ced:
             # -------------------------------------------------------------
@@ -2393,6 +2397,8 @@ class Transformer:
                 h, pre_mix = blk(h, start_pos, pre_mix, image_mask=im)
 
             # Stage 2: Decoder pass (layers enc_last_id + 1 .. 39) on ONLY bounded tail window.
+            for blk in dec_blocks:
+                blk.attn.window_kv_cache[0].zero_()  # no stale (previous request's) window kv for the tail
             tail_len = min(S, max(win_size, int(os.environ.get("DSV41_CED_TAIL_WINDOW", str(win_size)))))
             h_dec = h[:, -tail_len:]
             pre_mix_dec = pre_mix[:, -tail_len:]
@@ -2533,7 +2539,11 @@ class Transformer:
         last_progress_tokens = 0
 
         enc_last_id = int(os.environ.get("DSV41_CED_ENCODER_LAST_LAYER", "20"))
-        use_ced = os.environ.get("DSV41_CED", "1") != "0" and M > 1
+        use_ced = os.environ.get("DSV41_CED", "1") != "0" and M > 1 and images is None  # image prompts: exact (see _forward_sequential)
+        if use_ced:
+            for blk in self.blocks:
+                if blk.layer_id > enc_last_id:
+                    blk.attn.window_kv_cache[0].zero_()  # the last chunk's window must not see the previous request's kv
 
         for t in range(T):
             for k in range(K - 1, -1, -1):
