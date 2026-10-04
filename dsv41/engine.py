@@ -5075,6 +5075,13 @@ class Engine:
                     with getattr(self, "_slot_tokens_lock", threading.Lock()):
                         if slot_id in self._slot_tokens:
                             del self._slot_tokens[slot_id]
+                        # slot 0 (the prefill scratchpad) may be partially overwritten by the failed prefill:
+                        # forget what it held so no later request continues from it (GPU-slot LCP, exact-prefix
+                        # continuation, window log)
+                        self._slot_tokens.pop(0, None)
+                    self._slot_window_log.pop(0, None)
+                    self._prefix_prompt_ids = None
+                    self._prefix_len = 0
                     with self._slot_lock:
                         st = self.slot_states.get(slot_id, {})
                         st["status"] = "idle"
