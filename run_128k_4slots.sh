@@ -30,7 +30,7 @@ export DSV41_MAX_SEQS=5
 export DSV41_EP_COMPACT_XQ=1
 export DSV41_GPU_SLOT_CACHE=1
 export DSV41_PREFIX_DEDUP_MIRRORS=1
-export DSV41_CED=1  # text prompts: CED prefill (approximate tail, rings cleared); image prompts always run exact prefill (results/image_crosstalk_report.md)
+export DSV41_CED=0  # exact prefill for everything (user decision 2026-10-05); =1 is the approximate CED tail for text prompts, images are always exact (results/image_crosstalk_report.md)
 # Jev structured-output engine and its external policy API are off (user decision 2026-09-25)
 export DSV41_JEV=0
 export DSV41_ENABLE_JEV_POLICY=0
