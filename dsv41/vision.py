@@ -333,8 +333,8 @@ class ViT(nn.Module):
     def forward(self, patches: torch.Tensor, n_h: int, n_w: int) -> torch.Tensor:
         x = self.patch_embed(patches)
         cos, sin = get_vision_cos_sin(n_h, n_w, self.rope_dim, self.rope_theta)
-        cos = cos.to(device=x.device, dtype=x.dtype)
-        sin = sin.to(device=x.device, dtype=x.dtype)
+        cos = cos.to(device=x.device)  # fp32, as in the reference (apply_rotary computes in fp32)
+        sin = sin.to(device=x.device)
         for block in self.blocks:
             x = block(x, cos, sin)
         return self.norm(x)

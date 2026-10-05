@@ -111,3 +111,36 @@ Verification after the restart (`DSV41_CED=1`, new code): the six previously fai
 2,295 / 3,975–4,095 tokens) read the image correctly 6/6 at exact-prefill speed (440–470 tok/s at 4K); text needles
 in the tail and questions about the far start of a 1.5K / 3.4K / 5.3K prompt all correct under CED; randomized
 4-user audit seed 3: 0/120 leaks, 5/120 strict mismatches (OCR near-misses), 0 errors.
+
+## 8. Follow-up (2026-10-05): a concrete misdescribed image
+
+The user reported a 1810×2466 anime image (short blonde bob, torn black top, blue denim skirt, torn black leggings,
+brown boots) described as "long blonde hair past her shoulders, light-blue button-down blouse". Findings:
+
+* **ViT OOM on large images.** The vision encoder called `scaled_dot_product_attention` with 3-D inputs, which takes
+  the math kernel and materializes the n×n scores: 9.3 GiB peak for this image's 8,268 patches (measured on GPU 6),
+  → `CUDA out of memory` on the shared GPU 2 (≈ 2.6 GiB free). With 4-D inputs the flash kernel runs in 0.02 GiB,
+  outputs equal within bf16 rounding (max |Δ| 4.9e-4). Fixed (`dsv41/vision.py`).
+* **Engram gate not shut for image tokens.** The reference model passes `token_mask` into the Engram layer so image
+  positions get no Engram contribution; our port masked the n-gram hashes but left the gate open, so every image
+  token in every Engram layer received the pad-n-gram embedding. Fixed at all four prefill call sites
+  (`dsv41/engram.py`, `dsv41/model.py`).
+* **ViT rotary cos/sin in bf16** (reference: fp32). Now fp32. Encoder output vs the reference implementation on this
+  image: cosine 0.99983 (max |Δ| 0.029 at RMS 0.046) after the fixes, 0.99975 before; the reference is bit-exact
+  against itself.
+* Image preprocessing (`plan_image_grid`, `load_image`, token types) is identical to the reference: this image is
+  resized to 1092×1484 → a 36×26 token grid (974 tokens), the model's maximum; the server does not need to shrink
+  images further for memory once the flash kernel is used.
+
+Result on the user's image (`Describe this image in detail ...`, greedy), after the fixes:
+
+| input | before (flash fix only, Engram gate open) | after (Engram mask + fp32 rope) |
+|---|---|---|
+| full 1810×2466 (974 image tokens) | "long, voluminous blonde hair ... high ponytail", "white sleeveless crop top", "denim shorts" | "short, chin-length blonde hair styled in a bob", "fitted black t-shirt with short sleeves that have jagged, torn edges", "brown belt with a large gold buckle" |
+| 905×1233 (720 tokens) | – | same, correct |
+| 724×986 (486 tokens) | "short chin-length bob" but "white top" | "short bob", "black short-sleeved t-shirt", correct |
+
+The misdescription was therefore not cross-talk and not the image size: with the Engram gate open on image tokens
+the LLM saw image embeddings perturbed by the pad-n-gram Engram vector (974 perturbed positions for a large image,
+fewer for a small one), and described a generic character instead. Pre-shrinking images below the model's own cap
+is not needed and would discard detail the model is trained on.

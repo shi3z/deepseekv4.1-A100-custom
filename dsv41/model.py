@@ -2389,7 +2389,7 @@ class Transformer:
                     pre_mix = pre_mix.to(blk.device, non_blocking=True)
                 t = _tick("transfer", t)
                 if blk.engram is not None and hashes is not None:
-                    h = blk.engram(h, hashes[:, :, blk.engram.layer_hash_index, :])
+                    h = blk.engram(h, hashes[:, :, blk.engram.layer_hash_index, :], engram_mask)
                     _tick("engram", t)
                 if blk.layer_id in targets:
                     main_hiddens.append(h.mean(dim=2))
@@ -2413,7 +2413,7 @@ class Transformer:
                 t = _tick("transfer", t)
                 if blk.engram is not None and hashes is not None:
                     chunk_hashes = hashes[:, -tail_len:, blk.engram.layer_hash_index, :]
-                    h_dec = blk.engram(h_dec, chunk_hashes)
+                    h_dec = blk.engram(h_dec, chunk_hashes, None if engram_mask is None else engram_mask[:, -tail_len:])
                     _tick("engram", t)
                 if blk.layer_id in targets:
                     main_hiddens.append(h_dec.mean(dim=2))
@@ -2437,7 +2437,7 @@ class Transformer:
                 pre_mix = pre_mix.to(blk.device, non_blocking=True)
             t = _tick("transfer", t)
             if blk.engram is not None and hashes is not None:
-                h = blk.engram(h, hashes[:, :, blk.engram.layer_hash_index, :])
+                h = blk.engram(h, hashes[:, :, blk.engram.layer_hash_index, :], engram_mask)
                 _tick("engram", t)
             if blk.layer_id in targets:  # DSpark reads the attention input of its target layers
                 main_hiddens.append(h.mean(dim=2))
@@ -2515,6 +2515,7 @@ class Transformer:
 
         # Chunk-level engram hashes computed on demand to avoid allocating hundreds of MBs on GPU 0
         chunk_hashes_map: dict[int, torch.Tensor] = {}
+        chunk_engram_mask_map: dict[int, torch.Tensor | None] = {}
 
         targets = set(getattr(self, "collect_main_hidden", ()))
         chunk_main_hiddens: dict[int, list[torch.Tensor]] = {lid: [] for lid in targets}
@@ -2590,6 +2591,7 @@ class Transformer:
                             if image_mask is not None:
                                 chunk_engram_mask = (~image_mask[:, c0:c1]).to(dev_k)
                             chunk_hashes_map[m] = self.engram_hash(chunk_ids, p_m, token_mask=chunk_engram_mask)
+                            chunk_engram_mask_map[m] = chunk_engram_mask
                     else:
                         stream_k.wait_event(ev_stage_done[k - 1][m])
                         h_prev, pre_mix_prev = chunk_activations[k - 1][m]
@@ -2608,7 +2610,7 @@ class Transformer:
                             blk_hash = chunk_hashes[:, :, blk.engram.layer_hash_index, :]
                             if blk_hash.device != dev_k:
                                 blk_hash = blk_hash.to(dev_k, non_blocking=True)
-                            h = blk.engram(h, blk_hash)
+                            h = blk.engram(h, blk_hash, chunk_engram_mask_map.get(m))
                         if blk.layer_id in targets:
                             chunk_main_hiddens[blk.layer_id].append(h.mean(dim=2))
                         chunk_im = None

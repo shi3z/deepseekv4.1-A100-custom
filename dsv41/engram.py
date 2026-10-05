@@ -186,8 +186,9 @@ class Engram(torch.nn.Module):
         self.qk_weight = (q_weight.float() * k_weight.float())  # [hc, dim]
         self.clamp_value = 1e-6
 
-    def forward(self, x: torch.Tensor, hash_ids: torch.Tensor) -> torch.Tensor:
-        """x: [B, L, hc, dim] bf16; hash_ids: [B, L, n_hash_cols].
+    def forward(self, x: torch.Tensor, hash_ids: torch.Tensor, token_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """x: [B, L, hc, dim] bf16; hash_ids: [B, L, n_hash_cols]; token_mask [B, L] bool: False shuts the gate
+        (image tokens get no Engram contribution, as in the reference model).
 
         Long prefill is processed in sequence chunks so apply() never
         materializes x.float() for the entire prompt at once.
@@ -208,7 +209,7 @@ class Engram(torch.nn.Module):
                 x.device,
             ).flatten(-2)
 
-            return self.apply(x, emb)
+            return self.apply(x, emb, token_mask)
 
         if os.environ.get("DSV41_DEBUG", "0") == "1":
             print(
@@ -230,7 +231,7 @@ class Engram(torch.nn.Module):
                 x.device,
             ).flatten(-2)
 
-            ys = self.apply(xs, emb)
+            ys = self.apply(xs, emb, None if token_mask is None else token_mask[:, s0:s1])
 
             xs.copy_(ys)
 
@@ -239,7 +240,7 @@ class Engram(torch.nn.Module):
 
         return x
 
-    def apply(self, x: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
+    def apply(self, x: torch.Tensor, emb: torch.Tensor, token_mask: torch.Tensor | None = None) -> torch.Tensor:
         """The GPU half: emb [B, L, cols*head_dim] bf16 (already gathered + dequantized)."""
         from .w8 import linear_w
         kv = linear_w(emb, self.wkv)
@@ -249,4 +250,6 @@ class Engram(torch.nn.Module):
         rstd = torch.rsqrt(h.square().mean(-1) + self.eps) * torch.rsqrt(key.square().mean(-1) + self.eps)
         dot = (h * self.qk_weight * key).sum(-1) * rstd * self.dim**-0.5
         gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(self.clamp_value).sqrt(), dot))
+        if token_mask is not None:
+            gate = gate.masked_fill(~token_mask.to(gate.device).unsqueeze(-1), 0)  # reference: masked tokens pass through untouched
         return (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(x.dtype)
