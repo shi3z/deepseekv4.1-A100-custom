@@ -289,7 +289,9 @@ class Attention(nn.Module):
         q, k, v = (t.view(n, self.n_heads, self.head_dim) for t in self.wqkv(x).chunk(3, dim=-1))
         q = apply_rotary(q, cos, sin)
         k = apply_rotary(k, cos, sin)
-        o = F.scaled_dot_product_attention(q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1))
+        # 4-D [1, heads, n, d] so SDPA takes the flash / memory-efficient kernels: with 3-D inputs it falls back to the
+        # math kernel and materializes the n x n scores (9.3 GiB for an 8,268-patch image -> CUDA OOM on the shared GPU)
+        o = F.scaled_dot_product_attention(q.transpose(0, 1).unsqueeze(0), k.transpose(0, 1).unsqueeze(0), v.transpose(0, 1).unsqueeze(0)).squeeze(0)
         return self.wo(o.transpose(0, 1).reshape(n, -1))
 
 
