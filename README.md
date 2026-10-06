@@ -266,6 +266,23 @@ Full-request examples:
 
 At 117,896 tokens, MTP fallback and DSpark unloading were triggered, but the compressed/index cache eventually exhausted GPU memory and the API returned HTTP 507. This is a persistent full-context capacity limit, separate from short prefix-HIT replay performance.
 
+## GPU lending to the H3 fleet (`run_gpu_lender.sh`, 2026-10-06)
+
+The 4 LLM GPUs (0-3) are lent to the ComfyUI H3 fleet when the LLM is idle: `scripts/gpu_lender.py` (tmux
+`gpu-lender`) waits until no request has reached the LLM for `LEND_IDLE_MIN` (20) minutes and the fleet `queue/` is
+non-empty, then stops the LLM, starts ComfyUI members `c0`/`c1` on GPUs 0/1 (ports 8190/8191, same checkout and venv
+as the fleet) and keeps a wake-up proxy on :8000. `GET /v1/models` and `/health` keep answering; the first
+`POST /v1/chat/completions` (or `/v1/completions`) is held while the lent members are stopped (their claimed jobs are
+requeued like the fleet watchdog does) and the 4-GPU LLM is restarted (2-3 min), then forwarded. Connections that
+arrive while the LLM is loading are refused and must be retried. The fleet queue draining for 10 min also restores
+the LLM. The lent members follow the fleet's thermal rules (inlet >= 48 C pause, >= 49 C freeze, <= 47 C resume; GPU
+>= 83 C pause). The LLM cannot run on fewer GPUs meanwhile: the single-GPU `--offload-experts` mode
+(`run_offload_lend.sh`) needs 20+ minutes to pin 272 GB of experts into host RAM, so it is not used.
+
+GPU 5 is no longer part of the fleet (user decision, 2026-10-06; `h3-fleet/maintenance/c5` marker, fleet scripts
+updated). Other services must not take GPUs 0-3 while they are free: the LLM restart needs ~75 GiB per GPU, and the
+lender waits for them to be released (log `results/gpu_lender.log`).
+
 ## MTP evidence
 
 ```text
