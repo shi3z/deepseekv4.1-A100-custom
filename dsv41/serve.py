@@ -121,6 +121,83 @@ def _heartbeat_interval() -> float:
         return 5.0
 
 
+class _StreamSplitter:
+    """Turns the generated pieces of a chat stream into (kind, text) deltas, kind in {"reasoning", "content"},
+    and detects the start of DSML tool-call markup.
+
+    The tokenizer splits the markers across tokens ('<' + '｜DSML｜' + ' calls>', '</' + '｜DSML｜' ...), so a
+    per-piece substring test never fires.  Detection therefore runs on an accumulated buffer, and a tail that could
+    still be the beginning of a marker is held back until the next piece settles it (at most a few characters, one
+    token of latency).  Once '<｜DSML｜' is seen nothing more is emitted: the caller parses the full text at the end.
+    `in_thinking` starts True when the prompt ends with '<think>' (thinking mode): the model then emits only the
+    closing '</think>', which used to leak into the content."""
+
+    MARKERS = ("<｜DSML｜", "<think>", "</think>")
+
+    def __init__(self, in_thinking: bool = False):
+        self.in_thinking = in_thinking
+        self.has_dsml = False
+        self.buf = ""
+
+    def feed(self, piece: str) -> list[tuple[str, str]]:
+        if self.has_dsml:
+            return []
+        self.buf += piece
+        return self._drain(final=False)
+
+    def flush(self) -> list[tuple[str, str]]:
+        return self._drain(final=True)
+
+    def _emit(self, out: list, text: str) -> None:
+        if text:
+            out.append(("reasoning" if self.in_thinking else "content", text))
+
+    def _held_len(self) -> int:
+        longest = max(len(m) for m in self.MARKERS) - 1
+        for L in range(min(len(self.buf), longest), 0, -1):
+            suffix = self.buf[-L:]
+            if any(m.startswith(suffix) for m in self.MARKERS):
+                return L
+        return 0
+
+    def _drain(self, final: bool) -> list[tuple[str, str]]:
+        out: list[tuple[str, str]] = []
+        while self.buf and not self.has_dsml:
+            best = None
+            for m in self.MARKERS:
+                i = self.buf.find(m)
+                if i >= 0 and (best is None or i < best[0]):
+                    best = (i, m)
+            if best is not None:
+                i, m = best
+                self._emit(out, self.buf[:i])
+                self.buf = self.buf[i + len(m):]
+                if m == "<｜DSML｜":
+                    self.has_dsml = True
+                    self.buf = ""
+                elif m == "<think>":
+                    self.in_thinking = True
+                else:
+                    self.in_thinking = False
+                continue
+            hold = 0 if final else self._held_len()
+            if hold < len(self.buf):
+                self._emit(out, self.buf[: len(self.buf) - hold])
+                self.buf = self.buf[len(self.buf) - hold:]
+            break
+        return out
+
+
+def _prompt_ends_in_thinking(eng, ids, thinking) -> bool:
+    """True when generation starts inside a <think> block (the encoder appended the thinking start token)."""
+    try:
+        if ids:
+            return eng.tok.decode(list(ids[-1:])) == "<think>"
+    except Exception:
+        pass
+    return thinking == "thinking"
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -435,10 +512,15 @@ class Handler(BaseHTTPRequestHandler):
                 payload = "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
                 ka.write(payload.encode("utf-8"))
 
-            in_thinking = False
-            has_dsml = False
+            # Markers ('<｜DSML｜', '<think>', '</think>') arrive split across tokens; the splitter detects them on
+            # the accumulated text and holds back a possible marker prefix (see _StreamSplitter).
+            splitter = _StreamSplitter(in_thinking=_prompt_ends_in_thinking(eng, ids, thinking))
             full_pieces = []
             n = 0
+
+            def emit(events):
+                for kind, text in events:
+                    chunk({"reasoning_content": text} if kind == "reasoning" else {"content": text})
 
             try:
                 chunk({"role": "assistant"})
@@ -447,31 +529,9 @@ class Handler(BaseHTTPRequestHandler):
                         continue
                     full_pieces.append(piece)
                     n += 1
-
-                    # Tool call handling: if DSML marker detected, buffer for structured parsing
-                    if "<｜DSML｜" in piece or has_dsml:
-                        has_dsml = True
-                        continue
-
-                    # Thinking / reasoning detection
-                    if "<think>" in piece and not in_thinking:
-                        in_thinking = True
-                        piece = piece.replace("<think>", "")
-                        if not piece:
-                            continue
-
-                    if in_thinking:
-                        if "</think>" in piece:
-                            reasoning_part, text_part = piece.split("</think>", 1)
-                            if reasoning_part:
-                                chunk({"reasoning_content": reasoning_part})
-                            in_thinking = False
-                            if text_part:
-                                chunk({"content": text_part})
-                        else:
-                            chunk({"reasoning_content": piece})
-                    else:
-                        chunk({"content": piece})
+                    emit(splitter.feed(piece))
+                emit(splitter.flush())
+                has_dsml = splitter.has_dsml
 
                 # If DSML tool calls were encountered, parse and emit structured tool_calls chunk
                 full_text = "".join(full_pieces)
