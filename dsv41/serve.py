@@ -278,7 +278,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"object": "list", "data": data})
         elif self.path == "/health":
             self._json(200, {"status": "ok", "model": ENGINE.model_name, "max_seq_len": ENGINE.max_seq_len,
-                             "max_seqs": ENGINE.max_seqs, "max_input_tokens": ENGINE.max_seq_len - 1})
+                             "max_seqs": ENGINE.max_seqs, "max_input_tokens": ENGINE.max_seq_len - 1,
+                             "decode_slots": {str(s_): ENGINE.slot_cap_tokens(s_) for s_ in getattr(ENGINE, "decode_slot_ids", [])}})
         elif self.path in ("/dashboard", "/"):
             self._dashboard()
         elif self.path in (
@@ -292,7 +293,7 @@ class Handler(BaseHTTPRequestHandler):
                 "max_seqs": getattr(ENGINE, "max_seqs", 1) if ENGINE else 0,
                 "max_decode_slots": getattr(ENGINE, "max_decode_slots", 1) if ENGINE else 0,
                 "free_slots": len(getattr(ENGINE, "_free_decode_slots", [])) if ENGINE else 0,
-                "queue_depth": ENGINE._batch_queue.qsize() if ENGINE and hasattr(ENGINE, "_batch_queue") else 0,
+                "queue_depth": (ENGINE._batch_queue.qsize() + len(getattr(ENGINE, "_batch_waiting", []))) if ENGINE and hasattr(ENGINE, "_batch_queue") else 0,
                 "slots": ENGINE.slot_states if ENGINE and hasattr(ENGINE, "slot_states") else {},
             }
             self._json(200, slots_data)

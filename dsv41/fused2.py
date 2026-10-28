@@ -427,7 +427,7 @@ def sattn2(q, kv_win, kv_c, idx, pos, attn_sink, cos, sin, rd, softmax_scale, se
         idx = pos  # unused
         nblk = nwin
     else:
-        n_c = kv_c.shape[1]
+        n_c = kv_c.stride(0) // kv_c.shape[2]  # row stride in positions (== shape[1] unless the rows are an as_strided view)
         t = idx.shape[-1]
         nblk = nwin + triton.cdiv(t, block_t)
     # key blocks per split: one row needs many splits for parallelism, many rows do not (the fp32 partials

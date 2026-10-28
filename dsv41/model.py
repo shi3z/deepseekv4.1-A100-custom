@@ -285,6 +285,9 @@ class SharedAttn:
         self.window_log_range: list[int] = [-1, -1]
         self.compress_kv: dict[tuple[int, torch.device], torch.Tensor] = {}
         self.index_k: dict[tuple[int, torch.device], torch.Tensor] = {}
+        # DSV41_SLOT_CAPS (dsv41/slots.py): the tables above are as_strided views into these flat buffers
+        self.cache_flat: dict[tuple[str, int, torch.device], torch.Tensor] = {}
+        self.slot_layout = None
 
         # Hard maximum number of compressed rows for each owner.
         # Filled by load_model().
@@ -332,6 +335,15 @@ class SharedAttn:
         kind: str,
     ):
         """Grow every mirror of one owner's cache when necessary."""
+
+        if self.slot_layout is not None:
+            # per-slot capacities: fully allocated at load time, never grown
+            max_rows = self.cache_max_rows.get(owner)
+            if max_rows is not None and need_rows > max_rows:
+                raise RuntimeError(
+                    f"{kind}: owner {owner} needs {need_rows:,} rows, but the largest slot holds {max_rows:,}"
+                )
+            return
 
         keys = [
             key
@@ -398,13 +410,36 @@ class SharedAttn:
                 if old.size(1) >= need_rows:
                     continue
 
-                new = torch.empty(
-                    old.size(0),
-                    target,
-                    old.size(2),
-                    dtype=old.dtype,
-                    device=old.device,
-                )
+                try:
+                    new = torch.empty(
+                        old.size(0),
+                        target,
+                        old.size(2),
+                        dtype=old.dtype,
+                        device=old.device,
+                    )
+                    staged = None
+                except torch.OutOfMemoryError:
+                    # old + new do not fit side by side (2.4 GiB each for owner 20 at 500K x 5 rows):
+                    # stage the live rows in host memory, release the old mirror, then allocate.
+                    print(
+                        f"[cache-grow] {kind} owner={owner} dev={old.device}: no room for old+new "
+                        f"({old.size(1):,}->{target:,} rows); staging through host memory",
+                        flush=True,
+                    )
+                    dev = old.device
+                    staged = old.cpu()
+                    table.pop(key, None)
+                    del old
+                    torch.cuda.empty_cache()
+                    new = torch.empty(
+                        staged.size(0),
+                        target,
+                        staged.size(2),
+                        dtype=staged.dtype,
+                        device=dev,
+                    )
+                    old = staged
                 assert not torch.is_inference(new), f"{kind}[{key}] allocated cache must not be an InferenceTensor"
 
                 # Only existing rows need preserving.  Future rows need not
@@ -434,6 +469,8 @@ class SharedAttn:
             "compress_kv",
         )
 
+        if self.slot_layout is not None and bsz != 1:
+            raise RuntimeError(f"DSV41_SLOT_CAPS: prefill writes go to sequence row 0 only (bsz={bsz})")
         for (o, dev), cache in self.compress_kv.items():
             if o == owner:
                 if dev == rows.device:
@@ -686,7 +723,7 @@ class Indexer:
             kT = index_k_f.transpose(1, 2)
 
             idx_chunks = []
-            candidate_chunks = [] if self.is_candidate_source else None
+            candidate_all = None
 
             topk = min(self.topk, end_pos // ratio)
 
@@ -737,7 +774,14 @@ class Indexer:
                         self.candidate_topk_blocks,
                         self.candidate_block_size,
                     )
-                    candidate_chunks.append(cand)
+                    # write into one preallocated [B, S, n_keys] mask: torch.cat over the chunks held the
+                    # chunks and the result at once (2 x 0.84 GiB at a 500K prompt, an OOM site on 80 GB GPUs)
+                    if candidate_all is None:
+                        candidate_all = torch.empty(
+                            cand.size(0), seqlen, cand.size(-1), dtype=cand.dtype, device=cand.device
+                        )
+                    candidate_all[:, q0:q1] = cand
+                    del cand
 
                 elif self.uses_candidates:
                     cand = self.shared.candidates[:, q0:q1]
@@ -775,11 +819,8 @@ class Indexer:
 
                 del qc, wc, score
 
-            if self.is_candidate_source:
-                self.shared.candidates = torch.cat(
-                    candidate_chunks,
-                    dim=1,
-                )
+            if self.is_candidate_source and candidate_all is not None:
+                self.shared.candidates = candidate_all
 
             return torch.cat(idx_chunks, dim=1)
 
@@ -2311,10 +2352,14 @@ class Transformer:
                 if hasattr(c, "score_ring"):
                     c.score_ring.fill_(-torch.inf)
         if hasattr(self, "shared"):
-            for cache in self.shared.compress_kv.values():
-                cache.zero_()
-            for cache in self.shared.index_k.values():
-                cache.zero_()
+            if self.shared.cache_flat:
+                for cache in self.shared.cache_flat.values():
+                    cache.zero_()
+            else:
+                for cache in self.shared.compress_kv.values():
+                    cache.zero_()
+                for cache in self.shared.index_k.values():
+                    cache.zero_()
             self.shared._topk_idxs_map.clear()
             self.shared._candidates_map.clear()
             self.shared._current_chunk_idx = 0

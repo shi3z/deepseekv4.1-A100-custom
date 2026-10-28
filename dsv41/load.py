@@ -12,6 +12,24 @@ from .model import Args, Block, Transformer
 from .w8 import ENABLED as W8_ENABLED, W8
 from .quant import dequant_fp8_block
 from .stio import Checkpoint
+from .slots import slot_layout_from_env
+
+
+def consumer_cache_devices(owners, placement, n_layers):
+    """Devices that read an owner's compressed-KV / index-K cache.
+
+    Layer L reads the cache of the largest owner <= L on L's own device (model.py _compress_kv / Indexer,
+    decode.py attention), so owner o is consumed exactly by the devices hosting layers o .. next_owner-1.
+    With DSV41_LAYER_COUNTS=10,10,10,10 and owners 2, 8, 14, 20 that is {2: [dev0], 8: [dev0, dev1],
+    14: [dev1], 20: [dev2, dev3]}: 1,280 B/token/row per device instead of 3,200 with full mirrors.
+    Order follows the layer order (the owner's own device first), which is the order the EP / decode
+    runtimes push freshly written rows along."""
+    srt = sorted(o for o in owners if o < n_layers)
+    out = {}
+    for i, o in enumerate(srt):
+        end = srt[i + 1] if i + 1 < len(srt) else n_layers
+        out[o] = list(dict.fromkeys(placement[L] for L in range(o, end)))
+    return out
 
 HOT_EXPERTS: dict[int, list[int]] = {}  # layer -> expert ids to keep on the GPU (cpu offload mode)
 LAYER_GB = 7.1  # experts (6.72 GiB fp4 + scales) + dense bf16 (0.34 GiB) per layer
@@ -335,16 +353,35 @@ def load_model(ckpt_path: str, devices: list[int], max_seq_len: int = 16384, max
     )
 
     cache_devices = list(dict.fromkeys(placement))
+    # DSV41_CACHE_PLACEMENT=local: each owner's cache lives only on the devices that read it (see
+    # consumer_cache_devices); "mirror" (historical default) keeps a copy on every device.
+    cache_placement = os.environ.get("DSV41_CACHE_PLACEMENT", "mirror").strip().lower()
+    if cache_placement == "local":
+        owner_devices = consumer_cache_devices(owners, placement, n_layers)
+    else:
+        cache_placement = "mirror"
+        owner_devices = {o: list(cache_devices) for o in owners}
 
     print(
         f"dynamic cache: initial logical capacity "
         f"{cache_init_tokens:,}/{max_seq_len:,} tokens; "
-        f"full mirrors on {[str(d) for d in cache_devices]}",
+        f"placement={cache_placement} "
+        + (f"full mirrors on {[str(d) for d in cache_devices]}" if cache_placement == "mirror"
+           else "consumer-local: " + ", ".join(f"owner {o} -> {[str(d) for d in ds]}" for o, ds in owner_devices.items())),
         flush=True,
     )
 
     cache_initial_bytes = 0
     cache_max_bytes = 0
+
+    # DSV41_SLOT_CAPS: per-slot capacities in one flat buffer per (owner, device); see dsv41/slots.py
+    slot_layout = slot_layout_from_env(max_seq_len)
+    model.shared.slot_layout = slot_layout
+    if slot_layout is not None:
+        assert max_seqs == slot_layout.n_units, (max_seqs, slot_layout.n_units)
+        print(f"slot capacities: {slot_layout.describe()}; unit {slot_layout.unit:,} tokens, {slot_layout.n_units} cache rows", flush=True)
+        if slot_layout.flat_units > sum(slot_layout.k):
+            print(f"  note: {slot_layout.flat_units - sum(slot_layout.k)} unit(s) of padding per owner; list the largest decode slot last to avoid it", flush=True)
 
     for owner in cfg["kv_source_layers"]:
         if owner >= n_layers:
@@ -360,6 +397,28 @@ def load_model(ckpt_path: str, devices: list[int], max_seq_len: int = 16384, max
             max_rows,
             cache_init_tokens // ratio + 1,
         )
+
+        if slot_layout is not None:
+            # fixed allocation: the flat buffer holds every slot at its capacity, plus one spare row
+            unit_rows = slot_layout.unit_rows(ratio)
+            n_flat = slot_layout.flat_rows(ratio)
+            max_rows = initial_rows = slot_layout.max_rows(ratio)
+            model.shared.cache_max_rows[owner] = max_rows
+            for d in owner_devices[owner]:
+                for kind, width in (("compress_kv", cfg["head_dim"]), ("index_k", cfg["index_head_dim"])):
+                    flat = torch.empty(n_flat, width, dtype=torch.bfloat16, device=d)
+                    model.shared.cache_flat[(kind, owner, d)] = flat
+                    getattr(model.shared, kind)[(owner, d)] = torch.as_strided(
+                        flat, (slot_layout.n_units, max_rows, width), (unit_rows * width, width, 1)
+                    )
+                    cache_initial_bytes += n_flat * width * 2
+                    cache_max_bytes += n_flat * width * 2
+            print(
+                f"  cache owner {owner:2d}: ratio={ratio} flat rows={n_flat:,} (unit {unit_rows:,} x {slot_layout.flat_units}) "
+                f"mirrors={len(owner_devices[owner])}",
+                flush=True,
+            )
+            continue
 
         model.shared.cache_max_rows[owner] = max_rows
 
@@ -383,7 +442,7 @@ def load_model(ckpt_path: str, devices: list[int], max_seq_len: int = 16384, max
             * 2
         )
 
-        for d in cache_devices:
+        for d in owner_devices[owner]:
             model.shared.compress_kv[(owner, d)] = torch.empty(
                 max_seqs,
                 initial_rows,
@@ -407,15 +466,15 @@ def load_model(ckpt_path: str, devices: list[int], max_seq_len: int = 16384, max
             f"  cache owner {owner:2d}: "
             f"ratio={ratio} "
             f"rows={initial_rows:,}/{max_rows:,} "
-            f"mirrors={len(cache_devices)}",
+            f"mirrors={len(owner_devices[owner])}",
             flush=True,
         )
 
     print(
         f"compressed cache allocated at startup: "
         f"{cache_initial_bytes / 2**30:.2f} GiB "
-        f"(1M full capacity would be "
-        f"{cache_max_bytes / 2**30:.2f} GiB)",
+        f"(full {max_seq_len:,}-token capacity for {max_seqs} rows would be "
+        f"{cache_max_bytes / 2**30:.2f} GiB over all devices)",
         flush=True,
     )
 

@@ -19,6 +19,7 @@ import torch
 from .decode import DecodeRuntime
 from .load import load_model
 from .prefill_policy import PrefillDecision, PrefillObservation, decide_policy, verify_and_constrain
+from .slots import slot_layout_from_env
 import traceback
 
 DEFAULT_CKPT = "/mnt/ssd/models/DeepSeek-V4.1-Flash-Abliterated" if os.path.exists("/mnt/ssd/models/DeepSeek-V4.1-Flash-Abliterated") else "/mnt/ssd/models/DeepSeek-V4.1-Flash-1017"
@@ -242,13 +243,23 @@ class Engine:
             raise ValueError("--mtp must be 0..5")
         _env_seqs = os.environ.get("DSV41_MAX_SEQS")
         self.max_seqs = int(_env_seqs) if _env_seqs else int(max_seqs)
-        if self.max_seqs > 1:
+        # DSV41_SLOT_CAPS: per-slot capacities; max_seqs becomes the number of cache rows (units) and the decode
+        # slots are the rows listed by the layout (dsv41/slots.py)
+        self.slot_layout = slot_layout_from_env(max_seq_len)
+        if self.slot_layout is not None:
+            self.max_seqs = self.slot_layout.n_units
+            self.decode_slot_ids = list(self.slot_layout.decode_rows)
+            self.max_decode_slots = len(self.decode_slot_ids)
+            max_batch = self.max_decode_slots * (1 + self.mtp)
+        elif self.max_seqs > 1:
+            self.decode_slot_ids = list(range(1, self.max_seqs))
             self.max_decode_slots = self.max_seqs - 1
             max_batch = self.max_decode_slots * (1 + self.mtp)
         else:
+            self.decode_slot_ids = [0]
             self.max_decode_slots = 1
             max_batch = 1 + self.mtp
-        print(f"[engine-init] max_seqs={self.max_seqs} max_decode_slots={self.max_decode_slots} max_batch={max_batch}", flush=True)
+        print(f"[engine-init] max_seqs={self.max_seqs} max_decode_slots={self.max_decode_slots} decode_slots={self.decode_slot_ids} max_batch={max_batch}", flush=True)
         self.model = load_model(ckpt, devices or list(range(torch.cuda.device_count())), max_seq_len=max_seq_len, max_batch=max_batch, max_seqs=self.max_seqs,
                                 budgets_gb=budgets, tokenizer=self.tok, offload_experts=offload_experts,
                                 hot_experts=hot_experts, route_stats=route_stats, ep=ep, ep_shards=ep_shards)
@@ -347,7 +358,7 @@ class Engine:
         self._last_decode_log_time = 0.0
         self.last_decode_tok_s: float | None = None
         self.last_finish_reason: str = "stop"
-        slots_to_track = list(range(1, self.max_seqs)) if self.max_seqs > 1 else [0]
+        slots_to_track = list(self.decode_slot_ids) if self.max_seqs > 1 else [0]
         for s in slots_to_track:
             self.slot_states[s] = {
                 "slot_id": s,
@@ -430,7 +441,7 @@ class Engine:
         current_ctx = getattr(self, "current_context_tokens", 0)
         if shared is not None and hasattr(shared, "compress_kv"):
             for (owner, dev), t in shared.compress_kv.items():
-                if dev == self.model.blocks[0].device:
+                if f"owner_{owner}" not in kv_stats:  # one entry per owner (mirrors are identical in size)
                     ratio = self.model.args.compress_ratios[owner]
                     kv_stats[f"owner_{owner}"] = {
                         "allocated_rows": t.size(1),
@@ -472,7 +483,7 @@ class Engine:
             "active_decode_slots": active_cnt,
             "max_decode_slots": getattr(self, "max_decode_slots", 1),
             "free_decode_slots": len(getattr(self, "_free_decode_slots", [])),
-            "queue_depth": self._batch_queue.qsize() if hasattr(self, "_batch_queue") else 0,
+            "queue_depth": (self._batch_queue.qsize() + len(getattr(self, "_batch_waiting", []))) if hasattr(self, "_batch_queue") else 0,
             "combined_decode_tok_s": round(combined_tok_s, 1),
             "last_prefill": getattr(self, "last_prefill_stats", None),
             "prefill_history": list(getattr(self, "prefill_history", [])),
@@ -1038,7 +1049,8 @@ class Engine:
                     else:
                         ratio = 1
                     rows = max(1, min(src.shape[1], int(used_tokens) // max(1, ratio) + 1))
-                    save_src = src[:, :rows].contiguous()
+                    base = src[:1] if (src.shape[0] == _n_seq_rows and src.shape[0] > 1) else src
+                    save_src = base[:, :rows].contiguous()
                 elif (
                     kind == "attr"
                     and key == "cache"
@@ -1140,6 +1152,16 @@ class Engine:
                 if kind == "attr":
                     dst = getattr(holder, key)
                 else:
+                    if (
+                        isinstance(holder, dict) and key not in holder
+                        and isinstance(key, tuple) and len(key) == 2
+                    ):
+                        # Cache mirrors are placed per consumer device (DSV41_CACHE_PLACEMENT=local); a snapshot
+                        # taken under another placement names a mirror that no longer exists. Restore into any
+                        # mirror of the same owner; the broadcast below fills the others.
+                        alt = [k for k in holder if isinstance(k, tuple) and len(k) == 2 and k[0] == key[0]]
+                        if alt:
+                            key = alt[0]
                     dst = holder[key]
 
                 if not torch.is_tensor(dst):
@@ -3008,7 +3030,7 @@ class Engine:
 
         with getattr(self, "_slot_tokens_lock", threading.Lock()):
             active_slots = len(self._slot_tokens)
-        free_slots = max(0, self.max_seqs - active_slots)
+        free_slots = max(0, self.max_decode_slots - active_slots)
 
         from dsv41.prefill_policy import get_allowed_gpus_min_free_mem_gb
         gpu_min_free_mem_gb = get_allowed_gpus_min_free_mem_gb()
@@ -4840,7 +4862,8 @@ class Engine:
         self._batch_queue: queue.Queue[_BatchRequest] = queue.Queue()
         self._batch_stop_event = threading.Event()
         # Decode slots are 1 .. max_seqs - 1 (slot 0 is reserved for prefill scratchpad)
-        self._free_decode_slots = list(range(1, self.max_seqs))
+        self._free_decode_slots = list(self.decode_slot_ids)
+        self._batch_waiting: list[_BatchRequest] = []  # dequeued requests that found no slot of sufficient capacity yet
         self._active_slots: dict[int, _BatchRequest] = {}
         self._batch_thread = threading.Thread(target=self._batch_worker_loop, daemon=True)
         self._batch_thread.start()
@@ -4850,6 +4873,42 @@ class Engine:
             flush=True,
         )
 
+    def slot_cap_tokens(self, slot_id: int) -> int:
+        """Context capacity (tokens) of a sequence slot: max_seq_len, or its DSV41_SLOT_CAPS capacity."""
+        if self.slot_layout is not None:
+            return int(self.slot_layout.cap_by_row.get(slot_id, self.max_seq_len))
+        return int(self.max_seq_len)
+
+    def _next_fitting_request(self):
+        """Pick the next request that fits a free decode slot: in arrival order, a free slot whose capacity holds
+        the prompt plus one token; the slot that already holds the best prefix if it qualifies, otherwise the
+        smallest fitting one so large slots stay free for long requests.  Requests that fit nothing yet wait in
+        _batch_waiting without blocking the ones behind them.  Returns (req, slot_id, best_gpu_slot, best_gpu_lcp)."""
+        while True:
+            try:
+                self._batch_waiting.append(self._batch_queue.get_nowait())
+            except queue.Empty:
+                break
+        for i, req in enumerate(self._batch_waiting):
+            need = len(req.prompt_ids) + 1
+            fitting = [s for s in self._free_decode_slots if self.slot_cap_tokens(s) >= need]
+            if not fitting:
+                continue
+            # Smart slot assignment: if a GPU slot retains the best prefix and is currently free, reuse it!
+            best_gpu_slot, best_gpu_lcp = (0, 0) if req.images is not None else self._find_best_gpu_slot(req.prompt_ids)
+            if best_gpu_slot in fitting and best_gpu_slot != 0:
+                slot_id = best_gpu_slot
+            else:
+                slot_id = min(fitting, key=lambda s_: (self.slot_cap_tokens(s_), self._free_decode_slots.index(s_)))
+            self._free_decode_slots.remove(slot_id)
+            cap_left = self.slot_cap_tokens(slot_id) - len(req.prompt_ids) - 1
+            if req.max_new > cap_left:
+                print(f"[batched-engine] slot={slot_id} capacity {self.slot_cap_tokens(slot_id):,}: max_new {req.max_new:,} -> {cap_left:,}", flush=True)
+                req.max_new = max(1, cap_left)
+            del self._batch_waiting[i]
+            return req, slot_id, best_gpu_slot, best_gpu_lcp
+        return None
+
     @torch.inference_mode()
     def _batch_worker_loop(self):
         B = self.rt.B
@@ -4858,20 +4917,12 @@ class Engine:
             # If active decode slots are running, prefill at most 1 pending request per round to prevent decode stalling
             max_prefills_this_round = 1 if self._active_slots else len(self._free_decode_slots)
             prefilled_count = 0
-            while self._free_decode_slots and not self._batch_queue.empty() and prefilled_count < max_prefills_this_round:
-                try:
-                    req = self._batch_queue.get_nowait()
-                except queue.Empty:
+            while self._free_decode_slots and prefilled_count < max_prefills_this_round:
+                picked = self._next_fitting_request()
+                if picked is None:
                     break
+                req, slot_id, best_gpu_slot, best_gpu_lcp = picked
                 prefilled_count += 1
-
-                # Smart slot assignment: if a GPU slot retains the best prefix and is currently free, reuse it!
-                best_gpu_slot, best_gpu_lcp = (0, 0) if req.images is not None else self._find_best_gpu_slot(req.prompt_ids)
-                if best_gpu_slot in self._free_decode_slots and best_gpu_slot != 0:
-                    self._free_decode_slots.remove(best_gpu_slot)
-                    slot_id = best_gpu_slot
-                else:
-                    slot_id = self._free_decode_slots.pop(0)
 
                 req.slot_id = slot_id
                 with self._slot_lock:

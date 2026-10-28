@@ -52,6 +52,20 @@ class DecodeRuntime:
         self.pos = {d: torch.zeros(B, dtype=torch.int64, device=d) for d in self.devices}
         S = self.S = args.max_seqs or B  # sequence slots (the caches are sized by it)
         self.seq = {d: torch.arange(B, dtype=torch.int64, device=d) % S for d in self.devices}
+        self.slot_layout = getattr(model.shared, "slot_layout", None)
+        if self.slot_layout is not None:
+            # rows used by the batch are the decode slots' rows (never the scratchpad's or an aliased unit)
+            rows = (self.slot_layout.decode_rows * (B // len(self.slot_layout.decode_rows) + 1))[:B]
+            self.seq = {d: torch.tensor(rows, dtype=torch.int64, device=d) for d in self.devices}
+            # per logical row: the last row of the slot's capacity (never a live position) = write target of
+            # rows that must not write this step; indexed by seq, per compression ratio
+            self._dummy_tab = {}
+            for d in self.devices:
+                for ratio in sorted({int(b.attn.ratio) for b in model.blocks if b.attn.ratio}):
+                    tab = torch.zeros(S, dtype=torch.int64)
+                    for r, cap in self.slot_layout.cap_rows(ratio).items():
+                        tab[r] = cap - 1
+                    self._dummy_tab[(d, ratio)] = tab.to(d)
         self.pmax = {d: torch.zeros(B, dtype=torch.int64, device=d) for d in self.devices}  # newest position written to the row's sequence this step
         self.h_in = {d: torch.zeros(B, 1, hc, dim, dtype=torch.bfloat16, device=d) for d in self.devices}
         self.h_out = {d: torch.zeros(B, 1, hc, dim, dtype=torch.bfloat16, device=d) for d in self.devices}
@@ -134,7 +148,7 @@ class DecodeRuntime:
                 self.kv_owner = A.layer_id
                 latent, should = self.compressor2(A, x3, pos, seq)
                 cache = self.m.shared.compress_kv[(A.layer_id, d)]
-                row = torch.where(should, compress_len - 1, torch.full_like(compress_len, cache.shape[1] - 1))  # [B]
+                row = torch.where(should, compress_len - 1, self._no_write_row(A, d, compress_len, cache))  # [B]
             if A.is_index_source:
                 idxs = self.indexer(A, x3, qr.view(B, 1, -1), latent, pos, compress_len, d, row if A.is_kv_source else None)
                 self.topk_buf[d].copy_(idxs)
@@ -159,6 +173,13 @@ class DecodeRuntime:
             return cukern.fp8_gemv_m1_pre(o.reshape(1, -1).contiguous(), A.wo_b.w8, A.wo_b.s8, None, 0.0, 2).view(B, 1, -1)
         return linear_fp8(o, A.wo_b)
 
+    def _no_write_row(self, A, d, compress_len, cache):
+        """Row written by sequences that produce no compressed row this step: the table's spare last row, or
+        under DSV41_SLOT_CAPS the last row of each sequence's own capacity (never a live position)."""
+        if self.slot_layout is None:
+            return torch.full_like(compress_len, cache.shape[1] - 1)
+        return self._dummy_tab[(d, int(A.ratio))][self.seq[d]]
+
     def attention(self, A: Attention, x: torch.Tensor, d: torch.device) -> torch.Tensor:
         pos = self.pos[d]
         rd, eps = self.rd, A.eps
@@ -181,7 +202,7 @@ class DecodeRuntime:
                 self.kv_owner = A.layer_id
                 latent, should = self.compressor(A, x, pos)
                 cache = self.m.shared.compress_kv[(A.layer_id, d)]
-                row = torch.where(should, compress_len - 1, torch.full_like(compress_len, cache.shape[1] - 1))
+                row = torch.where(should, compress_len - 1, self._no_write_row(A, d, compress_len, cache))
             if A.is_index_source:
                 idxs = self.indexer(A, x, qr, latent, pos, compress_len, d, row if A.is_kv_source else None)
                 self.topk_buf[d].copy_(idxs)
@@ -196,6 +217,8 @@ class DecodeRuntime:
                 val.copy_(latent)
                 idx.copy_(row)
             ckv = self.m.shared.compress_kv[(self.kv_owner, d)]
+            if self.slot_layout is not None:
+                raise RuntimeError("DSV41_SLOT_CAPS: the eager decode attention path does not support the flat cache layout")
             o = sparse_attn_decode2(q, A.window_kv_cache, ckv, A.attn_sink, torch.cat([widx, idxs], dim=-1), A.softmax_scale)
         else:
             o = sparse_attn_decode2(q, A.window_kv_cache, None, A.attn_sink, widx, A.softmax_scale)
@@ -497,10 +520,12 @@ class DecodeRuntime:
             if lid in self.kv_row:
                 val, idx = self.kv_row[lid]
                 for dd in later:
-                    self.m.shared.compress_kv[(lid, dd)][self.seq[dd], idx.to(dd, non_blocking=True)] = val[:, 0].to(dd, non_blocking=True)
+                    if (lid, dd) in self.m.shared.compress_kv:  # consumer-local placement: no mirror -> no reader
+                        self.m.shared.compress_kv[(lid, dd)][self.seq[dd], idx.to(dd, non_blocking=True)] = val[:, 0].to(dd, non_blocking=True)
                 val, idx = self.ik_row[lid]
                 for dd in later:
-                    self.m.shared.index_k[(lid, dd)][self.seq[dd], idx.to(dd, non_blocking=True)] = val[:, 0].to(dd, non_blocking=True)
+                    if (lid, dd) in self.m.shared.index_k:
+                        self.m.shared.index_k[(lid, dd)][self.seq[dd], idx.to(dd, non_blocking=True)] = val[:, 0].to(dd, non_blocking=True)
         nd = later[0]
         self.topk_buf[nd].copy_(self.topk_buf[d], non_blocking=True)
         self.cand_buf[nd].copy_(self.cand_buf[d], non_blocking=True)
@@ -577,7 +602,13 @@ class DecodeRuntime:
                     with torch.inference_mode(False):
                         table[key] = cache.clone()
                         cache = table[key]
-                cache[dst].copy_(cache[src])
+                if self.slot_layout is not None:
+                    # copy only within the two slots' own capacities (rows past a slot's units belong to others)
+                    caps = self.slot_layout.cap_rows(int(self.m.blocks[key[0]].attn.ratio))
+                    n = min(caps[src], caps[dst])
+                    cache[dst, :n].copy_(cache[src, :n])
+                else:
+                    cache[dst].copy_(cache[src])
 
         if self.m.engram_hash is not None:
             if torch.is_inference(self.m.engram_hash.cache):

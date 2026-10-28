@@ -25,6 +25,9 @@ export DSV41_EXACT_CACHE_GROW=1
 
 # 4 Concurrent Decode Streams (max_seqs 5: slot 0 scratchpad + slots 1..4 concurrent decode)
 export DSV41_MAX_SEQS=5
+# consumer-local compressed-cache placement (2026-10-28): each owner's KV/index cache only on the GPUs that read it
+# (3.1 GiB/GPU at 512K x 5 rows instead of 7.8 with full mirrors) -- see load.consumer_cache_devices
+export DSV41_CACHE_PLACEMENT=local
 
 # Communication & Cache Acceleration
 export DSV41_EP_COMPACT_XQ=1

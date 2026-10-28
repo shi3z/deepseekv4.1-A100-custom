@@ -342,13 +342,16 @@ class EPRuntime(DecodeRuntime):
         lid = blk.layer_id
         if lid not in self.kv_row:
             return
+        # consumer-local placement (DSV41_CACHE_PLACEMENT=local): only devices that read this owner hold a mirror
         later = [dd for dd in self.devs if self.idx[dd] > self.idx[d]]
         val, idx = self.kv_row[lid]
         for dd in later:
-            p2p_copy_row(self.m.shared.compress_kv[(lid, dd)], idx, val, d, self.seq[d])
+            if (lid, dd) in self.m.shared.compress_kv:
+                p2p_copy_row(self.m.shared.compress_kv[(lid, dd)], idx, val, d, self.seq[d])
         val, idx = self.ik_row[lid]
         for dd in later:
-            p2p_copy_row(self.m.shared.index_k[(lid, dd)], idx, val, d, self.seq[d])
+            if (lid, dd) in self.m.shared.index_k:
+                p2p_copy_row(self.m.shared.index_k[(lid, dd)], idx, val, d, self.seq[d])
 
     def _owner_layer(self, blk: Block, d, h, pre):
         L = blk.layer_id
