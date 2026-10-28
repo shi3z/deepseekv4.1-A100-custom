@@ -5,21 +5,30 @@ model_list:
       api_base: http://127.0.0.1:8000/v1
       api_key: sk-local
       timeout: 3600
-      max_tokens: 1048576
+      max_tokens: 65536          # server caps interactive answers at DSV41_INTERACTIVE_MAX_NEW=65536
+    model_info:
+      max_input_tokens: 524288   # = --max-seq-len of run_512k_4slots.sh; keep in sync with the server profile
+      max_output_tokens: 65536
   - model_name: deepseek-v4.1-flash
     litellm_params:
       model: openai/deepseek-v4.1-flash-abliterated
       api_base: http://127.0.0.1:8000/v1
       api_key: sk-local
       timeout: 3600
-      max_tokens: 1048576
+      max_tokens: 65536          # server caps interactive answers at DSV41_INTERACTIVE_MAX_NEW=65536
+    model_info:
+      max_input_tokens: 524288   # = --max-seq-len of run_512k_4slots.sh; keep in sync with the server profile
+      max_output_tokens: 65536
   - model_name: "*"
     litellm_params:
       model: openai/deepseek-v4.1-flash-abliterated
       api_base: http://127.0.0.1:8000/v1
       api_key: sk-local
       timeout: 3600
-      max_tokens: 1048576
+      max_tokens: 65536          # server caps interactive answers at DSV41_INTERACTIVE_MAX_NEW=65536
+    model_info:
+      max_input_tokens: 524288   # = --max-seq-len of run_512k_4slots.sh; keep in sync with the server profile
+      max_output_tokens: 65536
 
 router_settings:
   enable_fallbacks: true
