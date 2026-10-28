@@ -6,7 +6,7 @@ Tracks:
 - Active / in-flight client requests, total requests, client disconnections
 - Prefill metrics: hit rate %, reused vs new tokens, effective vs new tok/s
 - Dynamic KV cache rows per attention owner (Owner 2, 8, 14, 20)
-- Prefix cache (host RAM) & Jev persistent prefix tree status
+- Prefix cache (host RAM) status
 - Real-time cache event stream and prefill history log
 - Throughput (tok/s): latest, rolling 24-hour history, min, max, 24h average
 - Embedded HTML5 Canvas time-series dashboard (100% offline, zero external dependencies)
@@ -987,7 +987,7 @@ _DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
   .stat-box-val { font-size: 18px; font-weight: 700; color: #fff; font-family: var(--font-mono); margin-top: 4px; }
   .stat-box-sub { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
 
-  /* KV Cache & Jev Table */
+  /* KV Cache Table */
   table.dark-table {
     width: 100%;
     border-collapse: collapse;
@@ -1047,7 +1047,6 @@ _DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
   .tag-req { background: rgba(34, 211, 238, 0.2); color: var(--accent-cyan); border: 1px solid rgba(34, 211, 238, 0.4); }
   .tag-disconnect { background: rgba(248, 113, 113, 0.2); color: var(--accent-red); border: 1px solid rgba(248, 113, 113, 0.4); }
   .tag-info { background: rgba(148, 163, 184, 0.2); color: var(--text-muted); border: 1px solid rgba(148, 163, 184, 0.4); }
-  .tag-jev { background: rgba(192, 132, 252, 0.25); color: #e9d5ff; border: 1px solid rgba(192, 132, 252, 0.5); }
   .event-msg { color: #e2e8f0; }
 
   /* History Table Section */
@@ -1083,16 +1082,6 @@ _DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
     </div>
   </div>
   <div class="header-badges">
-    <a href="http://tsuginosuke:8888" id="jev-arcade-link" target="_blank" style="text-decoration:none; display:inline-flex; align-items:center; gap:6px; font-size:13px; font-weight:700; color:#fff; background:linear-gradient(135deg, #a855f7, #ec4899); padding:6px 14px; border-radius:8px; box-shadow:0 0 12px rgba(168,85,247,0.4); transition:opacity 0.2s;" onmouseover="this.style.opacity=0.85" onmouseout="this.style.opacity=1.0">🎮 Jev Arcade (20 AI Games)</a>
-    <script>
-      // Dynamically use current host for the Jev Arcade link
-      document.addEventListener('DOMContentLoaded', () => {
-        const link = document.getElementById('jev-arcade-link');
-        if (link && window.location.hostname) {
-          link.href = 'http://' + window.location.hostname + ':8888';
-        }
-      });
-    </script>
     <div class="phase-tag" id="engine-phase-badge">PHASE: IDLE</div>
     <div class="status-tag">
       <div class="pulse"></div>
@@ -1163,7 +1152,6 @@ _DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
     <div class="kpi-value" id="val-prefix-ram" style="color:var(--accent-orange)">0.0 GiB</div>
     <div class="kpi-sub">
       <span>Entries: <b id="val-prefix-entries" style="color:#fff">0</b></span>
-      <span>Jev Schemas: <b id="val-jev-schemas" style="color:#fff">0</b></span>
     </div>
   </div>
 
@@ -1314,16 +1302,6 @@ _DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
       </table>
     </div>
 
-    <!-- Jev Prefix Tree Status -->
-    <div style="background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.06); border-radius:8px; padding:10px 14px;">
-      <div style="font-size:12px; font-weight:700; color:var(--accent-purple); margin-bottom:6px;">Jev Mode Persistent Prefix Tree</div>
-      <div style="display:flex; justify-content:space-between; font-size:12px; color:var(--text-muted); font-family:var(--font-mono); flex-wrap:wrap; gap:8px;">
-        <span>System Prompt: <b style="color:var(--accent-green)">GPU Pinned (L0)</b></span>
-        <span>Cached Schemas: <b id="jev-schemas-cnt" style="color:#fff">0</b></span>
-        <span>Cached Requests: <b id="jev-reqs-cnt" style="color:#fff">0</b></span>
-        <span>Field Branching: <b style="color:var(--accent-cyan)">Active</b></span>
-      </div>
-    </div>
   </div>
 
   <!-- Right Column: Real-Time Cache & Activity Event Stream -->
@@ -1375,7 +1353,7 @@ _DASHBOARD_HTML_TEMPLATE = """<!DOCTYPE html>
 </div>
 
 <footer>
-  <span>DeepSeek-v4.1 Inference Engine · Jev Parallel Structured Output · Strict GPUs 0, 1, 2, 3</span>
+  <span>DeepSeek-v4.1 Inference Engine · Strict GPUs 0, 1, 2, 3</span>
   <span>Auto-refreshing every 2s · 100% Offline Standalone Canvas Dashboard</span>
 </footer>
 
@@ -1558,11 +1536,6 @@ async function updateMetrics() {
       phaseEl.style.color = 'var(--accent-blue)';
       phaseEl.style.borderColor = 'rgba(56, 189, 248, 0.4)';
       phaseEl.style.background = 'rgba(56, 189, 248, 0.15)';
-    } else if (phase === 'jev') {
-      phaseEl.innerText = 'PHASE: JEV';
-      phaseEl.style.color = 'var(--accent-purple)';
-      phaseEl.style.borderColor = 'rgba(192, 132, 252, 0.4)';
-      phaseEl.style.background = 'rgba(192, 132, 252, 0.15)';
     } else {
       phaseEl.innerText = 'PHASE: IDLE';
       phaseEl.style.color = 'var(--text-muted)';
@@ -1683,7 +1656,6 @@ async function updateMetrics() {
     const c = data.cache || {};
     document.getElementById('val-prefix-entries').innerText = c.prefix_entries || 0;
     document.getElementById('val-prefix-ram').innerText = (c.prefix_gb || ((c.prefix_bytes || 0) / (1024**3))).toFixed(2) + ' GiB';
-    document.getElementById('val-jev-schemas').innerText = c.jev_schemas || 0;
 
     const ctxToks = c.current_context_tokens || 0;
     document.getElementById('val-ctx-tokens').innerText = formatNum(ctxToks);
@@ -1826,8 +1798,6 @@ async function updateMetrics() {
           modeBadge.className = 'tag tag-hit';
         } else if (prefillMode === 'BUILD') {
           modeBadge.className = 'tag tag-store';
-        } else if (prefillMode === 'JEV') {
-          modeBadge.className = 'tag tag-jev';
         } else {
           modeBadge.className = 'tag tag-miss';
         }
@@ -1881,10 +1851,6 @@ async function updateMetrics() {
       kvTbody.innerHTML = kvHtml;
     }
 
-    // 5. Jev Prefix Tree metrics
-    document.getElementById('jev-schemas-cnt').innerText = c.jev_schemas || 0;
-    document.getElementById('jev-reqs-cnt').innerText = c.jev_requests || 0;
-
     // 6. Real-Time Cache Event Stream
     const events = data.cache_events || [];
     const eventBox = document.getElementById('event-stream-box');
@@ -1904,7 +1870,6 @@ async function updateMetrics() {
         else if (type === 'req') { tagClass = 'tag-req'; tagText = 'REQUEST'; }
         else if (type === 'stream') { tagClass = 'tag-stream'; tagText = 'STREAM'; }
         else if (type === 'disconnect') { tagClass = 'tag-disconnect'; tagText = 'DISCONNECT'; }
-        else if (type === 'jev') { tagClass = 'tag-jev'; tagText = 'JEV'; }
 
         evHtml += `
           <div class="event-line">
@@ -1926,7 +1891,7 @@ async function updateMetrics() {
       hist.slice(-15).reverse().forEach(h => {
         const tStr = h.timestamp ? formatTime(h.timestamp) : '--';
         const mode = h.mode || 'FULL';
-        const hitTag = mode === 'LCP-HIT' ? 'tag-hit' : (mode === 'BUILD' ? 'tag-store' : (mode === 'JEV' ? 'tag-jev' : 'tag-miss'));
+        const hitTag = mode === 'LCP-HIT' ? 'tag-hit' : (mode === 'BUILD' ? 'tag-store' : 'tag-miss');
         histHtml += `
           <tr>
             <td>${tStr}</td>

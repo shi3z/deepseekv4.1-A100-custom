@@ -330,12 +330,9 @@ class Handler(BaseHTTPRequestHandler):
             if self.path in ("/v1/chat/completions", "/v1/completions"):
                 rf_type = body.get("response_format", {}).get("type")
                 has_rf_schema = rf_type == "json_schema" and "schema" in body.get("response_format", {}).get("json_schema", {})
-                if body.get("jev") or body.get("mode") == "jev" or has_rf_schema or body.get("schema"):
-                    if os.environ.get("DSV41_JEV", "0") == "1":
-                        return self._jev(body)
-                    # Jev is disabled (its batched scoring shared cache rows with the live decode
-                    # slots): answer schema requests with ordinary generation, asking for JSON.
-                    body = self._jev_to_chat(body)
+                if has_rf_schema or body.get("schema"):
+                    # structured-output requests are answered by ordinary generation, asking for JSON
+                    body = self._schema_to_chat(body)
             if self.path == "/v1/chat/completions":
                 return self._chat(body)
             if self.path == "/v1/completions":
@@ -720,8 +717,8 @@ class Handler(BaseHTTPRequestHandler):
                           "choices": [{"index": 0, "text": text, "finish_reason": "length" if (getattr(eng, "last_finish_reason", None) == "length" or n >= params.max_new_tokens) else "stop"}],
                           "usage": {"prompt_tokens": len(ids), "completion_tokens": n, "total_tokens": len(ids) + n}}, t0=t0, is_stream=False, ka=ka)
 
-    # ---------------------------------------------------------------- Jev mode structured output
-    def _jev_to_chat(self, body: dict) -> dict:
+    # ---------------------------------------------------------------- schema requests
+    def _schema_to_chat(self, body: dict) -> dict:
         schema = body.get("schema")
         if not schema and isinstance(body.get("response_format"), dict):
             schema = (body["response_format"].get("json_schema") or {}).get("schema")
@@ -738,220 +735,9 @@ class Handler(BaseHTTPRequestHandler):
             msgs.insert(0, {"role": "system", "content": hint})
         body["messages"] = msgs
         body.pop("schema", None)
-        body.pop("jev", None)
         body.pop("response_format", None)
-        print(f"[jev] disabled: schema request answered by plain generation ({len(msgs)} messages)", flush=True)
+        print(f"[schema] request answered by plain generation with a JSON hint ({len(msgs)} messages)", flush=True)
         return body
-
-    def _jev(self, body: dict):
-        eng = ENGINE
-        t0 = time.perf_counter()
-        stream = bool(body.get("stream"))
-
-        raw_schema = body.get("schema")
-        if not raw_schema and isinstance(body.get("response_format"), dict):
-            rf = body["response_format"]
-            if rf.get("type") == "json_schema" and isinstance(rf.get("json_schema"), dict):
-                raw_schema = rf["json_schema"].get("schema")
-        if not raw_schema:
-            return self._json(400, {"error": "schema is required for Jev mode"}, t0=t0, is_stream=stream)
-
-        prompt = body.get("prompt")
-        if not prompt and body.get("messages"):
-            for m in reversed(body["messages"]):
-                if m.get("role") == "user":
-                    prompt = m.get("content")
-                    break
-            if not prompt:
-                prompt = body["messages"][-1].get("content", "")
-
-        if not prompt:
-            return self._json(400, {"error": "prompt or user message is required"}, t0=t0, is_stream=stream)
-
-        max_batch = int(body.get("max_batch") or os.environ.get("DSV41_JEV_MAX_BATCH", "32"))
-        rid = f"jevcmpl-{uuid.uuid4().hex[:24]}"
-        created = int(time.time())
-
-        print(
-            f"[jev] request start prompt_len={len(prompt)} schema_fields={len(raw_schema)} stream={stream}",
-            flush=True,
-        )
-        if STATS_TRACKER:
-            STATS_TRACKER.record_request_start(len(prompt), stream=stream)
-
-        if stream:
-            # SSE streaming response with heartbeat to prevent client / proxy timeouts
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "keep-alive")
-            self.end_headers()
-
-            heartbeat_stop = threading.Event()
-            sse_lock = threading.Lock()
-
-            def _sse_write(data: bytes):
-                with sse_lock:
-                    self.wfile.write(data)
-                    self.wfile.flush()
-
-            def _heartbeat():
-                while not heartbeat_stop.wait(5.0):
-                    try:
-                        _sse_write(b": keep-alive\n\n")
-                    except (BrokenPipeError, ConnectionResetError, OSError):
-                        break
-
-            heartbeat_thread = threading.Thread(target=_heartbeat, daemon=True)
-            heartbeat_thread.start()
-
-            try:
-                assembled, metrics = eng.jev_inference(prompt, raw_schema, max_batch=max_batch)
-            except Exception as e:
-                heartbeat_stop.set()
-                heartbeat_thread.join(timeout=1.0)
-                tb = traceback.format_exc()
-                print(f"[jev-error] {e}\n{tb}", flush=True)
-                try:
-                    err_payload = json.dumps({"error": {"message": str(e), "type": "jev_error"}}, ensure_ascii=False)
-                    _sse_write(f"data: {err_payload}\n\ndata: [DONE]\n\n".encode("utf-8"))
-                except (BrokenPipeError, ConnectionResetError, OSError):
-                    pass
-                return
-
-            heartbeat_stop.set()
-            heartbeat_thread.join(timeout=1.0)
-
-            json_content = json.dumps(assembled, ensure_ascii=False)
-            dt_total = time.perf_counter() - t0
-            eff_tokens = metrics.get("completion_tokens", 0)
-            if not eff_tokens:
-                eff_tokens = len(eng.tok.encode(json_content, add_special_tokens=False)) if getattr(eng, "tok", None) else max(1, len(json_content.split()))
-
-            if STATS_TRACKER:
-                STATS_TRACKER.record_throughput(eff_tokens / max(dt_total, 1e-6), "jev-stream")
-                reused = metrics.get("prefix_saved_tokens", 0)
-                tot = metrics.get("prompt_tokens", 0)
-                hit_str = "HIT" if metrics.get("cache_hit") else "MISS"
-                STATS_TRACKER.record_cache_event(
-                    f"Jev stream [schema {hit_str}]: {metrics.get('num_fields', 0)} fields, {eff_tokens} output toks, saved {reused}/{tot} tokens ({dt_total*1000:.1f}ms)",
-                    event_type="hit" if metrics.get("cache_hit") else "info"
-                )
-
-            try:
-                role_chunk = {
-                    "id": rid,
-                    "object": "chat.completion.chunk" if self.path == "/v1/chat/completions" else "text_completion",
-                    "created": created,
-                    "model": body.get("model") or eng.model_name,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {"role": "assistant"},
-                            "finish_reason": None,
-                        }
-                    ],
-                }
-                _sse_write(f"data: {json.dumps(role_chunk, ensure_ascii=False)}\n\n".encode("utf-8"))
-
-                for i in range(0, len(json_content), 128):
-                    content_chunk = {
-                        "id": rid,
-                        "object": "chat.completion.chunk" if self.path == "/v1/chat/completions" else "text_completion",
-                        "created": created,
-                        "model": body.get("model") or eng.model_name,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {"content": json_content[i:i + 128]},
-                                "finish_reason": None,
-                            }
-                        ],
-                    }
-                    _sse_write(f"data: {json.dumps(content_chunk, ensure_ascii=False)}\n\n".encode("utf-8"))
-
-                finish_chunk = {
-                    "id": rid,
-                    "object": "chat.completion.chunk" if self.path == "/v1/chat/completions" else "text_completion",
-                    "created": created,
-                    "model": body.get("model") or eng.model_name,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {},
-                            "finish_reason": "stop",
-                        }
-                    ],
-                    "usage": {
-                        "prompt_tokens": metrics.get("prompt_tokens", 0),
-                        "completion_tokens": eff_tokens,
-                        "total_tokens": metrics.get("prompt_tokens", 0) + eff_tokens,
-                    },
-                    "jev_result": assembled,
-                    "jev_metrics": metrics,
-                }
-                _sse_write(f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n".encode("utf-8"))
-                _sse_write(b"data: [DONE]\n\n")
-            except (BrokenPipeError, ConnectionResetError, OSError):
-                elapsed = time.perf_counter() - t0
-                print(
-                    f"[http] broken pipe elapsed={elapsed:.3f}s bytes={len(json_content)} stream=True",
-                    flush=True,
-                )
-                if STATS_TRACKER:
-                    STATS_TRACKER.record_disconnect()
-            return
-
-        # Non-streaming response
-        ka = self._begin_json_keepalive()
-        try:
-            assembled, metrics = eng.jev_inference(prompt, raw_schema, max_batch=max_batch)
-        except Exception as e:
-            tb = traceback.format_exc()
-            print(f"[jev-error] {e}\n{tb}", flush=True)
-            return self._json(500, {"error": str(e), "traceback": tb}, t0=t0, is_stream=False, ka=ka)
-
-        json_content = json.dumps(assembled, ensure_ascii=False)
-        dt_total = time.perf_counter() - t0
-        eff_tokens = metrics.get("completion_tokens", 0)
-        if not eff_tokens:
-            eff_tokens = len(eng.tok.encode(json_content, add_special_tokens=False)) if getattr(eng, "tok", None) else max(1, len(json_content.split()))
-
-        if STATS_TRACKER:
-            STATS_TRACKER.record_throughput(eff_tokens / max(dt_total, 1e-6), "jev")
-            reused = metrics.get("prefix_saved_tokens", 0)
-            tot = metrics.get("prompt_tokens", 0)
-            hit_str = "HIT" if metrics.get("cache_hit") else "MISS"
-            STATS_TRACKER.record_cache_event(
-                f"Jev [schema {hit_str}]: {metrics.get('num_fields', 0)} fields, {eff_tokens} output toks, saved {reused}/{tot} tokens ({dt_total*1000:.1f}ms)",
-                event_type="hit" if metrics.get("cache_hit") else "info"
-            )
-
-        resp = {
-            "id": rid,
-            "object": "chat.completion" if self.path == "/v1/chat/completions" else "text_completion",
-            "created": created,
-            "model": body.get("model") or eng.model_name,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": json_content,
-                    },
-                    "text": json_content,
-                    "finish_reason": "stop",
-                }
-            ],
-            "usage": {
-                "prompt_tokens": metrics["prompt_tokens"],
-                "completion_tokens": eff_tokens,
-                "total_tokens": metrics["prompt_tokens"] + eff_tokens,
-            },
-            "jev_result": assembled,
-            "jev_metrics": metrics,
-        }
-        return self._json(200, resp, t0=t0, is_stream=False, ka=ka)
 
 
 def main():
@@ -997,11 +783,6 @@ def main():
     ENGINE.devices = dev_list
     STATS_TRACKER = StatsTracker(active_devices=dev_list)
     ENGINE.stats_tracker = STATS_TRACKER
-    try:
-        if os.environ.get("DSV41_JEV", "0") == "1":
-            ENGINE.jev_engine.prefix_tree.init_system_prompt()
-    except Exception as e:
-        print(f"[jev-init] Note: Jev system prompt prefill deferred ({e})", flush=True)
     ThreadingHTTPServer.request_queue_size = 128
     srv = ThreadingHTTPServer((a.host, a.port), Handler)
     print(f"serving OpenAI-compatible API on http://{a.host}:{a.port}/v1 (model '{ENGINE.model_name}')", flush=True)

@@ -13,7 +13,7 @@ export DSV41_CACHE_INIT_TOKENS=32768
 export DSV41_EP_PREALLOC_TOKENS=32768
 export DSV41_EXACT_CACHE_GROW=1
 export DSV41_CACHE_GROW_CHUNK=1024
-export DSV41_MAX_SEQS=5
+export DSV41_MAX_SEQS=2
 
 export DSV41_PREFIX_CACHE_DIR=/dev/shm/dsv41-prefix-cache
 export DSV41_PREFIX_CACHE_ENTRIES=16
@@ -26,14 +26,16 @@ export DSV41_PREFIX_BLOCK_MIN=16
 export DSV41_PREFIX_ANCHOR_STRIDE=1024
 export DSV41_PREFIX_ANCHOR_MAX=2
 
+export DSV41_VISION_DEVICE="cuda:2"
+
 mkdir -p results
 /home/shi3z/.local/bin/python -u -m dsv41.serve \
-    --ckpt /mnt/ssd/models/DeepSeek-V4.1-Flash \
+    --ckpt /mnt/ssd/models/DeepSeek-V4.1-Flash-Abliterated \
     --devices 2,3,0,1 \
     --ep \
-    --ep-shards 96,96,96,96 \
-    --max-seq-len 1048576 \
-    --max-seqs 5 \
+    --ep-shards 92,95,99,98 \
+    --max-seq-len 262144 \
+    --max-seqs 2 \
     --host 0.0.0.0 \
     --port 8000 \
     --mtp 0 2>&1 | tee -a results/server.log

@@ -18,11 +18,10 @@ import torch
 
 from .decode import DecodeRuntime
 from .load import load_model
-from .jev_policy import JevPolicyController, JevDecision, PrefillObservation, verify_and_constrain
-from .policy_logger import PolicyLogger
+from .prefill_policy import PrefillDecision, PrefillObservation, decide_policy, verify_and_constrain
 import traceback
 
-DEFAULT_CKPT = "/mnt/ssd/models/DeepSeek-V4.1-Flash-Abliterated" if os.path.exists("/mnt/ssd/models/DeepSeek-V4.1-Flash-Abliterated") else "/mnt/ssd/models/DeepSeek-V4.1-Flash"
+DEFAULT_CKPT = "/mnt/ssd/models/DeepSeek-V4.1-Flash-Abliterated" if os.path.exists("/mnt/ssd/models/DeepSeek-V4.1-Flash-Abliterated") else "/mnt/ssd/models/DeepSeek-V4.1-Flash-1017"
 CKPT = os.environ.get("DSV41_CKPT", DEFAULT_CKPT)
 
 
@@ -336,7 +335,6 @@ class Engine:
             self.model_name = os.environ.get("DSV41_MODEL_NAME", "deepseek-v4.1-flash-abliterated")
         else:
             self.model_name = os.environ.get("DSV41_MODEL_NAME", "deepseek-v4.1-flash")
-        self._jev_engine = None
         self.stats_tracker = None
         self.last_prefill_stats: dict | None = None
         self.current_phase = "idle"
@@ -370,10 +368,8 @@ class Engine:
         if self.max_seqs > 1:
             self._init_batch_scheduler()
 
-        self.jev_controller = JevPolicyController()
-        self.policy_logger = PolicyLogger()
         self._forced_prefill_policy_once = None
-        self.last_policy_decision: JevDecision | None = None
+        self.last_policy_decision: PrefillDecision | None = None
 
     def _record_prefill_stats(
         self,
@@ -422,57 +418,11 @@ class Engine:
             except Exception:
                 pass
 
-    @property
-    def jev_engine(self):
-        if self._jev_engine is None:
-            from .jev import JevEngine
-            self._jev_engine = JevEngine(self.model, self.tok)
-        return self._jev_engine
-
-    def jev_inference(self, prompt: str, schema: dict, max_batch: int = 32) -> tuple[dict, dict]:
-        # The Jev engine restores its request KV into cache rows 0..B-1 and scores B fields in one
-        # batched forward. Rows 1..max_seqs-1 are the live decode slots of the batched engine, so
-        # anything above one row overwrote other requests' caches mid-generation (prompt
-        # cross-talk). Score on row 0 (the prefill scratchpad) only, and forget what slot 0 held
-        # afterwards so the GPU-slot prefix reuse cannot pick up the Jev prompt's KV.
-        max_batch = max(1, min(int(max_batch), int(os.environ.get("DSV41_JEV_ROWS", "1"))))
-        with self.lock:
-            self.current_phase = "jev"
-            try:
-                assembled, metrics = self.jev_engine.process_request(prompt, schema, max_batch=max_batch)
-                tot_tokens = metrics.get("prompt_tokens", 0)
-                reused = metrics.get("prefix_saved_tokens", 0)
-                new_tok = max(0, tot_tokens - reused)
-                dt_prefill = metrics.get("prefill_time_s", 0.0)
-                self._record_prefill_stats("JEV", tot_tokens, reused, new_tok, dt_prefill)
-                if self.stats_tracker is not None:
-                    hit_str = "HIT" if metrics.get("cache_hit") else "MISS"
-                    self.stats_tracker.record_cache_event(
-                        f"Jev structured output: {metrics.get('num_fields', 0)} fields, schema {hit_str}, saved {reused}/{tot_tokens} tokens ({metrics.get('cache_hit_latency_ms', 0):.1f}ms cache hit, total {metrics.get('total_latency_ms', 0):.1f}ms)",
-                        event_type="hit" if metrics.get("cache_hit") else "info"
-                    )
-                return assembled, metrics
-            finally:
-                self.current_phase = "idle"
-                with getattr(self, "_slot_tokens_lock", threading.Lock()):
-                    if hasattr(self, "_slot_tokens"):
-                        self._slot_tokens.pop(0, None)
-                self._slot_window_log.pop(0, None)
-
     def get_cache_stats(self) -> dict:
         try:
             entries, total_bytes = self._prefix_cache_stats()
         except Exception:
             entries, total_bytes = 0, 0
-        jev_schemas = 0
-        jev_requests = 0
-        jev_stats = {}
-        if self._jev_engine is not None and getattr(self._jev_engine, "prefix_tree", None) is not None:
-            pt = self._jev_engine.prefix_tree
-            jev_schemas = len(pt.schema_nodes)
-            jev_requests = len(getattr(pt, "request_nodes", {}))
-            jev_stats = getattr(pt, "stats", {})
-
         # Dynamic KV cache allocation
         shared = getattr(self.model, "shared", None)
         kv_stats = {}
@@ -513,9 +463,6 @@ class Engine:
             "prefix_entries": entries,
             "prefix_bytes": total_bytes,
             "prefix_gb": round(total_bytes / (1024 ** 3), 2),
-            "jev_schemas": jev_schemas,
-            "jev_requests": jev_requests,
-            "jev_stats": jev_stats,
             "kv_cache": kv_stats,
             "current_context_tokens": current_ctx,
             "max_context_tokens": max_context,
@@ -3063,7 +3010,7 @@ class Engine:
             active_slots = len(self._slot_tokens)
         free_slots = max(0, self.max_seqs - active_slots)
 
-        from dsv41.jev_policy import get_allowed_gpus_min_free_mem_gb
+        from dsv41.prefill_policy import get_allowed_gpus_min_free_mem_gb
         gpu_min_free_mem_gb = get_allowed_gpus_min_free_mem_gb()
 
         is_multi_turn = (cache_hit_type != "none" or lcp >= 128)
@@ -3455,7 +3402,7 @@ class Engine:
         total = len(prompt_ids)
 
         # ------------------------------------------------------------
-        # Jev System 1 Execution Policy Controller
+        # Prefill execution policy (deterministic heuristic, dsv41/prefill_policy.py)
         # ------------------------------------------------------------
         obs, entry, best_gpu_slot, best_gpu_lcp, lcp = self._collect_prefill_observation(prompt_ids)
 
@@ -3481,7 +3428,7 @@ class Engine:
         if forced:
             forced = forced.strip().lower()
             block_sz = 512 if "512" in forced else (256 if "256" in forced else (128 if "128" in forced else 0))
-            decision = JevDecision(
+            decision = PrefillDecision(
                 policy=forced,
                 block_size=block_sz,
                 confidence=1.0,
@@ -3491,12 +3438,12 @@ class Engine:
             )
             decision = verify_and_constrain(decision, obs)
         else:
-            decision = self.jev_controller.decide_policy(obs)
+            decision = decide_policy(obs)
 
         self.last_policy_decision = decision
 
         print(
-            f"[jev-policy] DECISION policy={decision.policy} "
+            f"[prefill-policy] DECISION policy={decision.policy} "
             f"conf={decision.confidence:.2f} block={decision.block_size} "
             f"fb={decision.fallback_used} time={decision.latency_ms:.1f}ms "
             f"reason={decision.reason_code}",
@@ -3533,17 +3480,6 @@ class Engine:
                     reuse_pos=gpu_reuse_pos,
                 )
                 dt_gpu = time.perf_counter() - t0
-                self.policy_logger.log_decision_and_outcome(
-                    observation=obs,
-                    decision=decision,
-                    actual_policy="reuse_gpu_slot",
-                    prefill_time_s=dt_gpu,
-                    reused_tokens=reused_pos,
-                    new_tokens=total - reused_pos,
-                    total_tokens=total,
-                    req_id=req_id,
-                    success=True,
-                )
                 return logits, reused_pos
             except Exception as exc:
                 print(
@@ -3841,17 +3777,6 @@ class Engine:
                 suffix_tokens=replay_n,
             )
 
-            self.policy_logger.log_decision_and_outcome(
-                observation=obs,
-                decision=decision,
-                actual_policy=decision.policy,
-                prefill_time_s=dt,
-                reused_tokens=old_base,
-                new_tokens=replay_n,
-                total_tokens=total,
-                req_id=req_id,
-                success=True,
-            )
             return logits, old_base
 
         # ========================================================
@@ -3911,17 +3836,6 @@ class Engine:
                 suffix_tokens=total,
             )
 
-            self.policy_logger.log_decision_and_outcome(
-                observation=obs,
-                decision=decision,
-                actual_policy="full_prefill",
-                prefill_time_s=dt,
-                reused_tokens=0,
-                new_tokens=total,
-                total_tokens=total,
-                req_id=req_id,
-                success=True,
-            )
             return logits, 0
 
         # --------------------------------------------------------
@@ -4043,17 +3957,6 @@ class Engine:
             lcp=lcp,
             base_tokens=0,
             suffix_tokens=total,
-        )
-        self.policy_logger.log_decision_and_outcome(
-            observation=obs,
-            decision=decision,
-            actual_policy=decision.policy if decision.policy in ("full_prefill", "safe_recompute") else "full_prefill_fallback",
-            prefill_time_s=dt,
-            reused_tokens=0,
-            new_tokens=total,
-            total_tokens=total,
-            req_id=req_id,
-            success=True,
         )
         return logits, 0
 

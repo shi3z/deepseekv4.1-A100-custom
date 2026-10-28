@@ -11,7 +11,6 @@ Updated 2026-09-16. The numbers below are from the live five-GPU server logs in 
 - **CED (Causal Encoder-Decoder) / Decoder SWA Bounded Replay**: Intermediate prefill chunks run exclusively through layers 0..20 (Encoder side), generating all global compressed KV and candidate index representations. Decoder layers 21..39 only process the final 128-token SWA window, saving **~47% of prefill compute** on long contexts. **CED is an approximation** (see `results/image_crosstalk_report.md`, 2026-10-04): the tail's sliding window reaches positions that layers 21..39 never processed for this prompt, so those ring slots used to hold the *previous request's* kv — an image ending near the end of a ≥2K-token prompt became unreadable (the model answered with words from the prompt text), which looks like cross-talk. Since that fix, **image prompts never use CED** (always exact prefill, ~2× slower for 6.4K-token image requests: 8.8 s → 19.8 s) and the decoder-side rings are cleared before the tail pass so a CED prefill attends to zeros instead of another request's kv. `DSV41_CED=0` gives exact prefill for text too (prefill ~1.7× slower on 2–4K prompts).
 - **In-GPU Slot Cache & Prefix Replay**: Consecutive requests sharing a common prefix (e.g. Claude Code tool use / agentic coding) detect Longest Common Prefix (LCP) in GPU VRAM across active slots (`copy_seq`), forwarding only suffix tokens (e.g. 500 suffix tokens in 2s vs re-prefilling 128K tokens in 15 minutes). The web dashboard clearly distinguishes **Cold Prefill** from **Prefix Replay** with live hit rate and instant ETA.
 - **Compacted Canonical Snapshot Storage**: Host-RAM snapshots deduplicate multi-device GPU mirrors into a single canonical copy per owner, bound SWA windows to 128 rows, and slice Engram history to logical prefix length, slashing host RAM footprint by ~75% and accelerating restore via fast P2P GPU broadcast.
-- **Jev Mode Implemented**: Parallel non-autoregressive structured output engine with hierarchical persistent GPU prefix caching (`JevPrefixTree`). Replaces serial autoregressive JSON decode with parallel candidate log-probability scoring, achieving up to **2,854× speedup** on 30-field extraction (24 ms) and 100% schema consistency with zero output decode tokens.
 - Prefix snapshots, multi-anchor reuse, and continuation block replay are implemented.
 - DSpark/MTP draft and verification are implemented and verified with `--mtp 5 --mtp-device 4`.
 - For prompts over `DSV41_MTP_LONG_PROMPT_LIMIT`, the server can unload DSpark and fall back to ordinary decode. This reduces MTP memory pressure but does not remove the full-context cache limit.
@@ -29,12 +28,10 @@ DeepSeek-V4.1 supports flexible deployment profiles tailored to specific product
 | **🛡️ 1M Context Robust** | Full-repo scanning, long document analysis | **1M** (1,048,576) | **1 Slot** (`2`) | **45–50 tok/s** | 45–50 tok/s | **2–4 GiB** | Minimizes KV cache batch dimension to 2 rows; enables CED & exact cache growth to prevent OOM | [`./run_1m_robust.sh`](file:///mnt/ssdraid/git/deepseekv4.1/run_1m_robust.sh) |
 | **⚖️ Balanced Production (Default)** | General software engineering, 2-turn agents | **1M** (1,048,576) | **2 Slots** (`3`) | **50–51 tok/s** | **75–80 tok/s** | **7–10 GiB** | Balances 2 concurrent decode slots with 1M context readiness and 7–10 GiB VRAM headroom | [`./run_server_batched.sh`](file:///mnt/ssdraid/git/deepseekv4.1/run_server_batched.sh) |
 | **🏎️ 4-GPU MTP Speculative** | Interactive chat, fast terminal output, single agent | **64K** (65,536) | **1 Slot** (`2`) | **85–93 tok/s** | 85–93 tok/s | **10–14 GiB** | Shards experts as `100,100,100,84` to fit DSpark on `cuda:1`; drafts 5 tokens/step with 1.79 acceptance | [`./run_mtp_4gpu.sh`](file:///mnt/ssdraid/git/deepseekv4.1/run_mtp_4gpu.sh) |
-| **🚀 Jev Mode (Structured)** | JSON Schema extraction, classification, agent decisions | **Flexible** (64K–1M) | **Non-Autoregressive** (1-pass parallel queries) | *N/A* (0 decode tokens) | **up to ~13,000 tok/s** *(effective)* | Shared | Non-autoregressive candidate scoring on exact same weights; eliminates JSON formatting decode passes | [Jev Mode](#jev-mode-parallel-non-autoregressive-structured-output--hierarchical-prefix-cache-updated-2026-09-17) / [`examples/jev_mode/`](file:///mnt/ssdraid/git/deepseekv4.1/examples/jev_mode/README.md) |
 
 > [!NOTE]
 > **Generative Throughput vs. Effective Throughput**:
 > - **Autoregressive Profiles (1–4)**: Measure physical token generation throughput (generating arbitrary free-form text or code step-by-step across parallel client streams, bounded by GPU memory bandwidth at ~110–120 tok/s aggregate).
-> - **Jev Mode (Non-Autoregressive Scoring)**: Operates on the **exact same model weights**, but bypasses autoregressive decoding entirely. It evaluates schema field queries simultaneously across sequence slots and scores candidate log-probabilities in a single forward pass, assembling typed JSON directly in Python. Its ~13,000 tok/s rating represents **effective extraction throughput** (798 tokens of structured data delivered in 61.5 ms).
 
 ---
 
@@ -197,23 +194,9 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"What is the height of Tokyo Tower?"}],"max_tokens":256,"temperature":0.6,"stream":true}'
 
-# Jev Mode: Parallel Non-Autoregressive Structured Output (Zero decode tokens)
-curl http://127.0.0.1:8000/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "deepseek-v4.1-flash",
-    "prompt": "The customer says the service is too expensive and they are considering cancelling unless somebody contacts them today.",
-    "jev": true,
-    "schema": {
-      "sentiment": ["positive", "neutral", "negative"],
-      "churn_risk": ["low", "medium", "high"],
-      "urgency": ["low", "medium", "high"],
-      "needs_human": [true, false]
-    }
-  }'
 ```
 
-The server provides `/health`, `/v1/models`, `/v1/chat/completions`, `/v1/completions`, and `/dashboard` (plus `/api/metrics`). When `"jev": true` is passed with `"schema": {...}`, the engine runs in Jev Mode, extracting all fields concurrently via candidate log-probability scoring over the hierarchical persistent prefix cache. If `"stream": true` is set, Jev mode emits keep-alive heartbeat SSE comments (`: keep-alive\n\n`) during prefill to prevent client gateway timeouts, followed by OpenAI-compatible SSE chunks and `data: [DONE]`.
+The server provides `/health`, `/v1/models`, `/v1/chat/completions`, `/v1/completions`, and `/dashboard` (plus `/api/metrics`).
 
 ### Real-Time Monitoring Web Dashboard (`/dashboard`)
 
@@ -425,83 +408,6 @@ For multi-turn agentic workflows (e.g. Claude Code tool use), successive request
    - `NgramHashState.cache` is sliced from 1,000,000 tokens down to the logical prefix length.
    - `window_kv_cache` is bounded to 128 rows.
 
-## Jev Mode: Parallel Non-Autoregressive Structured Output & Hierarchical Prefix Cache (Updated 2026-09-17)
-
-Traditional structured JSON extraction with LLMs serializes data generation into dozens or hundreds of autoregressive decode steps (e.g. generating `{"`, field names, quotes, colons, commas, and formatting syntax). Each decode step requires an independent forward pass, causing high latency (8 to 68+ seconds for 3 to 30 fields) and vulnerability to formatting errors or premature EOS stops.
-
-**Jev Mode** (`dsv41/jev.py`) replaces serial token generation with **parallel non-autoregressive candidate scoring** over a **hierarchical persistent prefix cache** (`JevPrefixTree`). Instead of generating JSON syntax, the runtime treats schema fields as independent queries over the shared prompt representation and scores candidate token log-probabilities directly from next-token logits in parallel.
-
-### Hierarchical Persistent Prefix Cache Architecture
-
-```text
-[Prefix Tree Root]
-       │
-[Level 1: Jev System Prompt]  <-- Prefilled at startup, permanently retained in GPU VRAM (0 ms prefill)
-       │
-[Level 2: Schema Prefix]      <-- Cached separately per schema on GPU (Cache-hit latency: 0.08 ms)
-       │
-[Level 3: Request Input]      <-- User request tokens appended once -> Shared Request KV (~11 ms)
-       │
- ┌─────┴───────────────────────┬────────────────────────┐
-[Level 4: Field 1 Query]     [Level 4: Field 2 Query]  [Level 4: Field N Query] (Uniform 5-tok queries in parallel batch)
- │                             │                         │
-[Level 5: Candidate Logits]   [Level 5: Candidate Logits] [Level 5: Candidate Logits]
- │                             │                         │
- └─────────────────────────────┴─────────────────────────┘
-                               │
-                       [JSON Assemble] <-- Native Python dict directly constructed (0 decode tokens)
-```
-
-1. **Level 1 (Jev System Prompt)**: Fixed system prompt is prefilled once at server startup and permanently retained in GPU VRAM. It is never prefilled again.
-2. **Level 2 (Schema Prefix)**: Schema definitions are compiled into concise query definitions and cached separately on GPU. Subsequent requests with the same schema hit in **0.08 ms** with zero prefill overhead.
-3. **Level 3 (Request Input)**: Request input tokens are prefilled once onto the active KV cache, forming the **Shared Request KV**.
-4. **Level 4 (Field Queries)**: Field-specific suffixes (`\nField {i}:`, uniform 5 tokens each) are branched across the batch dimension without duplicating prefix storage in memory (GPU-to-GPU broadcast in < 0.01 ms). All fields execute in a single batched forward pass.
-5. **Level 5 (Candidate Scoring)**: Candidate values for categorical/boolean/enum fields are scored directly from output logits via teacher-forced log-probabilities ($S = \log P(\text{cand} \mid \text{prefix})$). The candidate with the highest log probability is chosen. Zero autoregressive decode tokens are generated.
-6. **Direct Assembly**: Assembled directly into a typed Python dictionary / JSON object. Syntax errors and formatting failures are mathematically eliminated.
-
-### First Target Verification Results
-
-- **Input Prompt**: `"The customer says the service is too expensive and they are considering cancelling unless somebody contacts them today."`
-- **Schema**:
-  - `sentiment`: `["positive", "neutral", "negative"]`
-  - `churn_risk`: `["low", "medium", "high"]`
-  - `urgency`: `["low", "medium", "high"]`
-  - `needs_human`: `[true, false]`
-- **Jev Mode Output**:
-  ```json
-  {
-    "sentiment": "negative",
-    "churn_risk": "high",
-    "urgency": "high",
-    "needs_human": true
-  }
-  ```
-- **Accuracy**: 100% match with ground truth model classification.
-- **Total Latency**: **23.98 ms**
-  - Hierarchical Cache-Hit Latency: **0.080 ms**
-  - Request Input Prefill: **11.40 ms**
-  - Candidate Scoring (all 4 fields in parallel): **12.50 ms**
-- **Output Tokens Generated**: **30 tokens** (extracted and assembled in parallel without autoregressive decode)
-- **Effective Throughput**: **1,251 tokens/second**
-
-### Benchmark Results: Normal Autoregressive JSON vs. Jev Mode
-
-Measured using `python3 -m dsv41.bench_jev` on 4× NVIDIA A100 80GB PCIe GPUs:
-
-| Case | Fields | Normal JSON Decode Latency | Normal Output Tokens | Jev Mode Latency | Jev Output Tokens | Speedup | Result Consistency | Effective Jev Throughput |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| **Case A** | 3 fields | 2,018.8 ms | 27 tok | **24.0 ms** | **22 tok** | **84.2 ×** | **100.0%** | **917.4 tok/s** |
-| **Case B** | 10 fields | 4,204.1 ms | 90 tok | **24.0 ms** | **78 tok** | **175.3 ×** | 80.0% | **3,252.7 tok/s** |
-| **Case C** | 30 fields | 9,773.3 ms (9.8 s) | 268 tok | **24.0 ms** | **238 tok** | **407.6 ×** | 73.3% | **9,924.9 tok/s** |
-| **Case D** | 100 fields | 30,745.8 ms (30.7 s) | 898 tok | **61.5 ms** | **798 tok** | **500.1 ×** | 68.0% | **12,979.8 tok/s** |
-
-#### Key Performance Takeaways:
-1. **O(1) Latency Scaling & Massive Throughput**: While normal autoregressive generation scales linearly with field count (2.0 s → 4.2 s → 9.8 s → 30.7 s), Jev Mode execution latency remains **flat at 24.0 ms** from 3 up to 30 fields, scaling effective structured output throughput from **917 tok/s** up to over **12,980 tok/s**.
-2. **408× Speedup**: On 30 fields, Jev Mode reduces latency from ~9.8 seconds down to 24 milliseconds.
-3. **500× Speedup on 100 Fields**: Normal generation takes over 30 seconds serializing 898 tokens, whereas Jev Mode extracts and tokenizes all 100 typed fields in **61.5 ms** (~13,000 tok/s effective throughput).
-
-See [`examples/jev_mode/`](file:///mnt/ssdraid/git/deepseekv4.1/examples/jev_mode/README.md) and [`examples/benchmarks/bench_jev_structured.py`](file:///mnt/ssdraid/git/deepseekv4.1/examples/benchmarks/bench_jev_structured.py) for runnable code and live demos.
-
 ## Generation Throughput & Prefix Cache Hit Benchmarks (Updated 2026-09-18)
 
 ### Autoregressive Decode Throughput (Single Stream)
@@ -637,8 +543,7 @@ Complete guides, runnable scripts, and interactive tools are located in the [`ex
 | Directory | Topic | Key Files |
 |:---|:---|:---|
 | [`examples/claude_code/`](file:///mnt/ssdraid/git/deepseekv4.1/examples/claude_code/README.md) | **Claude Code Backend** | `dsv41-litellm.yaml`, `claude-dsv41.sh`, `verify_litellm.py` |
-| [`examples/jev_mode/`](file:///mnt/ssdraid/git/deepseekv4.1/examples/jev_mode/README.md) | **Parallel Structured Output** | `demo_customer_feedback.py`, `demo_batch_extraction.py`, `demo_interactive.py` |
-| [`examples/benchmarks/`](file:///mnt/ssdraid/git/deepseekv4.1/examples/benchmarks/README.md) | **Performance & Load Testing** | `bench_jev_structured.py`, `bench_decode_throughput.py`, `bench_prefix_cache_hit.py`, `bench_concurrency.py` |
+| [`examples/benchmarks/`](file:///mnt/ssdraid/git/deepseekv4.1/examples/benchmarks/README.md) | **Performance & Load Testing** | `bench_decode_throughput.py`, `bench_prefix_cache_hit.py`, `bench_concurrency.py` |
 
 ---
 
@@ -683,8 +588,6 @@ These older measurements use different GPU counts, cache lengths, and batch size
 | `dsv41/ep.py` | expert parallel runtime, P2P synchronization, cache growth |
 | `dsv41/decode.py` | static-shape decode and CUDA graphs |
 | `dsv41/engine.py` | generation, prefix reuse, block replay, snapshots, MTP integration |
-| `dsv41/jev.py` | parallel non-autoregressive structured output engine and hierarchical prefix tree |
-| `dsv41/bench_jev.py` | benchmark suite comparing normal autoregressive JSON vs. Jev mode |
 | `dsv41/dspark.py` | DSpark draft and verification runtime |
 | `dsv41/serve.py` | OpenAI-compatible HTTP server |
 | `dsv41/stats.py` | real-time metrics collector, GPU/system monitor, and web dashboard |

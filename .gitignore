@@ -28,4 +28,4 @@ compression/
 /tmp/
 scratch/
 dsv41/cpu/.*.so
-
+.env

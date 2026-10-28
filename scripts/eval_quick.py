@@ -2,7 +2,7 @@
 """Quick capability check through the OpenAI-compatible API: fixed items with checkable answers
 (arithmetic / word problems, logic, Japanese comprehension, small coding tasks executed in a sandbox).
 usage: eval_quick.py [--port 8000] [--model default] [--tag name] [--max-tokens 2048]
-Prints per-category accuracy and writes results/eval_quick_<tag>.jsonl. The API key is read from .env (TYPESAFE_API_KEY) if the server asks for one."""
+Prints per-category accuracy and writes results/eval_quick_<tag>.jsonl."""
 import argparse, json, os, re, subprocess, sys, tempfile, time, urllib.request, urllib.error
 
 ITEMS = [
@@ -82,15 +82,6 @@ ITEMS = [
         ("code", "assert parse_csv_line('a,b,c')==['a','b','c']; assert parse_csv_line('\"x,y\",z')==['x,y','z']; assert parse_csv_line('\"say \"\"hi\"\"\",1')==['say \"hi\"','1']; assert parse_csv_line('')==['']\n")),
 ]
 
-def api_key():
-    try:
-        for line in open(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '.env')):
-            if line.startswith('TYPESAFE_API_KEY='):
-                return line.strip().split('=', 1)[1].strip().strip('"').strip("'")
-    except OSError:
-        pass
-    return None
-
 THINK = False
 
 def ask(port, model, prompt, max_tokens, key):
@@ -143,15 +134,7 @@ def main():
     a = ap.parse_args()
     global THINK
     THINK = a.think
-    key = None
-    # probe whether a key is needed
-    try:
-        ask(a.port, a.model, "Say OK.", 8, None)
-    except urllib.error.HTTPError as e:
-        if e.code in (401, 403):
-            key = api_key()
-        else:
-            raise
+    key = os.environ.get("DSV41_API_KEY")  # the local server needs none
     os.makedirs("results", exist_ok=True)
     out = open(f"results/eval_quick_{a.tag}.jsonl", "w")
     by_cat = {}

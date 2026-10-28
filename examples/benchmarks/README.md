@@ -1,30 +1,12 @@
 # DeepSeek-V4.1 Performance & Benchmark Suite
 
-This directory contains standalone benchmark tools to evaluate inference performance, decoding speed, prefix cache reuse, and parallel non-autoregressive extraction on DeepSeek-V4.1.
+This directory contains standalone benchmark tools to evaluate inference performance, decoding speed, and prefix cache reuse on DeepSeek-V4.1.
 
 ---
 
 ## 📊 Benchmark Tools
 
-### 1. Structured Output Benchmark (`bench_jev_structured.py`)
-Compares standard autoregressive JSON decoding against **Jev Mode** parallel candidate scoring across 4 schema complexity cases (3, 10, 30, and 100 fields).
-
-```bash
-# Run all 4 cases
-python3 examples/benchmarks/bench_jev_structured.py
-
-# Run specific cases
-python3 examples/benchmarks/bench_jev_structured.py --cases "Case A" "Case B"
-```
-
-**What it measures:**
-- Normal JSON round-trip time vs Jev Mode round-trip time.
-- Speedup multiplier ($84\times$ to $500\times$).
-- Output tokens and effective token generation throughput.
-
----
-
-### 2. Autoregressive Decode Throughput (`bench_decode_throughput.py`)
+### 1. Autoregressive Decode Throughput (`bench_decode_throughput.py`)
 Measures single-stream generation throughput (tokens/sec) across different generated token lengths (64, 128, 256, 512 tokens).
 
 ```bash
@@ -37,7 +19,7 @@ python3 examples/benchmarks/bench_decode_throughput.py --lengths 64 128 256 512
 
 ---
 
-### 3. Prefix Cache Hit Acceleration (`bench_prefix_cache_hit.py`)
+### 2. Prefix Cache Hit Acceleration (`bench_prefix_cache_hit.py`)
 Demonstrates the performance impact of Longest Common Prefix (LCP) caching during multi-turn developer interactions (such as Claude Code sessions or multi-step agent tool loops).
 
 ```bash
@@ -51,7 +33,7 @@ python3 examples/benchmarks/bench_prefix_cache_hit.py
 
 ---
 
-### 4. Server Concurrency & Load Test (`bench_concurrency.py`)
+### 3. Server Concurrency & Load Test (`bench_concurrency.py`)
 Tests how the server scales under concurrent client loads (1, 2, and 4 parallel workers).
 
 ```bash
@@ -65,7 +47,7 @@ python3 examples/benchmarks/bench_concurrency.py --workers 1 2 4 --requests-per-
 
 ---
 
-### 5. Python Code Generation Benchmark (`bench_code_generation.py`)
+### 4. Python Code Generation Benchmark (`bench_code_generation.py`)
 Evaluates DeepSeek-V4.1 on realistic algorithmic and systems programming tasks (LRU cache, binary search, token bucket rate limiter, trie prefix tree, topological sort).
 
 ```bash

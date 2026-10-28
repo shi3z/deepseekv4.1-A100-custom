@@ -31,9 +31,6 @@ export DSV41_EP_COMPACT_XQ=1
 export DSV41_GPU_SLOT_CACHE=1
 export DSV41_PREFIX_DEDUP_MIRRORS=1
 export DSV41_CED=0  # exact prefill for everything (user decision 2026-10-05); =1 is the approximate CED tail for text prompts, images are always exact (results/image_crosstalk_report.md)
-# Jev structured-output engine and its external policy API are off (user decision 2026-09-25)
-export DSV41_JEV=0
-export DSV41_ENABLE_JEV_POLICY=0
 
 # Repetition & Stability Safeguards
 export DSV41_REPETITION_PENALTY=1.05
@@ -62,7 +59,7 @@ export DSV41_PREFIX_ANCHOR_MAX=2
 
 DEFAULT_CKPT="/mnt/ssd/models/DeepSeek-V4.1-Flash-Abliterated"
 if [ ! -d "$DEFAULT_CKPT" ]; then
-    DEFAULT_CKPT="/mnt/ssd/models/DeepSeek-V4.1-Flash"
+    DEFAULT_CKPT="/mnt/ssd/models/DeepSeek-V4.1-Flash-1017"
 fi
 CKPT="${DSV41_CKPT:-$DEFAULT_CKPT}"
 

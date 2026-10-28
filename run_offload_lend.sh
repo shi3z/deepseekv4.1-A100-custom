@@ -13,8 +13,6 @@ export DSV41_CACHE_INIT_TOKENS=32768
 export DSV41_EXACT_CACHE_GROW=1
 export DSV41_MAX_SEQS=${LEND_MAX_SEQS:-2}
 export DSV41_CED=0
-export DSV41_JEV=0
-export DSV41_ENABLE_JEV_POLICY=0
 export DSV41_REPETITION_PENALTY=1.05
 export DSV41_FREQUENCY_PENALTY=0.02
 export DSV41_PRESENCE_PENALTY=0.0
@@ -32,7 +30,7 @@ export DSV41_PREFIX_CACHE_GB=8
 export DSV41_PREFIX_TMPFS_ENTRIES=4
 export DSV41_PREFIX_TMPFS_GB=8
 DEFAULT_CKPT="/mnt/ssd/models/DeepSeek-V4.1-Flash-Abliterated"
-[ -d "$DEFAULT_CKPT" ] || DEFAULT_CKPT="/mnt/ssd/models/DeepSeek-V4.1-Flash"
+[ -d "$DEFAULT_CKPT" ] || DEFAULT_CKPT="/mnt/ssd/models/DeepSeek-V4.1-Flash-1017"
 CKPT="${DSV41_CKPT:-$DEFAULT_CKPT}"
 exec /home/shi3z/.local/bin/python -u -m dsv41.serve \
     --ckpt "$CKPT" \
