@@ -2084,7 +2084,10 @@ class Engine:
             if kind == "dict" and h.ndim >= 2 and h.shape[1] > block_rows:
                 refs = []
                 for start in range(0, h.shape[1], block_rows):
-                    blk = h[:, start:start + block_rows].contiguous()
+                    # clone, not contiguous(): a [1, rows, dim] tensor's slice along dim 1 already counts as
+                    # contiguous, so contiguous() returned the view and torch.save wrote the WHOLE storage
+                    # (510 MB per "1024-row block" of a 499K prefix, 543 GB per snapshot; found 2026-10-28)
+                    blk = h[:, start:start + block_rows].clone()
                     digest = hashlib.sha256(blk.view(torch.uint8).numpy().tobytes()).hexdigest()[:32]
                     path = os.path.join(block_root, digest + ".pt")
                     if not os.path.exists(path):

@@ -28,6 +28,8 @@ DeepSeek-V4.1 supports flexible deployment profiles tailored to specific product
 | **🛡️ 1M Context Robust** | Full-repo scanning, long document analysis | **1M** (1,048,576) | **1 Slot** (`2`) | **45–50 tok/s** | 45–50 tok/s | **2–4 GiB** | Minimizes KV cache batch dimension to 2 rows; enables CED & exact cache growth to prevent OOM | [`./run_1m_robust.sh`](file:///mnt/ssdraid/git/deepseekv4.1/run_1m_robust.sh) |
 | **⚖️ Balanced Production (Default)** | General software engineering, 2-turn agents | **1M** (1,048,576) | **2 Slots** (`3`) | **50–51 tok/s** | **75–80 tok/s** | **7–10 GiB** | Balances 2 concurrent decode slots with 1M context readiness and 7–10 GiB VRAM headroom | [`./run_server_batched.sh`](file:///mnt/ssdraid/git/deepseekv4.1/run_server_batched.sh) |
 | **🏎️ 4-GPU MTP Speculative** | Interactive chat, fast terminal output, single agent | **64K** (65,536) | **1 Slot** (`2`) | **85–93 tok/s** | 85–93 tok/s | **10–14 GiB** | Shards experts as `100,100,100,84` to fit DSpark on `cuda:1`; drafts 5 tokens/step with 1.79 acceptance | [`./run_mtp_4gpu.sh`](file:///mnt/ssdraid/git/deepseekv4.1/run_mtp_4gpu.sh) |
+| **📚 512K × 4 slots (production since 2026-10-28)** | Claude Code sessions up to 512K, 4 parallel agents | **512K** (524,288) | **4 Slots** (`5`) | 45–55 tok/s | ~150 tok/s | 2–4 GiB | Consumer-local KV placement (`DSV41_CACHE_PLACEMENT=local`): 3.1 GiB/GPU of compressed cache at full context instead of 7.8 with mirrors; 499K prompt verified (cold prefill 39 min, snapshot re-send 2 s) | `run_512k_4slots.sh` |
+| **🧩 512K × 1 + 128K × 3** | One long session plus three ordinary ones | **512K / 128K** per slot | **4 Slots** (rows `4,5,6,7`) | 45–55 tok/s | ~150 tok/s | 3–5 GiB | Per-slot capacities (`DSV41_SLOT_CAPS=512k,128k,128k,128k,512k`): 1.7 GiB/GPU of compressed cache, fixed at load; requests go to the smallest free slot that holds them | `run_512k_mixed.sh` |
 
 > [!NOTE]
 > **Generative Throughput vs. Effective Throughput**:
@@ -226,6 +228,31 @@ Useful log lines:
 [prefix-replay-mtp-tail] main_hidden=OK shape=(1, 1, 15360)
 [prefill-bench] mode=LCP-HIT new=134 reused=16,264 total=16,398 ...
 ```
+
+## KV cache placement and per-slot capacities (2026-10-28)
+
+The compressed-KV / index-K cache has four owner layers (2, 8, 14, 20; ratio 2 up to layer 19, ratio 1 from 20) of
+`(512 + 128) × bf16` per compressed row: 3,200 B per token per sequence row when every owner is mirrored on every GPU,
+and every row of the `[max_seqs, rows, dim]` table grows to the longest sequence. 512K × 5 rows therefore cost
+7.8 GiB per GPU and OOMed on a 499K prompt (so did 512K × 3 rows: the prefill temporaries need ~2–3 GiB on top).
+
+**Consumer-local placement** (`DSV41_CACHE_PLACEMENT=local`, `dsv41/load.py: consumer_cache_devices`). A layer reads
+the cache of the largest owner ≤ its id on its own device, so an owner's cache is needed only on the devices hosting
+layers `owner .. next_owner - 1`. With 10,10,10,10 layers per GPU: owner 2 → GPU0, 8 → GPU0+1, 14 → GPU1, 20 → GPU2+3,
+i.e. 1,280 B/token/row on every GPU (2.5× less). Owner layers push freshly written rows only to devices that hold a
+mirror; a prefix snapshot taken under another placement restores into any mirror of the owner.
+Verified on the 512K × 4-slot profile: eval_quick 56/58 (= baseline), 12-client cross-talk audit 0/36, 150K needle
+correct (cold TTFT 395 s, 2.1 s on re-send), 499K needle correct (TTFT 2,351 s, 77–78 GB/GPU afterwards).
+
+**Per-slot capacities** (`DSV41_SLOT_CAPS=<scratchpad>,<slot1>,<slot2>,...`, `dsv41/slots.py`). Each (owner, device)
+cache is one flat buffer in which slot *s* occupies `k_s` units of `unit // ratio + 1` rows (unit = the smallest
+capacity); the kernels and the Python code see an `as_strided` view `[rows, max_rows, dim]` whose row stride is one
+unit, so `[row, position]` lands inside the slot's own units. Slot 0 (prefill scratchpad) must be the largest; list the
+largest decode slot last so the buffer is exactly the sum of the capacities. The scheduler gives a request the smallest
+free slot that holds `prompt + 1` tokens (the slot holding its best prefix if it fits), clamps `max_tokens` to the slot
+and lets requests that fit nothing yet wait without blocking later ones. `512k,128k,128k,128k,512k` = 1.7 GiB/GPU.
+Verified: eval_quick 56/58, cross-talk 0/36, 150K needle in the 512K slot while 12 clients use the 128K slots (0/24
+failures), snapshot re-send 2.1 s, GPU-slot re-send 1.0 s, 499K needle: correct (TTFT 2,344 s, ~7 min of it the then-buggy tmpfs store; 79–81 GB/GPU during prefill).
 
 ## Latest long-context measurements
 
@@ -573,6 +600,9 @@ These older measurements use different GPU counts, cache lengths, and batch size
 | `DSV41_HC_PREFILL_CHUNK` | `2048` | chunk size for hyper-connection prefill |
 | `DSV41_EP_PREALLOC_TOKENS` | `40000` | EP graph-capture preallocation horizon |
 | `DSV41_EXACT_CACHE_GROW` | `0` | grow caches only to the needed row count |
+| `DSV41_CACHE_PLACEMENT` | `mirror` | `local`: each owner's compressed cache only on the GPUs that read it (2.5× less cache VRAM per GPU) |
+| `DSV41_SLOT_CAPS` | unset | per-slot context capacities, e.g. `512k,128k,128k,128k,512k` (scratchpad first, largest decode slot last) |
+| `DSV41_PIPELINE_CHUNK_SIZE` | `2048` | pipelined prefill chunk; the indexer's candidate mask is `[chunk × context]` bool per chunk |
 | `DSV41_PREFIX_BLOCK_REPLAY` | `0` | enable block replay |
 | `DSV41_PREFIX_BLOCK_SIZE` | `128` | replay block size |
 | `DSV41_PREFIX_GUARD` | `256` | tail kept after a snapshot base |
