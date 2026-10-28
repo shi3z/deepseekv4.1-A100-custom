@@ -2368,6 +2368,34 @@ class Engine:
             except Exception:
                 pass
 
+        # The content-addressed blocks live outside the manifests, so the budget above only ever counted the
+        # ~7 MB manifests: 2026-10-28 found 947 GB of blocks (12,781 files since 10-17, 201 referenced) filling
+        # /dev/shm.  Collect unreferenced blocks here (the GC used to run only when a manifest was replaced, not
+        # when one was evicted) and evict the oldest manifests until the referenced blocks fit the budget too.
+        if os.environ.get("DSV41_PREFIX_BLOCK_GC", "1") == "1":
+            block_root = os.path.join(root, "blocks")
+
+            def _block_bytes():
+                try:
+                    return sum(
+                        os.path.getsize(os.path.join(block_root, n))
+                        for n in os.listdir(block_root)
+                        if n.endswith(".pt")
+                    )
+                except OSError:
+                    return 0
+
+            self._gc_prefix_blocks(root)
+            while len(keep) > 1 and total + _block_bytes() > max_bytes:
+                victim = keep.pop()  # keep is newest-first
+                try:
+                    total -= os.path.getsize(victim)
+                    os.unlink(victim)
+                    print(f"[prefix-tmpfs] EVICT (block budget {max_gb:.0f} GB) path={victim}", flush=True)
+                except Exception:
+                    pass
+                self._gc_prefix_blocks(root)
+
     def _load_prefix_cache_from_tmpfs(
         self,
         entries,
@@ -2752,6 +2780,8 @@ class Engine:
             f"dir={root}",
             flush=True,
         )
+        if os.environ.get("DSV41_PREFIX_BLOCK_GC", "1") == "1":
+            self._gc_prefix_blocks(root)  # blocks orphaned by evictions / crashes of earlier processes
 
     def _prefix_cache_entries(self):
         """Host-RAM prefix snapshot LRU.
@@ -2934,10 +2964,15 @@ class Engine:
             flush=True,
         )
 
-        self._persist_prefix_cache_entry(
-            ent,
-            previous=previous,
-        )
+        try:
+            self._persist_prefix_cache_entry(
+                ent,
+                previous=previous,
+            )
+        except Exception as exc:
+            # e.g. tmpfs full (2026-10-28: torch.save "unexpected pos" on a 100% /dev/shm); the host-RAM entry
+            # is already in place, only the persistent copy is missing
+            print(f"[prefix-tmpfs] STORE-FAIL base={len(base_ids):,} ({exc.__class__.__name__}: {str(exc)[:120]}); request continues", flush=True)
 
         if self.stats_tracker is not None:
             try:
