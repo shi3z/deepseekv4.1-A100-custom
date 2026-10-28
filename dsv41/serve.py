@@ -277,7 +277,8 @@ class Handler(BaseHTTPRequestHandler):
                     data.append({"id": alias, "object": "model", "owned_by": "local"})
             self._json(200, {"object": "list", "data": data})
         elif self.path == "/health":
-            self._json(200, {"status": "ok"})
+            self._json(200, {"status": "ok", "model": ENGINE.model_name, "max_seq_len": ENGINE.max_seq_len,
+                             "max_seqs": ENGINE.max_seqs, "max_input_tokens": ENGINE.max_seq_len - 1})
         elif self.path in ("/dashboard", "/"):
             self._dashboard()
         elif self.path in (
@@ -458,6 +459,8 @@ class Handler(BaseHTTPRequestHandler):
             ids, images, token_types = eng.format_chat(messages, thinking)
         except Exception as e:  # malformed messages / unsupported content
             return self._json(400, {"error": f"cannot encode messages: {e}"})
+        if len(ids) + 1 > eng.max_seq_len:
+            return self._context_length_error(len(ids))
         params = _params(body)
         # Claude/LiteLLM may retry a stalled stream as a non-stream request
         # with max_tokens=32000.  Keep interactive retries bounded so a
@@ -645,6 +648,17 @@ class Handler(BaseHTTPRequestHandler):
             out["prefill_policy"] = eng.last_policy_decision.to_dict()
         self._json(200, out, t0=t0, is_stream=False, ka=ka)
 
+    def _context_length_error(self, n_prompt: int, t0: float | None = None):
+        """OpenAI-style context_length_exceeded (LiteLLM maps it to ContextWindowExceededError, so Claude Code
+        compacts instead of retrying).  Without this the request ran a multi-minute prefix replay and then failed
+        inside the model (engram cache sized to max_seq_len) with a 500 that clients retried in a loop."""
+        limit = ENGINE.max_seq_len
+        msg = (f"This model's maximum context length is {limit} tokens. However, your messages resulted in "
+               f"{n_prompt} tokens (at least 1 token must be left for the completion). Please reduce the length of the messages.")
+        print(f"[chat] REJECT prompt_tokens={n_prompt} > max_seq_len-1={limit - 1} (context_length_exceeded)", flush=True)
+        return self._json(400, {"error": {"message": msg, "type": "invalid_request_error", "param": "messages",
+                                          "code": "context_length_exceeded"}}, t0=t0, is_stream=False)
+
     # ------------------------------------------------ raw completions
     def _completion(self, body: dict):
         eng = ENGINE
@@ -657,6 +671,8 @@ class Handler(BaseHTTPRequestHandler):
         else:
             ids = eng.tok.encode(prompt)
             images, token_types = None, None
+        if len(ids) + 1 > eng.max_seq_len:
+            return self._context_length_error(len(ids), t0=t0)
         params = _params(body)
         rid = f"cmpl-{uuid.uuid4().hex[:24]}"
         created = int(time.time())

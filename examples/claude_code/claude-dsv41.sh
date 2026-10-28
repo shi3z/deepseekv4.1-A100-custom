@@ -83,7 +83,14 @@ export CLAUDE_CODE_SUBAGENT_MODEL="$MODEL_NAME"
 
 export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1
 export CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1
-export CLAUDE_CODE_MAX_CONTEXT_TOKENS="${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-786432}"
+# Context window Claude Code assumes for compaction: take the server's real limit (/health reports
+# max_seq_len since 2026-10-28); a wrong value (the old 786432 default against a 128K server) let
+# sessions grow past the server limit, where every request failed and Claude Code stopped.
+if [ -z "${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-}" ]; then
+    _srv_ctx=$(curl -s -m 5 "http://127.0.0.1:$DSV41_PORT/health" 2>/dev/null | python3 -c 'import sys,json; print(json.load(sys.stdin).get("max_seq_len") or "")' 2>/dev/null)
+    CLAUDE_CODE_MAX_CONTEXT_TOKENS="${_srv_ctx:-131072}"
+fi
+export CLAUDE_CODE_MAX_CONTEXT_TOKENS
 export API_TIMEOUT_MS="${API_TIMEOUT_MS:-600000}"
 
 echo "Claude Code -> LiteLLM (http://127.0.0.1:$PROXY_PORT) -> DeepSeek-V4.1 (http://127.0.0.1:$DSV41_PORT)" >&2
