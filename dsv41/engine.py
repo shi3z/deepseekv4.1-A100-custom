@@ -2046,6 +2046,8 @@ class Engine:
                 shape = (-1, -1, *shape[2:])   # rows (max_seqs vs the saved row 0) and positions (dynamic) are layout-free
             except Exception:
                 pass
+        elif len(shape) >= 1:
+            shape = (-1, *shape[1:])           # every per-sequence tensor is saved as row 0 only (compressor states, ...)
         return {
             "kind": str(kind),
             "holder_class": (
@@ -2634,6 +2636,8 @@ class Engine:
                     sh = e.get("shape")
                     if isinstance(sh, (list, tuple)) and len(sh) >= 2 and sh[1] == -1:
                         e["shape"] = tuple([-1, -1, *list(sh)[2:]])
+                    elif isinstance(sh, (list, tuple)) and len(sh) >= 1:
+                        e["shape"] = tuple([-1, *list(sh)[1:]])
                     elif isinstance(sh, (list, tuple)):
                         e["shape"] = tuple(sh)
                     out.append(e)
