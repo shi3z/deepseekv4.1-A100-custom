@@ -88,7 +88,11 @@ export CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1
 # sessions grow past the server limit, where every request failed and Claude Code stopped.
 if [ -z "${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-}" ]; then
     _srv_ctx=$(curl -s -m 5 "http://127.0.0.1:$DSV41_PORT/health" 2>/dev/null | python3 -c 'import sys,json; print(json.load(sys.stdin).get("max_seq_len") or "")' 2>/dev/null)
-    CLAUDE_CODE_MAX_CONTEXT_TOKENS="${_srv_ctx:-131072}"
+    # practical cap: a cold prefill runs ~250 tok/s, so a 340K-token turn takes 25 min and times out (2026-10-29);
+    # let Claude Code compact well before that even when the server allows 512K
+    _cap=${CLAUDE_CODE_PRACTICAL_CONTEXT:-163840}
+    _srv_ctx=${_srv_ctx:-131072}
+    CLAUDE_CODE_MAX_CONTEXT_TOKENS=$(( _srv_ctx < _cap ? _srv_ctx : _cap ))
 fi
 export CLAUDE_CODE_MAX_CONTEXT_TOKENS
 export API_TIMEOUT_MS="${API_TIMEOUT_MS:-600000}"

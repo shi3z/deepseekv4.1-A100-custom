@@ -4927,10 +4927,20 @@ class Engine:
                 self._batch_waiting.append(self._batch_queue.get_nowait())
             except queue.Empty:
                 break
+        # Coalesce duplicates: a client that times out and retries (Claude Code at 340K tokens, 2026-10-29: 9 identical
+        # 343K prompts in flight, each a 25-minute cold prefill) must not prefill the same prompt in several slots at
+        # once.  A waiting request whose prompt equals an active one's waits; when the first finishes, the retry hits
+        # the prefix cache (LCP-HIT, seconds) instead of recomputing.
+        def _pkey(ids):
+            return (len(ids), hash(tuple(ids[:256])), hash(tuple(ids[-256:])))
+        busy = {_pkey(r.prompt_ids) for r in self._active_slots.values()}
         for i, req in enumerate(self._batch_waiting):
             need = len(req.prompt_ids) + 1
             fitting = [s for s in self._free_decode_slots if self.slot_cap_tokens(s) >= need]
             if not fitting:
+                continue
+            k = _pkey(req.prompt_ids)
+            if k in busy:
                 continue
             # Smart slot assignment: if a GPU slot retains the best prefix and is currently free, reuse it!
             best_gpu_slot, best_gpu_lcp = (0, 0) if req.images is not None else self._find_best_gpu_slot(req.prompt_ids)
