@@ -28,6 +28,12 @@ export DSV41_MAX_SEQS=5
 # consumer-local compressed-cache placement (2026-10-28): each owner's KV/index cache only on the GPUs that read it
 # (3.1 GiB/GPU at 512K x 5 rows instead of 7.8 with full mirrors) -- see load.consumer_cache_devices
 export DSV41_CACHE_PLACEMENT=local
+# long prefills run in segments; between segments the active slots decode (time budget) and one small waiting
+# request may be admitted (slot 0 saved/restored around it) -- engine._interleave_step
+export DSV41_PREFILL_SEGMENT_TOKENS=8192
+export DSV41_INTERLEAVE_DECODE_MS=1500
+export DSV41_INTERLEAVE_ADMIT=1
+export DSV41_INTERLEAVE_MAX_NEW_TOKENS=16384
 
 # Communication & Cache Acceleration
 export DSV41_EP_COMPACT_XQ=1

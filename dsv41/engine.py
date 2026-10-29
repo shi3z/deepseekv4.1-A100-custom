@@ -20,6 +20,7 @@ from .decode import DecodeRuntime
 from .load import load_model
 from .prefill_policy import PrefillDecision, PrefillObservation, decide_policy, verify_and_constrain
 from .slots import slot_layout_from_env
+import contextlib
 import traceback
 
 DEFAULT_CKPT = "/mnt/ssd/models/DeepSeek-V4.1-Flash-Abliterated" if os.path.exists("/mnt/ssd/models/DeepSeek-V4.1-Flash-Abliterated") else "/mnt/ssd/models/DeepSeek-V4.1-Flash-1017"
@@ -382,6 +383,7 @@ class Engine:
         self._forced_prefill_policy_once = None
         self.last_policy_decision: PrefillDecision | None = None
         self._prefill_interleave = None   # set by the batch worker while it prefills (see _forward_prefill_segments)
+        self._interleave_depth = 0
 
     def _record_prefill_stats(
         self,
@@ -661,12 +663,12 @@ class Engine:
         self._prefix_len = len(prompt_ids)
 
     def _forward_prefill_segments(self, token_ids, start_pos: int):
-        """model.forward over token_ids from start_pos in segments of DSV41_PREFILL_SEGMENT_TOKENS (default 16384;
+        """model.forward over token_ids from start_pos in segments of DSV41_PREFILL_SEGMENT_TOKENS (default 8192;
         0 = one call), running self._prefill_interleave() between segments when set (the batch worker installs it
         while it prefills: one decode step for the active slots).  The persistent caches make continuation exact
         (the DSV41_FORCE_LEGACY_BUILD_LOOP path did the same with HC_PREFILL_CHUNK); returns the last segment's
         logits.  Segments trade a little pipeline fill/drain per segment for bounded decode stalls."""
-        seg = int(os.environ.get("DSV41_PREFILL_SEGMENT_TOKENS", "16384"))
+        seg = int(os.environ.get("DSV41_PREFILL_SEGMENT_TOKENS", "8192"))
         n = len(token_ids)
         if seg <= 0 or n <= seg:
             return self.model.forward(torch.tensor([list(token_ids)], dtype=torch.long), start_pos)
@@ -684,7 +686,7 @@ class Engine:
                 hook = getattr(self, "_prefill_interleave", None)
                 if hook is not None:
                     try:
-                        hook()
+                        hook(start_pos + b)
                     except Exception as exc:
                         print(f"[prefill-segments] interleaved decode step failed: {exc}", flush=True)
                         traceback.print_exc()
@@ -1568,7 +1570,7 @@ class Engine:
 
         t0 = time.perf_counter()
 
-        _interleave_every = max(1, int(os.environ.get('DSV41_PREFILL_SEGMENT_TOKENS', '16384')))
+        _interleave_every = max(1, int(os.environ.get('DSV41_PREFILL_SEGMENT_TOKENS', '8192')))
 
         report_every = max(
             128,
@@ -1734,7 +1736,7 @@ class Engine:
                     _hook = getattr(self, "_prefill_interleave", None)
                     if _hook is not None and done % _interleave_every < n and pos < decode_end:
                         try:
-                            _hook()
+                            _hook(pos)
                         except Exception as exc:
                             print(f"[prefix-replay-block] interleaved decode step failed: {exc}", flush=True)
 
@@ -4988,8 +4990,7 @@ class Engine:
         # 343K prompts in flight, each a 25-minute cold prefill) must not prefill the same prompt in several slots at
         # once.  A waiting request whose prompt equals an active one's waits; when the first finishes, the retry hits
         # the prefix cache (LCP-HIT, seconds) instead of recomputing.
-        def _pkey(ids):
-            return (len(ids), hash(tuple(ids[:256])), hash(tuple(ids[-256:])))
+        _pkey = self._prompt_key
         busy = {_pkey(r.prompt_ids) for r in self._active_slots.values()}
         for i, req in enumerate(self._batch_waiting):
             need = len(req.prompt_ids) + 1
@@ -5013,6 +5014,251 @@ class Engine:
             del self._batch_waiting[i]
             return req, slot_id, best_gpu_slot, best_gpu_lcp
         return None
+
+    def _admit_request(self, req, slot_id, best_gpu_slot, best_gpu_lcp, B, locked=False):
+        """Prefill `req` on slot 0 and move it into decode slot `slot_id` (step 1 of _batch_worker_loop, extracted).
+        locked=True: called from _interleave_step while the worker already holds self.lock (a small request admitted
+        between the segments of another request's prefill)."""
+        req.slot_id = slot_id
+        with self._slot_lock:
+            st = self.slot_states.get(slot_id, {})
+            st["slot_id"] = slot_id
+            st["status"] = "prefilling"
+            st["req_id"] = req.req_id
+            st["prompt_tokens"] = len(req.prompt_ids)
+            st["reused_tokens"] = best_gpu_lcp
+            st["reused_slot"] = best_gpu_slot
+            st["lcp"] = best_gpu_lcp
+            st["prefill_type"] = "gpu_hit" if best_gpu_lcp > 0 else "cold"
+            st["suffix_tokens"] = max(0, len(req.prompt_ids) - best_gpu_lcp)
+            st["generated_tokens"] = 0
+            st["max_tokens"] = req.max_new
+            st["start_time"] = time.perf_counter()
+            st["first_tok_time"] = 0.0
+            st["elapsed_s"] = 0.0
+            st["tok_s"] = 0.0
+            st["recent_text"] = ""
+            self.slot_states[slot_id] = st
+        try:
+            with (contextlib.nullcontext() if locked else self.lock):
+                # Prefill using slot 0 (fully compatible with prefix-cache / snapshots / GPU cache).  Between
+                # prefill segments _interleave_step runs: one decode step for the active slots and, when a
+                # waiting request needs little new prefill, its admission (slot 0 saved and restored around it).
+                if not locked:
+                    self._prefill_interleave = (lambda pos: self._interleave_step(B, pos))
+                try:
+                    logits, _reused = self._prefill_with_prefix_reuse(
+                        req.prompt_ids,
+                        images=req.images,
+                        token_types=req.token_types,
+                        req_id=req.req_id,
+                    )
+                finally:
+                    if not locked:
+                        self._prefill_interleave = None
+                first_tok = sample_token(logits[0], req.params.temperature, req.params.top_p, req.gen)
+                # Copy per-sequence cache state from slot 0 to target decode slot
+                self.rt.copy_seq(0, slot_id, req_id=req.req_id)
+                _wlog = self._slot_window_log.get(0)
+                if _wlog is not None:
+                    self._slot_window_log[slot_id] = _wlog
+                else:
+                    self._slot_window_log.pop(slot_id, None)
+                with getattr(self, "_slot_tokens_lock", threading.Lock()):
+                    self._slot_tokens[0] = list(req.prompt_ids)
+                    self._slot_tokens[slot_id] = list(req.prompt_ids)
+                pf_stats = getattr(self, "last_prefill_stats", None)
+                with self._slot_lock:
+                    st = self.slot_states.get(slot_id, {})
+                    if pf_stats:
+                        st["prefill_type"] = pf_stats.get("prefill_type", st.get("prefill_type", "cold"))
+                        st["lcp"] = pf_stats.get("lcp", st.get("lcp", 0))
+                        st["reused_tokens"] = pf_stats.get("reused_tokens", st.get("reused_tokens", 0))
+                        st["suffix_tokens"] = pf_stats.get("suffix_tokens", max(0, len(req.prompt_ids) - st.get("reused_tokens", 0)))
+                        st["prefill_time_s"] = pf_stats.get("time_s", 0.0)
+                        st["prefill_eff_s"] = pf_stats.get("effective_tok_s", 0.0)
+                    self.slot_states[slot_id] = st
+                req.pos = len(req.prompt_ids)
+                req.next_token = first_tok
+                if first_tok == self.eos:
+                    req.result_text = ""
+                    req.result_count = 0
+                    req.token_queue.put(None)
+                    req.done_event.set()
+                    self._free_decode_slots.append(slot_id)
+                    with self._slot_lock:
+                        st = self.slot_states.get(slot_id, {})
+                        st["status"] = "completed"
+                        st["generated_tokens"] = 0
+                        st["recent_text"] = ""
+                        st["completed_at"] = time.perf_counter()
+                        self.slot_states[slot_id] = st
+                    print(f"[batched-engine] prompt immediately reached EOS for slot={slot_id}", flush=True)
+                else:
+                    req.out_tokens.append(first_tok)
+                    with getattr(self, "_slot_tokens_lock", threading.Lock()):
+                        if slot_id in self._slot_tokens:
+                            self._slot_tokens[slot_id].append(first_tok)
+                    req.first_token_time = time.perf_counter()
+                    text = self.tok.decode(req.out_tokens[req.decoded_upto:], errors="replace")
+                    if "\ufffd" not in text:
+                        if text:
+                            req.token_queue.put((first_tok, text))
+                        req.decoded_upto = len(req.out_tokens)
+                    req.live_text = text
+                    self._active_slots[slot_id] = req
+                    with self._slot_lock:
+                        st = self.slot_states.get(slot_id, {})
+                        st["status"] = "generating"
+                        st["first_tok_time"] = req.first_token_time
+                        st["generated_tokens"] = 1
+                        st["recent_text"] = text
+                        self.slot_states[slot_id] = st
+                    print(f"[batched-engine] prefilled slot={slot_id} prompt_tokens={len(req.prompt_ids)}", flush=True)
+        except Exception as e:
+            print(f"[batched-engine] prefill error on slot={slot_id}: {e}", flush=True)
+            traceback.print_exc()
+            if "out of memory" in str(e).lower() and torch.cuda.is_available():
+                for d in range(torch.cuda.device_count()):
+                    try:
+                        with torch.cuda.device(d):
+                            torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+            req.error = e
+            req.token_queue.put(None)
+            req.done_event.set()
+            self._free_decode_slots.append(slot_id)
+            with getattr(self, "_slot_tokens_lock", threading.Lock()):
+                if slot_id in self._slot_tokens:
+                    del self._slot_tokens[slot_id]
+                # slot 0 (the prefill scratchpad) may be partially overwritten by the failed prefill:
+                # forget what it held so no later request continues from it (GPU-slot LCP, exact-prefix
+                # continuation, window log)
+                self._slot_tokens.pop(0, None)
+            self._slot_window_log.pop(0, None)
+            self._prefix_prompt_ids = None
+            self._prefix_len = 0
+            with self._slot_lock:
+                st = self.slot_states.get(slot_id, {})
+                st["status"] = "idle"
+                self.slot_states[slot_id] = st
+
+    def _prompt_key(self, ids):
+        return (len(ids), hash(tuple(ids[:256])), hash(tuple(ids[-256:])))
+
+    def _interleave_step(self, B, pos):
+        """Called between the segments of a running prefill (self.lock held, worker thread): one decode step for
+        the active slots, then at most one small admission (DSV41_INTERLEAVE_ADMIT=1, default on)."""
+        if getattr(self, "_interleave_depth", 0) > 0:
+            return
+        self._interleave_depth = 1
+        try:
+            if os.environ.get("DSV41_INTERLEAVE_ADMIT", "1") == "1":
+                self._admit_small_during_prefill(B, pos)
+            # decode the active slots for up to DSV41_INTERLEAVE_DECODE_MS (1500) per boundary: one step per
+            # boundary gave an admitted request one token per segment (~35 s/token); a time budget gives it a
+            # few tokens per second while the long prefill loses ~10 % of its throughput
+            budget = float(os.environ.get("DSV41_INTERLEAVE_DECODE_MS", "1500")) / 1000.0
+            t0 = time.perf_counter()
+            steps = 0
+            while self._active_slots and (steps == 0 or time.perf_counter() - t0 < budget):
+                self._decode_active_once(B)
+                steps += 1
+        finally:
+            self._interleave_depth = 0
+
+    def _next_small_request(self, max_new_tokens):
+        """Like _next_fitting_request, but only a request whose prefill needs at most max_new_tokens new tokens
+        (prompt minus the best host / GPU prefix, per _collect_prefill_observation); image requests excluded."""
+        while True:
+            try:
+                self._batch_waiting.append(self._batch_queue.get_nowait())
+            except queue.Empty:
+                break
+        busy = {self._prompt_key(r.prompt_ids) for r in self._active_slots.values()}
+        for i, req in enumerate(self._batch_waiting):
+            if req.images is not None:
+                continue
+            need = len(req.prompt_ids) + 1
+            fitting = [s for s in self._free_decode_slots if self.slot_cap_tokens(s) >= need]
+            if not fitting or self._prompt_key(req.prompt_ids) in busy:
+                continue
+            try:
+                obs, _entry, best_gpu_slot, best_gpu_lcp, _lcp = self._collect_prefill_observation(req.prompt_ids)
+                new_tokens = int(obs.suffix_tokens)
+            except Exception:
+                new_tokens = len(req.prompt_ids); best_gpu_slot, best_gpu_lcp = 0, 0
+            if new_tokens > max_new_tokens:
+                continue
+            if best_gpu_slot in fitting and best_gpu_slot != 0:
+                slot_id = best_gpu_slot
+            else:
+                slot_id = min(fitting, key=lambda s_: (self.slot_cap_tokens(s_), self._free_decode_slots.index(s_)))
+            self._free_decode_slots.remove(slot_id)
+            cap_left = self.slot_cap_tokens(slot_id) - len(req.prompt_ids) - 1
+            if req.max_new > cap_left:
+                req.max_new = max(1, cap_left)
+            del self._batch_waiting[i]
+            return req, slot_id, best_gpu_slot, best_gpu_lcp, new_tokens
+        return None
+
+    def _save_slot0_state(self, pos):
+        """Host copy of everything a prefill in progress has put into sequence row 0 (positions < pos) plus the
+        engine's slot-0 bookkeeping, so that another request can use slot 0 and the prefill can resume."""
+        shared = self.model.shared
+        snap, _ = self._snapshot_prefix_state(used_tokens=pos)
+        with getattr(self, "_slot_tokens_lock", threading.Lock()):
+            slot_tokens = self._slot_tokens.get(0)
+        return dict(snap=snap, slot_tokens=slot_tokens, wlog=self._slot_window_log.get(0),
+                    prefix_ids=self._prefix_prompt_ids, prefix_len=self._prefix_len, stats=self.last_prefill_stats,
+                    window_log=shared.window_log, window_log_range=list(shared.window_log_range), phase=self.current_phase)
+
+    def _restore_slot0_state(self, saved):
+        shared = self.model.shared
+        self._restore_prefix_state(saved["snap"])
+        with getattr(self, "_slot_tokens_lock", threading.Lock()):
+            if saved["slot_tokens"] is None:
+                self._slot_tokens.pop(0, None)
+            else:
+                self._slot_tokens[0] = saved["slot_tokens"]
+        if saved["wlog"] is None:
+            self._slot_window_log.pop(0, None)
+        else:
+            self._slot_window_log[0] = saved["wlog"]
+        self._prefix_prompt_ids = saved["prefix_ids"]
+        self._prefix_len = saved["prefix_len"]
+        self.last_prefill_stats = saved["stats"]
+        shared.window_log = saved["window_log"]
+        shared.window_log_range = saved["window_log_range"]
+        self.current_phase = saved["phase"]
+
+    def _admit_small_during_prefill(self, B, pos):
+        """At a segment boundary of a long prefill: admit one waiting request that needs at most
+        DSV41_INTERLEAVE_MAX_NEW_TOKENS (16384) new prefill tokens.  Slot 0's partial state is saved to host RAM,
+        the request is prefilled and moved to its decode slot by the ordinary path, slot 0 is restored and the
+        long prefill resumes at `pos`.  Without this, a request arriving during a 340K-token prefill waited for
+        all of it (2026-10-29: 23 minutes)."""
+        if not self._free_decode_slots or (self._batch_queue.empty() and not self._batch_waiting):
+            return
+        max_new = int(os.environ.get("DSV41_INTERLEAVE_MAX_NEW_TOKENS", "16384"))
+        picked = self._next_small_request(max_new)
+        if picked is None:
+            return
+        req, slot_id, best_gpu_slot, best_gpu_lcp, new_tokens = picked
+        t0 = time.perf_counter()
+        saved = self._save_slot0_state(pos)
+        t1 = time.perf_counter()
+        try:
+            self._admit_request(req, slot_id, best_gpu_slot, best_gpu_lcp, B, locked=True)
+        finally:
+            t2 = time.perf_counter()
+            self._restore_slot0_state(saved)
+            print(
+                f"[prefill-interleave] admitted slot={slot_id} prompt={len(req.prompt_ids):,} new={new_tokens:,} "
+                f"during a prefill at {pos:,}: save {t1 - t0:.1f}s, prefill {t2 - t1:.1f}s, restore {time.perf_counter() - t2:.1f}s",
+                flush=True,
+            )
 
     def _decode_active_once(self, B):
         """One batched decode step over the active slots (the body of step 2 of _batch_worker_loop; the caller holds
@@ -5281,127 +5527,7 @@ class Engine:
                 req, slot_id, best_gpu_slot, best_gpu_lcp = picked
                 prefilled_count += 1
 
-                req.slot_id = slot_id
-                with self._slot_lock:
-                    st = self.slot_states.get(slot_id, {})
-                    st["slot_id"] = slot_id
-                    st["status"] = "prefilling"
-                    st["req_id"] = req.req_id
-                    st["prompt_tokens"] = len(req.prompt_ids)
-                    st["reused_tokens"] = best_gpu_lcp
-                    st["reused_slot"] = best_gpu_slot
-                    st["lcp"] = best_gpu_lcp
-                    st["prefill_type"] = "gpu_hit" if best_gpu_lcp > 0 else "cold"
-                    st["suffix_tokens"] = max(0, len(req.prompt_ids) - best_gpu_lcp)
-                    st["generated_tokens"] = 0
-                    st["max_tokens"] = req.max_new
-                    st["start_time"] = time.perf_counter()
-                    st["first_tok_time"] = 0.0
-                    st["elapsed_s"] = 0.0
-                    st["tok_s"] = 0.0
-                    st["recent_text"] = ""
-                    self.slot_states[slot_id] = st
-                try:
-                    with self.lock:
-                        # Prefill using slot 0 (fully compatible with prefix-cache / snapshots / GPU cache);
-                        # between prefill segments the active slots get a decode step (self.lock is held here)
-                        self._prefill_interleave = (lambda: self._decode_active_once(B)) if self._active_slots else None
-                        try:
-                            logits, _reused = self._prefill_with_prefix_reuse(
-                                req.prompt_ids,
-                                images=req.images,
-                                token_types=req.token_types,
-                                req_id=req.req_id,
-                            )
-                        finally:
-                            self._prefill_interleave = None
-                        first_tok = sample_token(logits[0], req.params.temperature, req.params.top_p, req.gen)
-                        # Copy per-sequence cache state from slot 0 to target decode slot
-                        self.rt.copy_seq(0, slot_id, req_id=req.req_id)
-                        _wlog = self._slot_window_log.get(0)
-                        if _wlog is not None:
-                            self._slot_window_log[slot_id] = _wlog
-                        else:
-                            self._slot_window_log.pop(slot_id, None)
-                        with getattr(self, "_slot_tokens_lock", threading.Lock()):
-                            self._slot_tokens[0] = list(req.prompt_ids)
-                            self._slot_tokens[slot_id] = list(req.prompt_ids)
-                        pf_stats = getattr(self, "last_prefill_stats", None)
-                        with self._slot_lock:
-                            st = self.slot_states.get(slot_id, {})
-                            if pf_stats:
-                                st["prefill_type"] = pf_stats.get("prefill_type", st.get("prefill_type", "cold"))
-                                st["lcp"] = pf_stats.get("lcp", st.get("lcp", 0))
-                                st["reused_tokens"] = pf_stats.get("reused_tokens", st.get("reused_tokens", 0))
-                                st["suffix_tokens"] = pf_stats.get("suffix_tokens", max(0, len(req.prompt_ids) - st.get("reused_tokens", 0)))
-                                st["prefill_time_s"] = pf_stats.get("time_s", 0.0)
-                                st["prefill_eff_s"] = pf_stats.get("effective_tok_s", 0.0)
-                            self.slot_states[slot_id] = st
-                        req.pos = len(req.prompt_ids)
-                        req.next_token = first_tok
-                        if first_tok == self.eos:
-                            req.result_text = ""
-                            req.result_count = 0
-                            req.token_queue.put(None)
-                            req.done_event.set()
-                            self._free_decode_slots.append(slot_id)
-                            with self._slot_lock:
-                                st = self.slot_states.get(slot_id, {})
-                                st["status"] = "completed"
-                                st["generated_tokens"] = 0
-                                st["recent_text"] = ""
-                                st["completed_at"] = time.perf_counter()
-                                self.slot_states[slot_id] = st
-                            print(f"[batched-engine] prompt immediately reached EOS for slot={slot_id}", flush=True)
-                        else:
-                            req.out_tokens.append(first_tok)
-                            with getattr(self, "_slot_tokens_lock", threading.Lock()):
-                                if slot_id in self._slot_tokens:
-                                    self._slot_tokens[slot_id].append(first_tok)
-                            req.first_token_time = time.perf_counter()
-                            text = self.tok.decode(req.out_tokens[req.decoded_upto:], errors="replace")
-                            if "\ufffd" not in text:
-                                if text:
-                                    req.token_queue.put((first_tok, text))
-                                req.decoded_upto = len(req.out_tokens)
-                            req.live_text = text
-                            self._active_slots[slot_id] = req
-                            with self._slot_lock:
-                                st = self.slot_states.get(slot_id, {})
-                                st["status"] = "generating"
-                                st["first_tok_time"] = req.first_token_time
-                                st["generated_tokens"] = 1
-                                st["recent_text"] = text
-                                self.slot_states[slot_id] = st
-                            print(f"[batched-engine] prefilled slot={slot_id} prompt_tokens={len(req.prompt_ids)}", flush=True)
-                except Exception as e:
-                    print(f"[batched-engine] prefill error on slot={slot_id}: {e}", flush=True)
-                    traceback.print_exc()
-                    if "out of memory" in str(e).lower() and torch.cuda.is_available():
-                        for d in range(torch.cuda.device_count()):
-                            try:
-                                with torch.cuda.device(d):
-                                    torch.cuda.empty_cache()
-                            except Exception:
-                                pass
-                    req.error = e
-                    req.token_queue.put(None)
-                    req.done_event.set()
-                    self._free_decode_slots.append(slot_id)
-                    with getattr(self, "_slot_tokens_lock", threading.Lock()):
-                        if slot_id in self._slot_tokens:
-                            del self._slot_tokens[slot_id]
-                        # slot 0 (the prefill scratchpad) may be partially overwritten by the failed prefill:
-                        # forget what it held so no later request continues from it (GPU-slot LCP, exact-prefix
-                        # continuation, window log)
-                        self._slot_tokens.pop(0, None)
-                    self._slot_window_log.pop(0, None)
-                    self._prefix_prompt_ids = None
-                    self._prefix_len = 0
-                    with self._slot_lock:
-                        st = self.slot_states.get(slot_id, {})
-                        st["status"] = "idle"
-                        self.slot_states[slot_id] = st
+                self._admit_request(req, slot_id, best_gpu_slot, best_gpu_lcp, B)
 
             # 2. Decode active slots in batch
             if not self._active_slots:
