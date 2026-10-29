@@ -384,6 +384,10 @@ class Engine:
         self.last_policy_decision: PrefillDecision | None = None
         self._prefill_interleave = None   # set by the batch worker while it prefills (see _forward_prefill_segments)
         self._interleave_depth = 0
+        self._slot_img_sig: dict[int, tuple] = {}   # image signature of the prompt each sequence slot holds
+        self._cur_img_sig = ()
+        self._cur_images = None
+        self._cur_token_types = None
 
     def _record_prefill_stats(
         self,
@@ -670,6 +674,15 @@ class Engine:
         logits.  Segments trade a little pipeline fill/drain per segment for bounded decode stalls."""
         seg = int(os.environ.get("DSV41_PREFILL_SEGMENT_TOKENS", "8192"))
         n = len(token_ids)
+        images = getattr(self, "_cur_images", None)
+        if images is not None and start_pos == 0:
+            # image request from zero: a single forward with the images (the vision tower runs at start_pos 0
+            # only, so this prefill is not segmented); token_types sliced to the forwarded span
+            tt = getattr(self, "_cur_token_types", None)
+            tt = tt[:, :n] if (torch.is_tensor(tt) and tt.dim() == 2) else tt
+            dev0 = self.model.blocks[0].device
+            return self.model.forward(torch.tensor([list(token_ids)], dtype=torch.long, device=dev0), 0,
+                                      images=images, token_types=tt)
         if seg <= 0 or n <= seg:
             return self.model.forward(torch.tensor([list(token_ids)], dtype=torch.long), start_pos)
         logits = None
@@ -2167,6 +2180,7 @@ class Engine:
             "created_at": time.time(),
             "prompt_ids": list(ent["prompt_ids"]),
             "base_ids": list(base_ids),
+            "img_sig": [list(x) for x in ent.get("img_sig", ())],
             "bytes": int(ent["bytes"]),
             "slot_signatures": slot_signatures,
             "tensors": tensors,
@@ -2819,6 +2833,7 @@ class Engine:
                 "base_ids": list(
                     payload["base_ids"]
                 ),
+                "img_sig": tuple(tuple(x) for x in (payload.get("img_sig") or [])),
                 "snapshot": snap,
                 "bytes": nbytes,
                 "last_used": float(
@@ -2888,22 +2903,27 @@ class Engine:
     def _find_prefix_cache_entry(
         self,
         prompt_ids,
+        img_sig=(),
     ):
         """Find the deepest cached base that is an exact prefix.
 
         This allows unrelated Claude/LiteLLM request families to coexist
         instead of constantly replacing one global last-request cache.
+        img_sig: an entry qualifies only with the identical image signature and a base past the last image.
         """
         entries = self._prefix_cache_entries()
 
         best = None
         best_base = 0
+        min_base = self._images_min_base(img_sig)
 
         for ent in entries:
             base_ids = ent["base_ids"]
             n = len(base_ids)
 
-            if n <= best_base:
+            if n <= best_base or n < min_base:
+                continue
+            if tuple(ent.get("img_sig", ())) != tuple(img_sig):
                 continue
 
             if len(prompt_ids) < n:
@@ -2958,6 +2978,7 @@ class Engine:
         ent = {
             "prompt_ids": list(prompt_ids),
             "base_ids": list(base_ids),
+            "img_sig": tuple(getattr(self, "_cur_img_sig", ()) or ()),
             "snapshot": snapshot,
             "bytes": int(snapshot_bytes),
             "last_used": now,
@@ -3066,18 +3087,55 @@ class Engine:
 
         return len(entries), total
 
-    def _find_best_gpu_slot(self, prompt_ids: list[int]) -> tuple[int, int]:
+    @staticmethod
+    def _image_signature(images):
+        """Identity of a request's images for prefix reuse: ((start, end, sha256[:32]) per image, in prompt order),
+        () for a text request.  images is what format_chat() returns ([ImageInput, ...] inside a list).  The KV
+        cache of an image span depends on the pixels, so a cached prefix is reused for an image request only when
+        the signatures are identical (same images at the same token positions)."""
+        if not images:
+            return ()
+        out = []
+        for group in images:
+            for im in (group if isinstance(group, (list, tuple)) else [group]):
+                patches = getattr(im, "patches", None)
+                types = getattr(im, "types", None)
+                start = int(getattr(im, "start", 0))
+                n = int(types.numel()) if torch.is_tensor(types) else 0
+                if torch.is_tensor(patches):
+                    flat = patches.detach().cpu().contiguous().view(-1)
+                    digest = hashlib.sha256(flat.view(torch.uint8).numpy().tobytes()).hexdigest()[:32]
+                else:
+                    digest = hashlib.sha256(repr(patches).encode()).hexdigest()[:32]
+                out.append((start, start + n, digest))
+        return tuple(out)
+
+    @staticmethod
+    def _images_min_base(img_sig) -> int:
+        """First position after the last image token: a reused prefix must reach it, because continuation forwards
+        (start_pos > 0) do not embed images (model._forward_sequential applies the vision tower at start_pos 0 only)."""
+        return max((int(e) for _s, e, _h in img_sig), default=0)
+
+    def _find_best_gpu_slot(self, prompt_ids: list[int], img_sig=()) -> tuple[int, int]:
         """Find the GPU sequence slot with the longest common prefix against prompt_ids.
-        Returns (best_slot, best_lcp_length). If no slot matches, returns (-1, 0)."""
+        Returns (best_slot, best_lcp_length). If no slot matches, returns (-1, 0).
+        img_sig: the request's image signature; a slot qualifies only with the identical signature and a common
+        prefix covering every image."""
         best_slot = -1
         best_lcp = 0
+        min_base = self._images_min_base(img_sig)
         with getattr(self, "_slot_tokens_lock", threading.Lock()):
             items = list(self._slot_tokens.items())
+            sigs = dict(getattr(self, "_slot_img_sig", {}))
 
         for slot_id, tokens in items:
             if not tokens:
                 continue
+            if tuple(sigs.get(slot_id, ())) != tuple(img_sig):
+                continue
             lcp = self._prompt_lcp(tokens, prompt_ids)
+            if lcp < min_base:
+                continue
             # Prefer slot 0 on tie because slot 0 is already the prefill scratchpad
             if lcp > best_lcp or (lcp == best_lcp and slot_id == 0 and best_slot != 0):
                 best_lcp = lcp
@@ -3096,14 +3154,15 @@ class Engine:
     def _collect_prefill_observation(
         self,
         prompt_ids: list[int],
+        img_sig=(),
     ) -> tuple[PrefillObservation, dict | None, int, int, int]:
         """Extract multi-level cache and resource state for policy selection."""
         total = len(prompt_ids)
-        best_gpu_slot, best_gpu_lcp = self._find_best_gpu_slot(prompt_ids)
+        best_gpu_slot, best_gpu_lcp = self._find_best_gpu_slot(prompt_ids, img_sig)
         min_gpu_prefix = int(os.environ.get("DSV41_GPU_PREFIX_MIN", "64"))
         has_gpu_slot = (best_gpu_slot >= 0 and best_gpu_lcp >= min_gpu_prefix)
 
-        entry = self._find_prefix_cache_entry(prompt_ids)
+        entry = self._find_prefix_cache_entry(prompt_ids, img_sig)
         has_anchor = (entry is not None and len(entry.get("base_ids", [])) > 0)
         anchor_base_tokens = len(entry["base_ids"]) if has_anchor else 0
 
@@ -3406,6 +3465,8 @@ class Engine:
         finally:
             lo, hi = shared.window_log_range
             shared.window_log = None
+            self._cur_images = None
+            self._cur_token_types = None
         if 0 <= lo < hi:
             self._slot_window_log[0] = (buf, int(lo), int(hi))
         else:
@@ -3420,35 +3481,15 @@ class Engine:
         token_types=None,
         req_id: str = "",
     ):
-        if images is not None:
-            _t0 = time.perf_counter()
-            dev0 = self.model.blocks[0].device
-            logits = self.model.forward(
-                torch.tensor([prompt_ids], dtype=torch.long, device=dev0),
-                0,
-                images=images,
-                token_types=token_types,
-            )
-            if torch.is_tensor(logits) and logits.is_cuda:
-                torch.cuda.synchronize(logits.device)
-            _dt = time.perf_counter() - _t0
-            _n = len(prompt_ids)
-            print(
-                f"[vision-prefill] full-prefill tokens={_n:,} "
-                f"time={_dt:.3f}s "
-                f"tok_s={_n/max(_dt,1e-9):,.1f}",
-                flush=True,
-            )
-            self._remember_prefill_prefix(prompt_ids)
-            self._record_prefill_stats(
-                mode="cold_vision",
-                total=_n,
-                reused=0,
-                new_tokens=_n,
-                dt=_dt,
-                prefill_type="cold_vision",
-            )
-            return logits, 0
+        # Image requests used to bypass every cache (full prefill each turn: 7 minutes per turn of a 115K-token
+        # session with one screenshot, 2026-10-29).  They now take the ordinary path with two rules: a cached
+        # prefix (host entry or GPU slot) qualifies only with the identical image signature, and the reused base
+        # must lie past the last image token so that every continuation forward is text-only (the vision tower
+        # runs at start_pos 0 only).  A cold prefill of an image request is one from-zero forward with the images
+        # (_forward_prefill_segments), exactly what the bypass did, and it now also stores the snapshot.
+        self._cur_img_sig = self._image_signature(images) if images is not None else ()
+        self._cur_images = images
+        self._cur_token_types = token_types
 
         # ------------------------------------------------------------
         # Debug correctness switch.
@@ -3526,7 +3567,9 @@ class Engine:
         # ------------------------------------------------------------
         # Prefill execution policy (deterministic heuristic, dsv41/prefill_policy.py)
         # ------------------------------------------------------------
-        obs, entry, best_gpu_slot, best_gpu_lcp, lcp = self._collect_prefill_observation(prompt_ids)
+        obs, entry, best_gpu_slot, best_gpu_lcp, lcp = self._collect_prefill_observation(prompt_ids, self._cur_img_sig)
+        with getattr(self, "_slot_tokens_lock", threading.Lock()):
+            self._slot_img_sig[0] = self._cur_img_sig     # slot 0 is about to hold this prompt
 
         if entry is not None:
             old_prompt = entry["prompt_ids"]
@@ -3542,6 +3585,10 @@ class Engine:
             old_base = 0
 
         target_base = max(0, total - guard)
+        _min_base = self._images_min_base(self._cur_img_sig)
+        if _min_base and target_base < _min_base:
+            # the snapshot base must cover every image: the tail replay is text-only
+            target_base = min(_min_base, max(0, total - 1))
         reusable = (entry is not None and old_base > 0)
 
         forced = getattr(self, "_forced_prefill_policy_once", None)
@@ -3586,6 +3633,8 @@ class Engine:
         gpu_reuse_pos = None
         if decision.policy == "reuse_gpu_slot" and use_gpu_cache and best_gpu_slot >= 0 and best_gpu_lcp >= min_gpu_prefix:
             gpu_reuse_pos = self._gpu_slot_reuse_pos(best_gpu_slot, best_gpu_lcp, total)
+            if gpu_reuse_pos is not None and gpu_reuse_pos < _min_base:
+                gpu_reuse_pos = None    # the continuation would have to embed an image: not supported
             if gpu_reuse_pos is None:
                 print(
                     f"[gpu-slot-cache] SKIP best_slot={best_gpu_slot} lcp={best_gpu_lcp:,}: "
@@ -3919,13 +3968,7 @@ class Engine:
         # Very small prompts: ordinary full prefill.  There is no
         # meaningful stable base to snapshot yet.
         if target_base <= 0:
-            logits = self.model.forward(
-                torch.tensor(
-                    [prompt_ids],
-                    dtype=torch.long,
-                ),
-                0,
-            )
+            logits = self._forward_prefill_segments(prompt_ids, 0)
 
             # Too small to snapshot.  Do not destroy unrelated
             # cached sessions.
@@ -5001,7 +5044,7 @@ class Engine:
             if k in busy:
                 continue
             # Smart slot assignment: if a GPU slot retains the best prefix and is currently free, reuse it!
-            best_gpu_slot, best_gpu_lcp = (0, 0) if req.images is not None else self._find_best_gpu_slot(req.prompt_ids)
+            best_gpu_slot, best_gpu_lcp = self._find_best_gpu_slot(req.prompt_ids, self._image_signature(req.images))
             if best_gpu_slot in fitting and best_gpu_slot != 0:
                 slot_id = best_gpu_slot
             else:
@@ -5067,6 +5110,7 @@ class Engine:
                 with getattr(self, "_slot_tokens_lock", threading.Lock()):
                     self._slot_tokens[0] = list(req.prompt_ids)
                     self._slot_tokens[slot_id] = list(req.prompt_ids)
+                    self._slot_img_sig[slot_id] = self._slot_img_sig.get(0, ())
                 pf_stats = getattr(self, "last_prefill_stats", None)
                 with self._slot_lock:
                     st = self.slot_states.get(slot_id, {})
@@ -5178,14 +5222,13 @@ class Engine:
                 break
         busy = {self._prompt_key(r.prompt_ids) for r in self._active_slots.values()}
         for i, req in enumerate(self._batch_waiting):
-            if req.images is not None:
-                continue
             need = len(req.prompt_ids) + 1
             fitting = [s for s in self._free_decode_slots if self.slot_cap_tokens(s) >= need]
             if not fitting or self._prompt_key(req.prompt_ids) in busy:
                 continue
             try:
-                obs, _entry, best_gpu_slot, best_gpu_lcp, _lcp = self._collect_prefill_observation(req.prompt_ids)
+                obs, _entry, best_gpu_slot, best_gpu_lcp, _lcp = self._collect_prefill_observation(
+                    req.prompt_ids, self._image_signature(req.images))
                 # the tokens the prefill will really compute: the suffix if the policy reuses a prefix, else all
                 decision = decide_policy(obs)
                 new_tokens = len(req.prompt_ids) if decision.policy in ("full_prefill", "safe_recompute") else int(obs.suffix_tokens)
@@ -5212,7 +5255,7 @@ class Engine:
         snap, _ = self._snapshot_prefix_state(used_tokens=pos)
         with getattr(self, "_slot_tokens_lock", threading.Lock()):
             slot_tokens = self._slot_tokens.get(0)
-        return dict(snap=snap, slot_tokens=slot_tokens, wlog=self._slot_window_log.get(0),
+        return dict(snap=snap, slot_tokens=slot_tokens, slot_sig=self._slot_img_sig.get(0), wlog=self._slot_window_log.get(0),
                     prefix_ids=self._prefix_prompt_ids, prefix_len=self._prefix_len, stats=self.last_prefill_stats,
                     window_log=shared.window_log, window_log_range=list(shared.window_log_range), phase=self.current_phase)
 
@@ -5224,6 +5267,10 @@ class Engine:
                 self._slot_tokens.pop(0, None)
             else:
                 self._slot_tokens[0] = saved["slot_tokens"]
+            if saved.get("slot_sig") is None:
+                self._slot_img_sig.pop(0, None)
+            else:
+                self._slot_img_sig[0] = saved["slot_sig"]
         if saved["wlog"] is None:
             self._slot_window_log.pop(0, None)
         else:
