@@ -2741,7 +2741,7 @@ class Engine:
                         or (
                             kind in ("dict", "attr")
                             and src.ndim == dst.ndim
-                            and tuple(src.shape[:1]) == tuple(dst.shape[:1])
+                            and src.shape[0] <= dst.shape[0]      # saved as row 0 only; restore writes dst[:src rows]
                             and tuple(src.shape[2:]) == tuple(dst.shape[2:])
                             and src.shape[1] <= dst.shape[1]
                         )
