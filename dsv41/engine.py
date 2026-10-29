@@ -2716,21 +2716,22 @@ class Engine:
                     and src.dtype == dst.dtype
                     and kind == "dict"
                     and src.ndim == dst.ndim
-                    and tuple(src.shape[:1]) == tuple(dst.shape[:1])
+                    and src.shape[0] <= dst.shape[0]
                     and tuple(src.shape[2:]) == tuple(dst.shape[2:])
                     and src.shape[1] > dst.shape[1]
                 ):
+                    # the live table starts at DSV41_CACHE_INIT_TOKENS rows: grow it to the saved prefix
                     try:
                         owner = key[0] if isinstance(key, tuple) else None
-                        table_kind = "index_k" if "index_k" in str(key) or "index_k" in str(holder) else "compress_kv"
                         shared = getattr(self.model, "shared", None)
-                        if shared and hasattr(shared, "grow_cache_rows") and owner is not None:
-                            shared.grow_cache_rows(table_kind, owner, src.shape[1])
-                            table = getattr(shared, table_kind, None)
-                            if table and key in table:
+                        table = holder if isinstance(holder, dict) else None
+                        table_kind = "index_k" if (shared is not None and holder is getattr(shared, "index_k", None)) else "compress_kv"
+                        if shared is not None and table is not None and owner is not None:
+                            shared._ensure_capacity(table, owner, int(src.shape[1]), table_kind)
+                            if key in table:
                                 dst = table[key]
                     except Exception as grow_err:
-                        pass
+                        print(f"[prefix-tmpfs] grow for restore failed key={key!r} rows={src.shape[1]}: {grow_err}", flush=True)
 
                 _shape_ok = (
                     torch.is_tensor(src)
@@ -2748,6 +2749,12 @@ class Engine:
                     )
                 )
                 if not _shape_ok:
+                    print(
+                        f"[prefix-tmpfs] layout mismatch kind={kind} key={str(key)[:60]} "
+                        f"src={tuple(src.shape) if torch.is_tensor(src) else type(src).__name__}/{getattr(src, 'dtype', None)} "
+                        f"dst={tuple(dst.shape) if torch.is_tensor(dst) else type(dst).__name__}/{getattr(dst, 'dtype', None)}",
+                        flush=True,
+                    )
                     bad = True
                     break
 
