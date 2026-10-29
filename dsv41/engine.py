@@ -5186,7 +5186,9 @@ class Engine:
                 continue
             try:
                 obs, _entry, best_gpu_slot, best_gpu_lcp, _lcp = self._collect_prefill_observation(req.prompt_ids)
-                new_tokens = int(obs.suffix_tokens)
+                # the tokens the prefill will really compute: the suffix if the policy reuses a prefix, else all
+                decision = decide_policy(obs)
+                new_tokens = len(req.prompt_ids) if decision.policy in ("full_prefill", "safe_recompute") else int(obs.suffix_tokens)
             except Exception:
                 new_tokens = len(req.prompt_ids); best_gpu_slot, best_gpu_lcp = 0, 0
             if new_tokens > max_new_tokens:

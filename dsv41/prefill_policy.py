@@ -133,7 +133,12 @@ def decide_policy(obs: PrefillObservation, reason: str = "heuristic") -> Prefill
             model="heuristic-rule",
         )
 
-    if obs.gpu_min_free_mem_gb < 0.2:
+    # Low free VRAM used to force a cold recompute (and evict the matching entry). That is backwards: restoring a
+    # snapshot and replaying the suffix needs less transient memory than a cold prefill of the whole prompt, and
+    # nvml's "free" ignores PyTorch's reusable cached blocks, so during a long prefill it reads ~0 and every
+    # concurrent request went cold (2026-10-29: 47K-token cold prefills instead of 2.6K-token replays).
+    # DSV41_SAFE_RECOMPUTE_FREE_GB > 0 re-enables the rule with that threshold.
+    if obs.gpu_min_free_mem_gb < float(os.environ.get("DSV41_SAFE_RECOMPUTE_FREE_GB", "0")):
         return PrefillDecision(
             policy="safe_recompute",
             block_size=0,
