@@ -53,7 +53,7 @@ class DecodeRuntime:
         S = self.S = args.max_seqs or B  # sequence slots (the caches are sized by it)
         self.seq = {d: torch.arange(B, dtype=torch.int64, device=d) % S for d in self.devices}
         self.slot_layout = getattr(model.shared, "slot_layout", None)
-        if self.slot_layout is not None:
+        if getattr(self, "slot_layout", None) is not None:
             # rows used by the batch are the decode slots' rows (never the scratchpad's or an aliased unit)
             rows = (self.slot_layout.decode_rows * (B // len(self.slot_layout.decode_rows) + 1))[:B]
             self.seq = {d: torch.tensor(rows, dtype=torch.int64, device=d) for d in self.devices}
@@ -176,7 +176,7 @@ class DecodeRuntime:
     def _no_write_row(self, A, d, compress_len, cache):
         """Row written by sequences that produce no compressed row this step: the table's spare last row, or
         under DSV41_SLOT_CAPS the last row of each sequence's own capacity (never a live position)."""
-        if self.slot_layout is None:
+        if getattr(self, "slot_layout", None) is None:
             return torch.full_like(compress_len, cache.shape[1] - 1)
         return self._dummy_tab[(d, int(A.ratio))][self.seq[d]]
 
@@ -217,7 +217,7 @@ class DecodeRuntime:
                 val.copy_(latent)
                 idx.copy_(row)
             ckv = self.m.shared.compress_kv[(self.kv_owner, d)]
-            if self.slot_layout is not None:
+            if getattr(self, "slot_layout", None) is not None:
                 raise RuntimeError("DSV41_SLOT_CAPS: the eager decode attention path does not support the flat cache layout")
             o = sparse_attn_decode2(q, A.window_kv_cache, ckv, A.attn_sink, torch.cat([widx, idxs], dim=-1), A.softmax_scale)
         else:
@@ -602,7 +602,7 @@ class DecodeRuntime:
                     with torch.inference_mode(False):
                         table[key] = cache.clone()
                         cache = table[key]
-                if self.slot_layout is not None:
+                if getattr(self, "slot_layout", None) is not None:
                     # copy only within the two slots' own capacities (rows past a slot's units belong to others)
                     caps = self.slot_layout.cap_rows(int(self.m.blocks[key[0]].attn.ratio))
                     n = min(caps[src], caps[dst])
