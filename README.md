@@ -228,6 +228,11 @@ mainplane chat
 
 `context_limit` must stay below the server's `max_seq_len` minus the answer (512K profile: 524,288). The round trip was verified with mainplane's own `pkg/provider` code (compile → stream → records): thinking, text and call records, `stop=tool_calls`, and on the second turn of a session `cache_read` = the reused prefix.
 
+Running mainplane **on the server machine itself, loopback only** (no Cloudflare tunnel, no public network name; harness,
+admin worker and CLI on 127.0.0.1): [tools/mainplane-local/README.md](tools/mainplane-local/README.md). Verified
+2026-10-30: a session on `dsv41/deepseek-v4.1-flash` called `run` on the admin worker (`nvidia-smi`), got the result
+back and answered; the model's DSML call came through as a `tool_calls` step.
+
 ### Real-Time Monitoring Web Dashboard (`/dashboard`)
 
 ![Live Inference & Prefill Monitor Dashboard](assets/dashboard.jpg)

@@ -1,0 +1,19 @@
+diff --git a/pkg/coordinator/coordinator.go b/pkg/coordinator/coordinator.go
+index 47a2871..0eb9cb1 100644
+--- a/pkg/coordinator/coordinator.go
++++ b/pkg/coordinator/coordinator.go
+@@ -643,7 +643,13 @@ func tail(n *node) *tailcfg.Node {
+ func (c *Coordinator) relayMap() *tailcfg.DERPMap {
+ 	var nodes []*tailcfg.DERPNode
+ 	if c.host != "" {
+-		nodes = append(nodes, &tailcfg.DERPNode{Name: "harness", RegionID: region, HostName: c.host, DERPPort: 443, STUNPort: -1})
++		n := &tailcfg.DERPNode{Name: "harness", RegionID: region, HostName: c.host, DERPPort: 443, STUNPort: -1}
++		// dsv41 local build: a harness reached at https://localhost (loopback-only run, no tunnel, no proxy on 443)
++		// relays through its own loopback HTTP port, plain ws, where /derp is served.
++		if ip := net.ParseIP(c.host); c.host == "localhost" || ip != nil && ip.IsLoopback() {
++			n.DERPPort, n.InsecureForTests = 8080, true
++		}
++		nodes = append(nodes, n)
+ 	}
+ 	nodes = append(nodes,
+ 		&tailcfg.DERPNode{Name: "stun-cloudflare", RegionID: region, HostName: "stun.cloudflare.com", STUNPort: 3478, STUNOnly: true},
