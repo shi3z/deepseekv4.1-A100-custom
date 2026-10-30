@@ -29,6 +29,29 @@ ENGINE: Engine | None = None
 STATS_TRACKER: StatsTracker | None = None
 
 
+def _usage(n_prompt: int, n_out: int, info: dict | None = None) -> dict:
+    """OpenAI usage block with the prefix-cache hit in the spellings clients read: prompt_tokens_details.cached_tokens
+    (OpenAI), prompt_cache_hit_tokens / prompt_cache_miss_tokens (DeepSeek; mainplane reads both).  cached = prompt
+    tokens whose K/V came from a GPU slot or a host/tmpfs prefix snapshot instead of a forward (engine prefill stats
+    reused_tokens of THIS request), clamped to the prompt."""
+    cached = max(0, min(int((info or {}).get("cached_tokens", 0) or 0), int(n_prompt)))
+    return {"prompt_tokens": n_prompt, "completion_tokens": n_out, "total_tokens": n_prompt + n_out,
+            "prompt_tokens_details": {"cached_tokens": cached},
+            "prompt_cache_hit_tokens": cached, "prompt_cache_miss_tokens": n_prompt - cached}
+
+
+def _client_opts(body: dict) -> tuple[str, bool]:
+    """(prompt_cache_key, stream_options.include_usage) of a request.  prompt_cache_key (OpenAI; mainplane sends its
+    session's first record id, a copied session shares it) is kept with the slot state and the prefix-cache entries the
+    request makes and is logged; prefix matching itself stays by tokens.  include_usage asks for the usage chunk
+    (choices: []) after the finish chunk of a stream."""
+    key = body.get("prompt_cache_key") or body.get("cache_key") or ""
+    key = str(key)[:128] if isinstance(key, (str, int)) else ""
+    so = body.get("stream_options")
+    include_usage = bool(isinstance(so, dict) and so.get("include_usage"))
+    return key, include_usage
+
+
 def _params(body: dict) -> GenParams:
     stop = body.get("stop") or []
     if isinstance(stop, str):
@@ -475,8 +498,11 @@ class Handler(BaseHTTPRequestHandler):
         rid = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created = int(time.time())
         t0 = time.perf_counter()
+        cache_key, include_usage = _client_opts(body)
+        info: dict = {}   # filled by the engine with this request's prefill stats / finish reason (see Engine._request_info)
         print(
           f"[chat] START req_id={rid} prompt_tokens={len(ids)} "
+          f"cache_key={cache_key or '-'} "
           f"max_seq_len={eng.max_seq_len} "
           f"max_tokens={params.max_new_tokens} (effective) "
           f"stream={body.get('stream')} "
@@ -525,7 +551,8 @@ class Handler(BaseHTTPRequestHandler):
 
             try:
                 chunk({"role": "assistant"})
-                for tok_id, piece in eng.generate_stream(ids, params, images=images, token_types=token_types):
+                for tok_id, piece in eng.generate_stream(ids, params, images=images, token_types=token_types,
+                                                         req_id=rid, cache_key=cache_key, info=info):
                     if not piece:
                         continue
                     full_pieces.append(piece)
@@ -565,12 +592,18 @@ class Handler(BaseHTTPRequestHandler):
 
                 if tool_calls:
                     finish = "tool_calls"
-                elif getattr(eng, "last_finish_reason", None) == "length" or n >= params.max_new_tokens:
+                elif (info.get("finish_reason") or getattr(eng, "last_finish_reason", None)) == "length" or n >= params.max_new_tokens:
                     finish = "length"
                 else:
                     finish = "stop"
 
                 chunk({}, finish)
+                if include_usage:
+                    # OpenAI stream_options.include_usage: one more chunk, no choices, the usage (mainplane, OpenCode,
+                    # LiteLLM read cached tokens from here).
+                    obj = {"id": rid, "object": "chat.completion.chunk", "created": created,
+                           "model": body.get("model") or eng.model_name, "choices": [], "usage": _usage(len(ids), n, info)}
+                    ka.write(("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode("utf-8"))
                 ka.write(b"data: [DONE]\n\n")
                 self.close_connection = True
 
@@ -618,7 +651,7 @@ class Handler(BaseHTTPRequestHandler):
         t_gen_0 = time.perf_counter()
         ka = self._begin_json_keepalive()
         try:
-            text, n = eng.generate_text(ids, params, images=images, token_types=token_types)
+            text, n = eng.generate_text(ids, params, images=images, token_types=token_types, req_id=rid, cache_key=cache_key, info=info)
         except Exception as e:
             tb = traceback.format_exc()
             print(f"\n[chat-error] non-streaming generation failed req_id={rid}: {e}\n{tb}", flush=True)
@@ -639,8 +672,8 @@ class Handler(BaseHTTPRequestHandler):
         content = msg.get("content") if isinstance(msg, dict) else text
         out = {"id": rid, "object": "chat.completion", "created": created, "model": body.get("model") or eng.model_name,
                "choices": [{"index": 0, "message": {"role": "assistant", "content": content if content is not None else text},
-                            "finish_reason": "tool_calls" if (isinstance(msg, dict) and msg.get("tool_calls")) else ("length" if (getattr(eng, "last_finish_reason", None) == "length" or n >= params.max_new_tokens) else "stop")}],
-               "usage": {"prompt_tokens": len(ids), "completion_tokens": n, "total_tokens": len(ids) + n}}
+                            "finish_reason": "tool_calls" if (isinstance(msg, dict) and msg.get("tool_calls")) else ("length" if ((info.get("finish_reason") or getattr(eng, "last_finish_reason", None)) == "length" or n >= params.max_new_tokens) else "stop")}],
+               "usage": _usage(len(ids), n, info)}
         if isinstance(msg, dict) and msg.get("reasoning_content"):
             out["choices"][0]["message"]["reasoning_content"] = msg["reasoning_content"]
         if isinstance(msg, dict) and msg.get("tool_calls"):
@@ -675,6 +708,7 @@ class Handler(BaseHTTPRequestHandler):
         if len(ids) + 1 > eng.max_seq_len:
             return self._context_length_error(len(ids), t0=t0)
         params = _params(body)
+        info: dict = {}
         rid = f"cmpl-{uuid.uuid4().hex[:24]}"
         created = int(time.time())
         if body.get("stream"):
@@ -714,7 +748,7 @@ class Handler(BaseHTTPRequestHandler):
         t_gen_0 = time.perf_counter()
         ka = self._begin_json_keepalive()
         try:
-            text, n = eng.generate_text(ids, params, images=images, token_types=token_types)
+            text, n = eng.generate_text(ids, params, images=images, token_types=token_types, info=info)
         except Exception as e:
             tb = traceback.format_exc()
             print(f"\n[completion-error] generation failed req_id={rid}: {e}\n{tb}", flush=True)
@@ -732,7 +766,7 @@ class Handler(BaseHTTPRequestHandler):
             )
         self._json(200, {"id": rid, "object": "text_completion", "created": created, "model": body.get("model") or eng.model_name,
                           "choices": [{"index": 0, "text": text, "finish_reason": "length" if (getattr(eng, "last_finish_reason", None) == "length" or n >= params.max_new_tokens) else "stop"}],
-                          "usage": {"prompt_tokens": len(ids), "completion_tokens": n, "total_tokens": len(ids) + n}}, t0=t0, is_stream=False, ka=ka)
+                          "usage": _usage(len(ids), n, info)}, t0=t0, is_stream=False, ka=ka)
 
     # ---------------------------------------------------------------- schema requests
     def _schema_to_chat(self, body: dict) -> dict:

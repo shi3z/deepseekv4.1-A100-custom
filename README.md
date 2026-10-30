@@ -200,6 +200,34 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 The server provides `/health`, `/v1/models`, `/v1/chat/completions`, `/v1/completions`, and `/dashboard` (plus `/api/metrics`).
 
+### OpenAI-compatible agent clients (mainplane, OpenCode, LiteLLM) — 2026-10-30
+
+`/v1/chat/completions` speaks the Chat Completions dialect these harnesses expect from a DeepSeek-style server:
+
+| Request field | What the server does |
+|---|---|
+| `tools` (function tools) | passed to the DeepSeek chat template; the model's DSML calls come back as `tool_calls` (one streamed delta per call, `finish_reason: "tool_calls"`); `role: tool` results with `tool_call_id` go back in |
+| `reasoning_content` on assistant turns | accepted (replayed thinking); the server streams its own thinking as `delta.reasoning_content` |
+| `prompt_cache_key` | kept with the request's slot state and the prefix-cache entries it creates, logged in `[chat] START … cache_key=`; the prefix match itself stays token-based (longest common prefix over GPU slots and host/tmpfs snapshots), so the key is a label for the dashboard and the logs, not a routing requirement |
+| `stream_options.include_usage` | one more chunk after the finish chunk with `choices: []` and the `usage` |
+
+`usage` (stream and non-stream) carries the prefix-cache hit of **this** request in the spellings clients read: `prompt_tokens_details.cached_tokens` (OpenAI), `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` (DeepSeek). Cached = prompt tokens whose K/V came from a GPU slot or a host/tmpfs snapshot instead of a forward (the engine's `reused_tokens`; per request, not the engine-wide last prefill).
+
+**mainplane** ([github.com/mainplane-ai/mainplane](https://github.com/mainplane-ai/mainplane)) uses this server through its `openai-chat` shape. Its harness must reach the server (LAN or Tailscale address; the server has no auth, so keep it on a trusted network). On the harness machine:
+
+```bash
+# providers are free names + a shape; the key is required by mainplane but ignored here
+mainplane-server install   # once; then add to /var/lib/mainplane-server/config.json:
+#   "providers": {"dsv41": {"shape": "openai-chat", "url": "http://<server>:8000/v1", "key": "local"}}
+# or, from a logged-in CLI, without editing the file:
+#   curl -X PUT "$HARNESS/providers/dsv41" -H "Authorization: Bearer mp_key_..." \
+#        -d '{"shape":"openai-chat","url":"http://<server>:8000/v1","key":"local"}'
+echo '{"model":"dsv41/deepseek-v4.1-flash","tools":"default","context_limit":480000,"workers":[{"name":"admin"}]}' | mainplane new
+mainplane chat
+```
+
+`context_limit` must stay below the server's `max_seq_len` minus the answer (512K profile: 524,288). The round trip was verified with mainplane's own `pkg/provider` code (compile → stream → records): thinking, text and call records, `stop=tool_calls`, and on the second turn of a session `cache_read` = the reused prefix.
+
 ### Real-Time Monitoring Web Dashboard (`/dashboard`)
 
 ![Live Inference & Prefill Monitor Dashboard](assets/dashboard.jpg)

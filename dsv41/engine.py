@@ -146,8 +146,10 @@ def detect_loop(
 
 
 class _BatchRequest:
-    def __init__(self, prompt_ids: list[int], params: GenParams, max_new: int, gen: torch.Generator | None, req_id: str = "", images=None, token_types=None):
+    def __init__(self, prompt_ids: list[int], params: GenParams, max_new: int, gen: torch.Generator | None, req_id: str = "", images=None, token_types=None, cache_key: str = ""):
         self.req_id = req_id or f"req_{id(self):x}"
+        self.cache_key = cache_key or ""          # the client's prompt_cache_key (mainplane: the session's first record id)
+        self.prefill_stats: dict | None = None    # this request's prefill stats (engine.last_prefill_stats is shared, this is not)
         self.prompt_ids = prompt_ids
         self.params = params
         self.max_new = max_new
@@ -427,6 +429,7 @@ class Engine:
             "new_tok_s": round(new_tokens / max(dt, 1e-9), 1),
             "effective_tok_s": round(total / max(dt, 1e-9), 1),
             "timestamp": time.time(),
+            "cache_key": str(getattr(self, "_cur_cache_key", "") or ""),
         }
         self.current_context_tokens = total
         self.prefill_history.append(self.last_prefill_stats)
@@ -2979,6 +2982,7 @@ class Engine:
             "prompt_ids": list(prompt_ids),
             "base_ids": list(base_ids),
             "img_sig": tuple(getattr(self, "_cur_img_sig", ()) or ()),
+            "cache_key": str(getattr(self, "_cur_cache_key", "") or ""),
             "snapshot": snapshot,
             "bytes": int(snapshot_bytes),
             "last_used": now,
@@ -4334,10 +4338,10 @@ class Engine:
             }
 
     @torch.inference_mode()
-    def generate(self, prompt_ids: list[int], p: GenParams, images=None, token_types=None) -> Iterator[tuple[int, str]]:
+    def generate(self, prompt_ids: list[int], p: GenParams, images=None, token_types=None, cache_key: str = "") -> Iterator[tuple[int, str]]:
         """Yields (token_id, text_piece) as they are produced."""
         if getattr(self, "max_seqs", 1) > 1:
-            yield from self.generate_stream(prompt_ids, p, images=images, token_types=token_types)
+            yield from self.generate_stream(prompt_ids, p, images=images, token_types=token_types, cache_key=cache_key)
             return
         assert len(prompt_ids) < self.max_seq_len, f"prompt of {len(prompt_ids)} tokens exceeds max_seq_len={self.max_seq_len}"
         # MTP keeps DSpark resident on GPU4. At very long cold-prefill
@@ -4368,7 +4372,7 @@ class Engine:
             # Keep plain mode after unloading DSpark. Restoring self.mtp here
             # races with concurrent Claude retries that can enter the MTP
             # path while ds is still absent. A server restart re-enables MTP.
-            yield from self.generate(prompt_ids, p, images=images, token_types=token_types)
+            yield from self.generate(prompt_ids, p, images=images, token_types=token_types, cache_key=cache_key)
             return
         max_new = min(p.max_new_tokens, self.max_seq_len - len(prompt_ids) - 1)
         # Claude may request 32K output even for a 100K+ context. Keep
@@ -4384,6 +4388,7 @@ class Engine:
         with self.lock:
             self.current_phase = "prefill"
             self.current_context_tokens = len(prompt_ids)
+            self._cur_cache_key = cache_key or ""
             try:
                 if self.mtp and images is None:
                     yield from self._generate_mtp_locked(
@@ -4988,15 +4993,19 @@ class Engine:
             )
 
     @torch.inference_mode()
-    def generate_text(self, prompt_ids: list[int], p: GenParams, images=None, token_types=None) -> tuple[str, int]:
+    def generate_text(self, prompt_ids: list[int], p: GenParams, images=None, token_types=None, req_id: str = "",
+                      cache_key: str = "", info: dict | None = None) -> tuple[str, int]:
         if self.max_seqs <= 1:
             pieces, n = [], 0
-            for _, piece in self.generate(prompt_ids, p, images=images, token_types=token_types):
+            for _, piece in self.generate(prompt_ids, p, images=images, token_types=token_types, cache_key=cache_key):
                 pieces.append(piece)
                 n += 1
+            self._request_info(info, getattr(self, "last_prefill_stats", None), getattr(self, "last_finish_reason", None),
+                               getattr(self, "last_decode_tok_s", None), cache_key)
             return "".join(pieces), n
 
-        return self._generate_text_batched(prompt_ids, p, images=images, token_types=token_types)
+        return self._generate_text_batched(prompt_ids, p, images=images, token_types=token_types, req_id=req_id,
+                                           cache_key=cache_key, info=info)
 
     def _init_batch_scheduler(self):
         self._batch_queue: queue.Queue[_BatchRequest] = queue.Queue()
@@ -5068,6 +5077,7 @@ class Engine:
             st["slot_id"] = slot_id
             st["status"] = "prefilling"
             st["req_id"] = req.req_id
+            st["cache_key"] = req.cache_key
             st["prompt_tokens"] = len(req.prompt_ids)
             st["reused_tokens"] = best_gpu_lcp
             st["reused_slot"] = best_gpu_slot
@@ -5089,6 +5099,7 @@ class Engine:
                 # waiting request needs little new prefill, its admission (slot 0 saved and restored around it).
                 if not locked:
                     self._prefill_interleave = (lambda pos: self._interleave_step(B, pos))
+                self._cur_cache_key = req.cache_key
                 try:
                     logits, _reused = self._prefill_with_prefix_reuse(
                         req.prompt_ids,
@@ -5112,6 +5123,7 @@ class Engine:
                     self._slot_tokens[slot_id] = list(req.prompt_ids)
                     self._slot_img_sig[slot_id] = self._slot_img_sig.get(0, ())
                 pf_stats = getattr(self, "last_prefill_stats", None)
+                req.prefill_stats = dict(pf_stats) if pf_stats else None   # under self.lock: these stats are this prefill's
                 with self._slot_lock:
                     st = self.slot_states.get(slot_id, {})
                     if pf_stats:
@@ -5586,9 +5598,27 @@ class Engine:
             with self.lock:
                 self._decode_active_once(B)
     @torch.inference_mode()
-    def generate_stream(self, prompt_ids: list[int], p: GenParams, images=None, token_types=None) -> Iterator[tuple[int, str]]:
+    @staticmethod
+    def _request_info(info: dict | None, stats: dict | None, finish: str | None, tok_s, cache_key: str = ""):
+        """Fill the HTTP layer's per-request `info` (usage, finish reason) from THIS request's facts.  The engine-wide
+        last_prefill_stats / last_finish_reason / last_decode_tok_s are shared by every concurrent request and stay only
+        for callers that have no info dict.  cached_tokens = prompt tokens whose K/V came from a GPU slot or a host/tmpfs
+        prefix snapshot (reported as prompt_tokens_details.cached_tokens / prompt_cache_hit_tokens)."""
+        if info is None:
+            return
+        st = dict(stats or {})
+        info["prefill"] = st
+        info["cached_tokens"] = int(st.get("reused_tokens", 0) or 0)
+        info["finish_reason"] = finish or "stop"
+        info["decode_tok_s"] = tok_s
+        info["cache_key"] = cache_key or ""
+
+    def generate_stream(self, prompt_ids: list[int], p: GenParams, images=None, token_types=None, req_id: str = "",
+                        cache_key: str = "", info: dict | None = None) -> Iterator[tuple[int, str]]:
         if self.max_seqs <= 1:
-            yield from self.generate(prompt_ids, p, images=images, token_types=token_types)
+            yield from self.generate(prompt_ids, p, images=images, token_types=token_types, cache_key=cache_key)
+            self._request_info(info, getattr(self, "last_prefill_stats", None), getattr(self, "last_finish_reason", None),
+                               getattr(self, "last_decode_tok_s", None), cache_key)
             return
 
         _mtp_long_limit = int(os.environ.get("DSV41_MTP_LONG_PROMPT_LIMIT", "65536"))
@@ -5601,7 +5631,7 @@ class Engine:
             gen = torch.Generator(device=self.model.blocks[-1].device)
             gen.manual_seed(p.seed)
 
-        req = _BatchRequest(prompt_ids, p, max_new, gen, images=images, token_types=token_types)
+        req = _BatchRequest(prompt_ids, p, max_new, gen, req_id=req_id, images=images, token_types=token_types, cache_key=cache_key)
         self._batch_queue.put(req)
         try:
             while True:
@@ -5616,9 +5646,11 @@ class Engine:
                 raise req.error
             self.last_decode_tok_s = getattr(req, "decode_tok_s", None)
             self.last_finish_reason = getattr(req, "finish_reason", "stop")
+            self._request_info(info, req.prefill_stats, req.finish_reason, req.decode_tok_s, req.cache_key)
 
     @torch.inference_mode()
-    def _generate_text_batched(self, prompt_ids: list[int], p: GenParams, images=None, token_types=None) -> tuple[str, int]:
+    def _generate_text_batched(self, prompt_ids: list[int], p: GenParams, images=None, token_types=None, req_id: str = "",
+                               cache_key: str = "", info: dict | None = None) -> tuple[str, int]:
         _mtp_long_limit = int(os.environ.get("DSV41_MTP_LONG_PROMPT_LIMIT", "65536"))
         max_new = min(p.max_new_tokens, self.max_seq_len - len(prompt_ids) - 1)
         if len(prompt_ids) > _mtp_long_limit:
@@ -5629,13 +5661,14 @@ class Engine:
             gen = torch.Generator(device=self.model.blocks[-1].device)
             gen.manual_seed(p.seed)
 
-        req = _BatchRequest(prompt_ids, p, max_new, gen, images=images, token_types=token_types)
+        req = _BatchRequest(prompt_ids, p, max_new, gen, req_id=req_id, images=images, token_types=token_types, cache_key=cache_key)
         self._batch_queue.put(req)
         req.done_event.wait()
         if req.error:
             raise req.error
         self.last_decode_tok_s = getattr(req, "decode_tok_s", None)
         self.last_finish_reason = getattr(req, "finish_reason", "stop")
+        self._request_info(info, req.prefill_stats, req.finish_reason, req.decode_tok_s, req.cache_key)
         return req.result_text, req.result_count
 
 
