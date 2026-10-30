@@ -41,12 +41,14 @@ def _usage(n_prompt: int, n_out: int, info: dict | None = None) -> dict:
 
 
 def _client_opts(body: dict) -> tuple[str, bool]:
-    """(prompt_cache_key, stream_options.include_usage) of a request.  prompt_cache_key (OpenAI; mainplane sends its
-    session's first record id, a copied session shares it) is kept with the slot state and the prefix-cache entries the
-    request makes and is logged; prefix matching itself stays by tokens.  include_usage asks for the usage chunk
-    (choices: []) after the finish chunk of a stream."""
+    """(cache-key digest, stream_options.include_usage) of a request.  prompt_cache_key (OpenAI; mainplane sends its
+    session's first record id, a copied session shares it; other clients put device/account identifiers in it) is
+    reduced to a 16-hex sha256 digest before it reaches the engine, the logs, the slot states and the prefix-cache
+    entries: it is a label for "same session", nothing reads it back.  Prefix matching itself stays by tokens.
+    include_usage asks for the usage chunk (choices: []) after the finish chunk of a stream."""
+    import hashlib
     key = body.get("prompt_cache_key") or body.get("cache_key") or ""
-    key = str(key)[:128] if isinstance(key, (str, int)) else ""
+    key = hashlib.sha256(str(key).encode("utf-8")).hexdigest()[:16] if isinstance(key, (str, int)) and str(key) else ""
     so = body.get("stream_options")
     include_usage = bool(isinstance(so, dict) and so.get("include_usage"))
     return key, include_usage

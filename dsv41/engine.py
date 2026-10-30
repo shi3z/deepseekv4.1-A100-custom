@@ -5662,7 +5662,7 @@ class Engine:
 
             with self.lock:
                 self._decode_active_once(B)
-    @torch.inference_mode()
+
     @staticmethod
     def _request_info(info: dict | None, stats: dict | None, finish: str | None, tok_s, cache_key: str = ""):
         """Fill the HTTP layer's per-request `info` (usage, finish reason) from THIS request's facts.  The engine-wide
@@ -5678,6 +5678,7 @@ class Engine:
         info["decode_tok_s"] = tok_s
         info["cache_key"] = cache_key or ""
 
+    @torch.inference_mode()
     def generate_stream(self, prompt_ids: list[int], p: GenParams, images=None, token_types=None, req_id: str = "",
                         cache_key: str = "", info: dict | None = None) -> Iterator[tuple[int, str]]:
         if self.max_seqs <= 1:
