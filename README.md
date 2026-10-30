@@ -246,6 +246,15 @@ Navigate to `http://127.0.0.1:8000/dashboard` in any web browser for live server
 - **Host RAM Prefix Cache**: Track persistent prefix cache entries and host RAM/tmpfs memory footprint.
 - **100% Self-Contained**: Offline HTML5 Canvas rendering with zero external scripts or CDN dependencies.
 
+## The same model as a 1-bit GGUF on one card (2026-10-31)
+
+For comparison with this runtime, unsloth's `UD-IQ1_S` quantization of DeepSeek-V4.1-Flash-1017 (216.97 GiB, the
+smallest one they publish) was measured on a single RTX PRO 6000 Blackwell with 123 GB of host RAM: **37.2 t/s decode
+and 213 t/s prefill** at the best split that fits (`llama.cpp -ngl 99 -ncmoe 9`, peak 95.2 GB VRAM and 116 GB RSS),
+against 14.5 t/s with every expert on the CPU and 3.3 t/s with no GPU. Full table, metadata of the GGUF
+(748B-A16B, 384 experts / 6 used, 16M-entry engram table) and the raw logs:
+[results/gguf_iq1s_zeta/README.md](results/gguf_iq1s_zeta/README.md); scripts in [tools/gguf-bench/](tools/gguf-bench/).
+
 ## Cache and replay
 
 The runtime restores mutable window KV, compressed KV, index keys, compressor state, Engram history, and DSpark state from a prefix snapshot. Block replay uses the model continuation path; ordinary decode continues to use the EPRuntime CUDA-graph path. Multi-anchor replay never skips a pending anchor.
