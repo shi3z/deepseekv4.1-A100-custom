@@ -56,10 +56,15 @@ export DSV41_LONG_PROMPT_MAX_NEW=65536
 
 # Prefix Cache (Host RAM & tmpfs)
 export DSV41_PREFIX_CACHE_DIR=/dev/shm/dsv41-prefix-cache
-export DSV41_PREFIX_CACHE_ENTRIES=16
+# 2026-10-30: 64 entries (16 were all 7 MB entries of 700-token background requests, 0.14 GiB of the 32 GB budget,
+# and every 150K+ snapshot had been evicted); prompts under MIN_STORE tokens are not stored; entries of
+# PROTECT tokens or more are evicted last (engine._store_prefix_cache_entry, _prefix_tmpfs eviction)
+export DSV41_PREFIX_CACHE_ENTRIES=64
 export DSV41_PREFIX_CACHE_GB=32
-export DSV41_PREFIX_TMPFS_ENTRIES=16
+export DSV41_PREFIX_TMPFS_ENTRIES=64
 export DSV41_PREFIX_TMPFS_GB=32
+export DSV41_PREFIX_MIN_STORE_TOKENS=4096
+export DSV41_PREFIX_PROTECT_TOKENS=65536
 export DSV41_PREFIX_BLOCK_REPLAY=1
 export DSV41_PREFIX_BLOCK_SIZE=512
 export DSV41_PREFIX_BLOCK_MIN=16

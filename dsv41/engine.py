@@ -678,19 +678,38 @@ class Engine:
         seg = int(os.environ.get("DSV41_PREFILL_SEGMENT_TOKENS", "8192"))
         n = len(token_ids)
         images = getattr(self, "_cur_images", None)
-        if images is not None and start_pos == 0:
-            # image request from zero: a single forward with the images (the vision tower runs at start_pos 0
-            # only, so this prefill is not segmented); token_types sliced to the forwarded span
-            tt = getattr(self, "_cur_token_types", None)
-            tt = tt[:, :n] if (torch.is_tensor(tt) and tt.dim() == 2) else tt
-            dev0 = self.model.blocks[0].device
-            return self.model.forward(torch.tensor([list(token_ids)], dtype=torch.long, device=dev0), 0,
-                                      images=images, token_types=tt)
-        if seg <= 0 or n <= seg:
-            return self.model.forward(torch.tensor([list(token_ids)], dtype=torch.long), start_pos)
-        logits = None
         t0 = time.perf_counter()
-        for a in range(0, n, seg):
+        logits = None
+        first = 0
+        if images is not None and start_pos == 0:
+            # image request from zero: the first forward carries the images (the vision tower runs at start_pos 0
+            # only) and ends after the last image token, rounded up to a segment; the rest is text-only
+            # continuation like any other segment (the same forwards image-aware prefix reuse makes).  Before
+            # 2026-10-30 the whole prompt was one forward: no segments, so no interleaved admission or decode for
+            # the other slots during a 220K-token cold prefill with one screenshot.
+            tt = getattr(self, "_cur_token_types", None)
+            cut = int(self._images_min_base(getattr(self, "_cur_img_sig", ()) or ()))
+            if seg > 0 and 0 < cut < n:
+                cut = min(n, -(-cut // seg) * seg)
+            else:
+                cut = n
+            tt = tt[:, :cut] if (torch.is_tensor(tt) and tt.dim() == 2) else tt
+            dev0 = self.model.blocks[0].device
+            logits = self.model.forward(torch.tensor([list(token_ids[:cut])], dtype=torch.long, device=dev0), 0,
+                                        images=images, token_types=tt)
+            if cut >= n:
+                return logits
+            first = cut
+            hook = getattr(self, "_prefill_interleave", None)
+            if hook is not None:
+                try:
+                    hook(cut)
+                except Exception as exc:
+                    print(f"[prefill-segments] interleaved decode step failed: {exc}", flush=True)
+            print(f"[prefill-segments] {cut:,}/{n:,} from 0 with images ({time.perf_counter() - t0:.0f}s)", flush=True)
+        elif seg <= 0 or n <= seg:
+            return self.model.forward(torch.tensor([list(token_ids)], dtype=torch.long), start_pos)
+        for a in range(first, n, seg):
             b = min(a + seg, n)
             logits = self.model.forward(torch.tensor([list(token_ids[a:b])], dtype=torch.long), start_pos + a)
             if b < n:
@@ -2375,8 +2394,16 @@ class Engine:
                 )
             ]
 
+            # newest first; manifests of long prefixes (>= DSV41_PREFIX_PROTECT_TOKENS, from the base count in the
+            # file name prefix-<base>-<hash>.pt) ahead of the rest, so short entries are evicted before them
+            protect = int(os.environ.get("DSV41_PREFIX_PROTECT_TOKENS", "65536"))
+            def _base_of(p):
+                try:
+                    return int(os.path.basename(p).split("-")[1])
+                except Exception:
+                    return 0
             paths.sort(
-                key=lambda x: os.stat(x).st_mtime,
+                key=lambda x: (_base_of(x) >= protect, os.stat(x).st_mtime),
                 reverse=True,
             )
 
@@ -2947,6 +2974,12 @@ class Engine:
         snapshot_bytes,
         previous=None,
     ):
+        min_store = int(os.environ.get("DSV41_PREFIX_MIN_STORE_TOKENS", "4096"))
+        if len(base_ids) < min_store and previous is None:
+            # A 700-token prompt is 3 s to recompute; its 7 MB entry evicted 150K-token snapshots from the LRU
+            # (2026-10-30: 16 entries, all of them small, ram 0.14 GiB of a 32 GB budget).
+            print(f"[prefix-cache] SKIP-SMALL base={len(base_ids):,} < {min_store:,} tokens (not stored)", flush=True)
+            return None
         # Do not rewrite an identical stable base.
         #
         # A HIT may finish without advancing the snapshot base.  In that
@@ -3030,11 +3063,16 @@ class Engine:
             for e in entries
         )
 
+        protect = int(os.environ.get("DSV41_PREFIX_PROTECT_TOKENS", "65536"))
         while (
             len(entries) > max_entries
             or total_bytes > max_bytes
         ):
-            victim = entries.pop(0)
+            # oldest of the short entries first; a protected (long) entry only when nothing else is left or the
+            # byte budget overflows -- restoring a 200K snapshot is seconds, recomputing it is a quarter hour
+            pool = [e for e in entries if len(e["base_ids"]) < protect] or entries
+            victim = min(pool, key=lambda x: x["last_used"])
+            entries.remove(victim)
             total_bytes -= victim["bytes"]
 
             print(
@@ -3145,6 +3183,22 @@ class Engine:
                 best_lcp = lcp
                 best_slot = slot_id
         return best_slot, best_lcp
+
+    def _touch_prefix_entries(self, prompt_ids):
+        """Mark every host entry whose base is a prefix of prompt_ids as just used.  A session served from its GPU
+        slot never touched its host snapshot, which then aged out of the LRU while the slot was being reused."""
+        try:
+            now = time.monotonic()
+            n = 0
+            for e in self._prefix_cache_entries():
+                b = e.get("base_ids") or []
+                if 0 < len(b) <= len(prompt_ids) and prompt_ids[len(b) - 1] == b[-1] and prompt_ids[:len(b)] == list(b):
+                    e["last_used"] = now
+                    n += 1
+            if n:
+                print(f"[prefix-cache] TOUCH {n} host entr{'y' if n == 1 else 'ies'} (prefix of this prompt)", flush=True)
+        except Exception as exc:
+            print(f"[prefix-cache] TOUCH failed: {exc}", flush=True)
 
     def _remove_prefix_cache_entry(self, entry: dict):
         """Evict a specific snapshot entry from in-memory cache."""
@@ -3655,6 +3709,7 @@ class Engine:
                     reuse_pos=gpu_reuse_pos,
                 )
                 dt_gpu = time.perf_counter() - t0
+                self._touch_prefix_entries(prompt_ids)
                 return logits, reused_pos
             except Exception as exc:
                 print(
@@ -5028,6 +5083,16 @@ class Engine:
             return int(self.slot_layout.cap_by_row.get(slot_id, self.max_seq_len))
         return int(self.max_seq_len)
 
+    def _pick_free_slot(self, fitting):
+        """The free decode slot a request takes when no slot holds its prefix: smallest capacity first (large slots
+        stay free for long requests), then the slot whose cached tokens are the FEWEST, then the oldest-freed.  A
+        slot keeps the K/V of its last request as a GPU prefix cache; 2026-10-30 a stream of 737-token background
+        requests rotated through all four 512K slots and overwrote a 220K session's K/V within four requests, after
+        which every turn of that session was a 17-minute cold prefill."""
+        with getattr(self, "_slot_tokens_lock", threading.Lock()):
+            cached = {s_: len(self._slot_tokens.get(s_) or ()) for s_ in fitting}
+        return min(fitting, key=lambda s_: (self.slot_cap_tokens(s_), cached[s_], self._free_decode_slots.index(s_)))
+
     def _next_fitting_request(self):
         """Pick the next request that fits a free decode slot: in arrival order, a free slot whose capacity holds
         the prompt plus one token; the slot that already holds the best prefix if it qualifies, otherwise the
@@ -5057,7 +5122,7 @@ class Engine:
             if best_gpu_slot in fitting and best_gpu_slot != 0:
                 slot_id = best_gpu_slot
             else:
-                slot_id = min(fitting, key=lambda s_: (self.slot_cap_tokens(s_), self._free_decode_slots.index(s_)))
+                slot_id = self._pick_free_slot(fitting)
             self._free_decode_slots.remove(slot_id)
             cap_left = self.slot_cap_tokens(slot_id) - len(req.prompt_ids) - 1
             if req.max_new > cap_left:
@@ -5251,7 +5316,7 @@ class Engine:
             if best_gpu_slot in fitting and best_gpu_slot != 0:
                 slot_id = best_gpu_slot
             else:
-                slot_id = min(fitting, key=lambda s_: (self.slot_cap_tokens(s_), self._free_decode_slots.index(s_)))
+                slot_id = self._pick_free_slot(fitting)
             self._free_decode_slots.remove(slot_id)
             cap_left = self.slot_cap_tokens(slot_id) - len(req.prompt_ids) - 1
             if req.max_new > cap_left:
