@@ -712,14 +712,28 @@ class Indexer:
         if seqlen > 1:
             QUERY_CHUNK = query_chunk
 
+            # Precision of the selection scores (DSV41_INDEX_BF16, 2026-11-02).  Both operands reach this point
+            # fp4-quantized (fake_quant_fp4 above for q, in write_index_k for the keys) and index_k is stored
+            # bfloat16, so the fp32 path upcast 4 bits of mantissa into fp32 and paid for fp32 matmuls plus a
+            # [bsz, key_len, 128] fp32 copy of the key cache (134 MiB at 262K keys).
+            #   1 (default) bf16 matmul, fp32 accumulator: 2.0x faster at 131K keys, 99.3 % of the top-512 set
+            #               unchanged against fp32 (measured with fp4 inputs, worst query row 98.6 %)
+            #   2           everything bf16: 2.6x faster, 97.5 % of the set unchanged (worst row 95.7 %)
+            #   0           the fp32 path as it was
+            # The keys that differ are the lowest-scoring of the 512 selected, which contribute least to the
+            # attention that follows.
+            index_bf16 = int(os.environ.get("DSV41_INDEX_BF16", "1"))
+            mm_dtype = torch.bfloat16 if index_bf16 else torch.float32
+            acc_dtype = torch.bfloat16 if index_bf16 >= 2 else torch.float32
+
             key_len = index_k.size(1)
             key_pos = torch.arange(
                 key_len,
                 device=x.device,
             )
 
-            # One conversion per layer instead of per query chunk.
-            index_k_f = index_k.float()
+            # One conversion per layer instead of per query chunk (a no-op when the cache dtype is already mm_dtype).
+            index_k_f = index_k.to(mm_dtype)
             kT = index_k_f.transpose(1, 2)
 
             idx_chunks = []
@@ -730,8 +744,8 @@ class Indexer:
             for q0 in range(0, seqlen, QUERY_CHUNK):
                 q1 = min(q0 + QUERY_CHUNK, seqlen)
 
-                qc = q[:, q0:q1].float()
-                wc = weights[:, q0:q1].float()
+                qc = q[:, q0:q1].to(mm_dtype)
+                wc = weights[:, q0:q1].to(mm_dtype)
 
                 # Memory-efficient head accumulation: [B, C, T] instead of [B, C, H, T]
                 # Completely eliminates multi-GiB scratch tensors for long contexts (1M tokens).
@@ -739,7 +753,7 @@ class Indexer:
                     bsz,
                     q1 - q0,
                     key_len,
-                    dtype=torch.float32,
+                    dtype=acc_dtype,
                     device=x.device,
                 )
                 for h_idx in range(self.n_heads):
