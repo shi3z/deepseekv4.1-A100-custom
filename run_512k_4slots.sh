@@ -44,7 +44,12 @@ export DSV41_INTERLEAVE_MAX_NEW_TOKENS=16384
 export DSV41_EP_COMPACT_XQ=1
 export DSV41_GPU_SLOT_CACHE=1
 export DSV41_PREFIX_DEDUP_MIRRORS=1
-export DSV41_CED=0  # exact prefill for everything (user decision 2026-10-05); =1 is the approximate CED tail for text prompts, images are always exact (results/image_crosstalk_report.md)
+# Exact prefill for everything (user decision 2026-10-05, results/image_crosstalk_report.md).  =1 turns the CED tail
+# back on, which the model code already applies only to text prompts of >= 2048 tokens (`images is None` in
+# model.py use_ced, added the same day as the audit) and which cuts prefill compute by ~47 %.  Overridable from the
+# environment so the approximation can be measured against scripts/longctx_quality.py without editing this file;
+# the default stays at the setting whose long-context quality is known (10/10 needles at 32K and 128K).
+export DSV41_CED=${DSV41_CED:-0}
 
 # Repetition & Stability Safeguards
 export DSV41_REPETITION_PENALTY=1.05
