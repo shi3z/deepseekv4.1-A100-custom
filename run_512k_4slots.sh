@@ -19,7 +19,12 @@ export DSV41_LAYER_COUNTS=10,10,10,10
 # 512K Context Horizon
 export DSV41_EP_GRAPH_TOKENS=524288
 export DSV41_EP_CAND_TOKENS=524288
-export DSV41_CACHE_INIT_TOKENS=32768
+# 2026-11-04: allocate the full 512K compressed cache at startup (12.50 GiB over all four GPUs, 3.12 of them on
+# GPU 2) instead of growing into it.  Growing needs the old and the new table side by side, so a 499K prompt asked
+# for 2.38 GiB on a GPU where another tenant's ASR server had taken 2.27 GiB, failed, and left the partly grown
+# tables allocated: every request after that died with "1.31 MiB is free" until a restart.  Reserved up front, the
+# transient peak never happens and no co-tenant can take the space first.
+export DSV41_CACHE_INIT_TOKENS=524288
 export DSV41_EP_PREALLOC_TOKENS=32768
 export DSV41_EXACT_CACHE_GROW=1
 

@@ -5246,6 +5246,19 @@ class Engine:
                             torch.cuda.empty_cache()
                     except Exception:
                         pass
+                # empty_cache only returns the allocator's free blocks; the tables a growth spurt enlarged are
+                # still referenced and keep the VRAM, so one over-long prompt used to wedge every request after it
+                # (2026-11-04, see SharedAttn.shrink_caches).  Give them back, but only with nothing decoding:
+                # dim 0 of a table is shared by every sequence row.
+                if not self._active_slots:
+                    try:
+                        init_tokens = int(os.environ.get("DSV41_CACHE_INIT_TOKENS", "131072"))
+                        self.model.shared.shrink_caches(target_tokens=min(init_tokens, self.max_seq_len),
+                                                        max_seq_len=self.max_seq_len)
+                    except Exception as exc:
+                        print(f"[cache-shrink] failed: {exc}", flush=True)
+                else:
+                    print(f"[cache-shrink] skipped: {len(self._active_slots)} slot(s) still decoding", flush=True)
             req.error = e
             req.token_queue.put(None)
             req.done_event.set()

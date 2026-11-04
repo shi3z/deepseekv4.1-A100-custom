@@ -327,6 +327,60 @@ class SharedAttn:
         self._topk_idxs_map.pop(chunk_idx, None)
         self._candidates_map.pop(chunk_idx, None)
 
+    def shrink_caches(self, target_rows_frac: float = None, target_tokens: int = None, max_seq_len: int = None):
+        """Give the compressed caches back down after a growth spurt, so one over-long request cannot wedge the
+        server for every request after it.
+
+        2026-11-04: a 498,692-token prompt grew owner 20 from 421,165 to 425,261 rows while the ASR server of
+        another tenant held 2.27 GiB on GPU 2; the growth needs old and new side by side, failed at 2.38 GiB, and
+        the partially grown tables stayed allocated, so the next 657 requests all died on "Tried to allocate
+        2.00 MiB ... 1.31 MiB is free".  The caller (the batch worker's OOM handler) runs this only with no active
+        slots, because dim 0 of every table is shared by all sequence rows and shrinking dim 1 throws away any row
+        past the target.  Tables under a fixed slot layout never grow, so there is nothing to give back.
+        Returns the bytes released."""
+        if self.slot_layout is not None:
+            return 0
+        freed = 0
+        for kind in ("compress_kv", "index_k"):
+            table = getattr(self, kind)
+            for key in list(table.keys()):
+                owner = key[0]
+                old_t = table[key]
+                rows = old_t.size(1)
+                if target_rows_frac is not None:
+                    want = int(rows * target_rows_frac)
+                else:
+                    max_rows = self.cache_max_rows.get(owner) or rows
+                    span = max_seq_len or 0
+                    want = int(max_rows * target_tokens / span) + 1 if span else rows
+                want = max(1024, min(want, rows))
+                if want >= rows:
+                    continue
+                try:
+                    with torch.inference_mode(False):
+                        new_t = torch.empty(old_t.size(0), want, old_t.size(2), dtype=old_t.dtype,
+                                            device=old_t.device)
+                        new_t.copy_(old_t[:, :want])
+                    table[key] = new_t
+                    freed += (rows - want) * old_t.size(0) * old_t.size(2) * old_t.element_size()
+                    del old_t
+                except torch.OutOfMemoryError:
+                    # not even the smaller table fits beside the old one; leave this mirror as it is
+                    print(f"[cache-shrink] {kind} owner={owner} dev={key[1]}: no room to reallocate "
+                          f"{rows:,}->{want:,}", flush=True)
+                    continue
+                print(f"[cache-shrink] {kind} owner={owner} dev={key[1]} rows={rows:,}->{want:,}", flush=True)
+        if freed:
+            for d in range(torch.cuda.device_count()):
+                with torch.cuda.device(d):
+                    torch.cuda.empty_cache()
+            print(f"[cache-shrink] released {freed / 2 ** 30:.2f} GiB", flush=True)
+        else:
+            # Nothing to give back: either no table ever grew past what the profile reserved at startup
+            # (DSV41_CACHE_INIT_TOKENS, which this never undoes) or every reallocation was refused.
+            print("[cache-shrink] nothing to release (no table is larger than the reserved size)", flush=True)
+        return freed
+
     def _ensure_capacity(
         self,
         table: dict,
