@@ -44,12 +44,14 @@ export DSV41_INTERLEAVE_MAX_NEW_TOKENS=16384
 export DSV41_EP_COMPACT_XQ=1
 export DSV41_GPU_SLOT_CACHE=1
 export DSV41_PREFIX_DEDUP_MIRRORS=1
-# Exact prefill for everything (user decision 2026-10-05, results/image_crosstalk_report.md).  =1 turns the CED tail
-# back on, which the model code already applies only to text prompts of >= 2048 tokens (`images is None` in
-# model.py use_ced, added the same day as the audit) and which cuts prefill compute by ~47 %.  Overridable from the
-# environment so the approximation can be measured against scripts/longctx_quality.py without editing this file;
-# the default stays at the setting whose long-context quality is known (10/10 needles at 32K and 128K).
-export DSV41_CED=${DSV41_CED:-0}
+# CED tail on for text, exact for images.  The model code decides per request: `use_ced` requires `images is None`
+# and >= DSV41_CED_MIN_TOKENS (2048), so the image cross-talk of 2026-10-04 cannot recur, and that gate was verified
+# end to end on 2026-11-04 (a 2,296-token image request read the word in its image and ran at 436 tok/s, the
+# exact-path rate from the audit's table; CED would have been 710-795).  Text recall was the open question the audit
+# never measured; scripts/longctx_quality.py answers it: 15/15 needles at 32K, 128K and 256K across depths 0.1 to
+# 0.9, identical to exact prefill, while the cold prefill falls 42-47 % (128K 357 -> 207 s, 256K 851 -> 451 s).
+# Set DSV41_CED=0 to go back to exact prefill for everything.
+export DSV41_CED=${DSV41_CED:-1}
 
 # Repetition & Stability Safeguards
 export DSV41_REPETITION_PENALTY=1.05

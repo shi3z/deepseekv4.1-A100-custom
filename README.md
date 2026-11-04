@@ -255,6 +255,23 @@ against 14.5 t/s with every expert on the CPU and 3.3 t/s with no GPU. Full tabl
 (748B-A16B, 384 experts / 6 used, 16M-entry engram table) and the raw logs:
 [results/gguf_iq1s_zeta/README.md](results/gguf_iq1s_zeta/README.md); scripts in [tools/gguf-bench/](tools/gguf-bench/).
 
+## Long-context quality (`scripts/longctx_quality.py`, 2026-11-04)
+
+Needle retrieval measured against the running server: one context per length carrying one needle per depth, then one
+question per needle, so the depths after the first share the context as their prefix (100 % cache hit, ~2 s each)
+and a sweep costs one cold prefill instead of one per depth.
+
+| context | needles retrieved (depths 0.1-0.9) | cold prefill, exact | cold prefill, CED tail |
+|---|---|---|---|
+| 32K | 5/5 both settings | 92.9 s | — (served from cache) |
+| 128K | 5/5 both settings | 357.2 s | 206.8 s (-42 %) |
+| 256K | 5/5 with the CED tail | 851 s (2026-10-30 log) | 451.3 s (-47 %) |
+
+The depth-0.1 needle of a 256K context survives although 31 of its 32 chunks never run layers 21-39, so the
+compressed K/V of layers 0-20 plus the index selection carries long-range information on its own.  Image requests
+keep the exact path automatically (`images is None` in `use_ced`), verified end to end.  Raw rows in
+`results/longctx_ced0.json`, `longctx_ced1.json`, `longctx_ced1_256k.json`.
+
 ## Cache and replay
 
 The runtime restores mutable window KV, compressed KV, index keys, compressor state, Engram history, and DSpark state from a prefix snapshot. Block replay uses the model continuation path; ordinary decode continues to use the EPRuntime CUDA-graph path. Multi-anchor replay never skips a pending anchor.
