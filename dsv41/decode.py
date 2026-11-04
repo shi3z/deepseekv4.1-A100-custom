@@ -294,8 +294,17 @@ class DecodeRuntime:
             return topk_indices(score, self.topk, cl)
         if FUSED2:
             index_k = index_k.index_select(0, self.seq[d])  # the row's sequence
-        score = torch.einsum("bshd,btd->bsht", q.float(), index_k.float())
-        score = (score.relu_() * weights.float().unsqueeze(-1)).sum(dim=2)  # [B, 1, max_c + 1]
+        # Same precision argument as the prefill indexer (model.py, DSV41_INDEX_BF16): both operands arrive
+        # fp4-quantized and index_k is stored bfloat16, so fp32 bought nothing and cost everything.  Here it cost
+        # the 1M profile: [B, 1, H, T] in fp32 at T = 1,048,576 is 671 MiB per layer, plus a 537 MiB fp32 copy of
+        # the key cache, and CUDA-graph capture holds them for every indexer layer at once -- that is what made
+        # four 1M startups die in ep.py capture on 2026-11-04.  bf16 halves the big tensor and removes the copy;
+        # the head sum still accumulates in fp32 (mode 1, the default).
+        _bf16 = int(os.environ.get("DSV41_INDEX_BF16", "1"))
+        _mm = torch.bfloat16 if _bf16 else torch.float32
+        _acc = torch.bfloat16 if _bf16 >= 2 else torch.float32
+        score = torch.einsum("bshd,btd->bsht", q.to(_mm), index_k.to(_mm))
+        score = (score.relu_() * weights.to(_mm).unsqueeze(-1)).sum(dim=2, dtype=_acc)  # [B, 1, max_c + 1]
         n_pos = score.shape[-1]
         cl = compress_len.view(-1, 1, 1) if compress_len.dim() else compress_len
         score = score.masked_fill(torch.arange(n_pos, device=d) >= cl, -torch.inf)

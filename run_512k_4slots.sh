@@ -89,11 +89,17 @@ if [ ! -d "$DEFAULT_CKPT" ]; then
 fi
 CKPT="${DSV41_CKPT:-$DEFAULT_CKPT}"
 
+# Expert placement, rebalanced 2026-11-04 from the /api/memory breakdown.  --ep-shards maps positionally to
+# --devices, so this is cuda:2=92, cuda:3=100, cuda:0=97, cuda:1=95.  Before (92,95,99,98) the free VRAM was
+# 3.10 / 5.64 / 1.53 / 1.40 GiB: the two GPUs with the most experts had the least room, and CUDA-graph capture for a
+# 1M profile died there wanting 2.0-2.5 GiB.  One expert shard costs about 0.6 GiB (measured: cuda:0 had 4 more
+# shards than cuda:3 and 2.65 GiB more weights), so moving 2 off cuda:0 and 3 off cuda:1 onto cuda:3 should leave
+# roughly 2.6-3.2 GiB free everywhere.
 exec /home/shi3z/.local/bin/python -u -m dsv41.serve \
     --ckpt "$CKPT" \
     --devices 2,3,0,1 \
     --ep \
-    --ep-shards 92,95,99,98 \
+    --ep-shards 92,100,97,95 \
     --max-seq-len 524288 \
     --max-seqs 5 \
     --host 0.0.0.0 \

@@ -54,6 +54,83 @@ def _client_opts(body: dict) -> tuple[str, bool]:
     return key, include_usage
 
 
+def _memory_report(eng) -> dict:
+    """Per-device VRAM: what the driver reports, what torch has allocated and reserved, and the pieces we can name
+    (model parameters by device, the compressed caches, the per-layer RoPE tables, the sliding-window K/V).  The
+    unnamed remainder is mostly the CUDA-graph workspace and the allocator's fragmentation."""
+    if eng is None:
+        return {"error": "engine not loaded"}
+    devs = sorted({int(str(d).split(":")[-1]) for d in getattr(eng, "devices", []) or [0]})
+    named = {d: {"params": 0, "cache": 0, "rope": 0, "window_kv": 0} for d in devs}
+    try:
+        for p in eng.model.parameters():
+            if p.is_cuda:
+                named.setdefault(p.device.index, {"params": 0, "cache": 0, "rope": 0, "window_kv": 0})
+                named[p.device.index]["params"] += p.numel() * p.element_size()
+        for buf in eng.model.buffers():
+            if buf.is_cuda:
+                named.setdefault(buf.device.index, {"params": 0, "cache": 0, "rope": 0, "window_kv": 0})
+                named[buf.device.index]["params"] += buf.numel() * buf.element_size()
+    except Exception as exc:
+        named["params_error"] = str(exc)[:120]
+    sh = getattr(eng.model, "shared", None)
+    if sh is not None:
+        # Under DSV41_SLOT_CAPS every owner's view is an as_strided window onto one flat buffer per (kind, owner,
+        # device), so counting the views double-counts: the 1M profile reported 25.0 GiB of cache against the
+        # 10.94 GiB the loader actually allocated.  Count each storage once.
+        cache_seen = set()
+        tables = [t for table in ("compress_kv", "index_k") for t in getattr(sh, table, {}).values()]
+        tables += list(getattr(sh, "cache_flat", {}).values())
+        for t in tables:
+            key = (t.device, t.untyped_storage().data_ptr() if hasattr(t, "untyped_storage") else t.data_ptr())
+            if key in cache_seen:
+                continue
+            cache_seen.add(key)
+            i = t.device.index
+            named.setdefault(i, {"params": 0, "cache": 0, "rope": 0, "window_kv": 0})
+            named[i]["cache"] += (t.untyped_storage().nbytes() if hasattr(t, "untyped_storage")
+                                  else t.numel() * t.element_size())
+    seen = set()
+    for blk in getattr(eng.model, "blocks", []):
+        a = getattr(blk, "attn", None)
+        for name in ("cos", "sin"):
+            t = getattr(a, name, None)
+            if t is not None and t.is_cuda and t.data_ptr() not in seen:
+                seen.add(t.data_ptr())
+                named.setdefault(t.device.index, {"params": 0, "cache": 0, "rope": 0, "window_kv": 0})
+                named[t.device.index]["rope"] += t.numel() * t.element_size()
+        w = getattr(a, "window_kv_cache", None)
+        if w is not None and w.is_cuda and w.data_ptr() not in seen:
+            seen.add(w.data_ptr())
+            named.setdefault(w.device.index, {"params": 0, "cache": 0, "rope": 0, "window_kv": 0})
+            named[w.device.index]["window_kv"] += w.numel() * w.element_size()
+    out = {"max_seq_len": int(getattr(eng, "max_seq_len", 0)), "max_seqs": int(getattr(eng, "max_seqs", 0)),
+           "slot_caps": os.environ.get("DSV41_SLOT_CAPS", ""),
+           "ep_graph_tokens": os.environ.get("DSV41_EP_GRAPH_TOKENS", ""),
+           "graph_token_limit": int(getattr(getattr(eng, "rt", None), "graph_token_limit", 0) or 0),
+           "devices": {}}
+    gib = lambda b: round(b / 2 ** 30, 2)
+    for d in devs:
+        try:
+            free, total = torch.cuda.mem_get_info(d)
+            alloc = torch.cuda.memory_allocated(d)
+            reserved = torch.cuda.memory_reserved(d)
+        except Exception:
+            free = total = alloc = reserved = 0
+        n = named.get(d, {})
+        known = sum(v for k, v in n.items() if isinstance(v, int))
+        out["devices"][str(d)] = {
+            "total_gib": gib(total), "free_gib": gib(free), "used_by_everyone_gib": gib(total - free),
+            "torch_allocated_gib": gib(alloc), "torch_reserved_gib": gib(reserved),
+            "params_gib": gib(n.get("params", 0)), "compressed_cache_gib": gib(n.get("cache", 0)),
+            "rope_gib": gib(n.get("rope", 0)), "window_kv_gib": gib(n.get("window_kv", 0)),
+            "named_total_gib": gib(known),
+            "unnamed_allocated_gib": gib(max(0, alloc - known)),
+            "outside_torch_gib": gib(max(0, (total - free) - reserved)),
+        }
+    return out
+
+
 def _params(body: dict) -> GenParams:
     stop = body.get("stop") or []
     if isinstance(stop, str):
@@ -313,6 +390,12 @@ class Handler(BaseHTTPRequestHandler):
             "/api/monitor", "/queue"
         ):
             self._json(200, STATS_TRACKER.get_metrics(ENGINE) if STATS_TRACKER else {})
+        elif self.path in ("/api/memory", "/memory"):
+            # Where the VRAM of each GPU goes, so a profile change can be decided from numbers instead of tried.
+            # 2026-11-04: three attempts at a 1M profile died in CUDA-graph capture on GPU 0 (642 MiB, 2.50 GiB and
+            # 2.00 GiB wanted against 0.15-1.71 GiB free) while the compressed cache itself was SMALLER than the
+            # 512K profile's, so the binding term is something else and guessing was not working.
+            self._json(200, _memory_report(ENGINE))
         elif self.path in ("/api/slots", "/slots"):
             slots_data = {
                 "max_seqs": getattr(ENGINE, "max_seqs", 1) if ENGINE else 0,
